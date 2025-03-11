@@ -1,68 +1,66 @@
 const std = @import("std");
 const objc = @import("objc");
-const c = @cImport({
-    @cInclude("CoreGraphics/CoreGraphics.h");
-});
+const appkit = @import("appkit.zig");
 
-const NSApplicationActivationPolicy = enum(u32) {
-    regular = 0,
-    accessory = 1,
-    err = 2,
-};
+const CustomClass = @import("objc.zig").CustomClass;
 
-const NSWindowStyleMask = packed struct(u32) {
-    titled: bool = false,
-    closable: bool = false,
-    miniaturizable: bool = false,
-    resizable: bool = false,
-    _: u28 = 0,
-};
+const AppDelegate = CustomClass(
+    appkit.NSObject,
+    struct {
+        pub fn init(self: AppDelegate) void {
+            self.msgSend(void, "init", .{});
+        }
 
-const NSBackingStoreType = enum(u32) {
-    buffered = 2,
-};
+        pub fn setWindow(self: AppDelegate, window: appkit.NSWindow) void {
+            self.msgSend(void, "setWindow:", .{window});
+        }
 
-extern fn NSRectFill(rect: c.CGRect) callconv(.C) void;
+        pub fn applicationShouldTerminateAfterLastWindowClosed(self: AppDelegate, _: objc.Sel) bool {
+            _ = self;
 
-const AppDelegate = extern struct {
-    isa: objc.Class,
+            // std.debug.print("applicationShouldTerminateAfterLastWindowClosed {s}\n", .{});
 
-    window: objc.Object,
+            return true;
+        }
 
-    pub var class: ?objc.Class = null;
+        pub fn windowWillClose(self: AppDelegate, _: objc.Sel, _: appkit.NSNotification) void {
+            _ = self;
 
-    pub fn applicationDidFinishLaunching(id: *AppDelegate, _: objc.Sel) bool {
-        const self = @as(*AppDelegate, @ptrCast(id));
+            std.debug.print("window is closing\n", .{});
+        }
 
-        const NSWindow = objc.getClass("NSWindow") orelse unreachable;
-        const NSString = objc.getClass("NSString") orelse unreachable;
-        const CustomViewClass = CustomView.class orelse unreachable;
+        pub fn applicationDidFinishLaunching(self: AppDelegate, _: objc.Sel) bool {
+            // const self = @as(*AppDelegate, @ptrCast(id));
 
-        self.window = NSWindow.msgSend(objc.Object, "alloc", .{});
-        self.window.msgSend(void, "initWithContentRect:styleMask:backing:defer:", .{
-            c.CGRect{
-                .origin = .{
-                    .x = 0,
-                    .y = 0,
+            // const NSWindow = objc.getClass("NSWindow") orelse unreachable;
+            // const NSString = objc.getClass("NSString") orelse unreachable;
+            // const CustomViewClass = CustomView.class orelse unreachable;
+
+            // self.window = NSWindow.msgSend(objc.Object, "alloc", .{});
+            const window = appkit.NSWindow.alloc();
+            window.init(
+                .{
+                    .origin = .{
+                        .x = 0,
+                        .y = 0,
+                    },
+                    .size = .{
+                        .width = 600,
+                        .height = 600,
+                    },
                 },
-                .size = .{
-                    .width = 600,
-                    .height = 600,
+                .{
+                    .titled = true,
+                    .closable = true,
+                    .miniaturizable = true,
+                    .resizable = true,
                 },
-            },
-            NSWindowStyleMask{
-                .titled = true,
-                .closable = true,
-                .miniaturizable = true,
-                .resizable = true,
-            },
-            NSBackingStoreType.buffered,
-            false,
-        });
+                .buffered,
+                false,
+            );
 
-        const view = CustomViewClass.msgSend(objc.Object, "alloc", .{});
-        view.msgSend(void, "initWithFrame:", .{
-            c.CGRect{
+            const view = CustomView.alloc();
+            view.super().initWithFrame(.{
                 .origin = .{
                     .x = 14,
                     .y = 14,
@@ -71,126 +69,89 @@ const AppDelegate = extern struct {
                     .width = 320,
                     .height = 480,
                 },
-            },
-        });
+            });
 
-        self.window.msgSend(void, "setContentView:", .{view});
-        self.window.msgSend(void, "becomeFirstResponder", .{});
+            window.setContentView(view);
+            window.becomeFirstResponder();
 
-        const title = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{"Pure Zig App"});
+            const title = appkit.NSString.stringWithUTF8String("Pure Zig App");
 
-        self.window.msgSend(void, "setTitle:", .{title});
-        self.window.msgSend(void, "makeKeyAndOrderFront:", .{null});
+            window.setTitle(title);
+            window.makeKeyAndOrderFront(null);
 
-        return true;
-    }
-};
+            appkit.NSNotificationCenter.defaultCenter().addObserver(self, "windowWillClose:", appkit.NSWindowWillCloseNotification, window);
 
-const CustomView = extern struct {
-    pub var class: ?objc.Class = null;
+            self.setWindow(window);
 
-    pub const ivars = struct {
-        color: [*c]const u8,
+            return true;
+        }
+    },
+);
 
-        fn get(instance: objc.Object, comptime field: std.meta.FieldEnum(ivars)) std.meta.FieldType(@This(), field) {
-            var value: ?std.meta.FieldType(@This(), field) = undefined;
-            _ = objc.c.object_getInstanceVariable(instance.value, @tagName(field), @ptrCast(&value));
-            return value.?;
+const CustomView = CustomClass(
+    appkit.NSView,
+    struct {
+        pub const ivars = struct {
+            color: [*c]const u8,
+
+            fn get(instance: objc.Object, comptime field: std.meta.FieldEnum(ivars)) std.meta.FieldType(@This(), field) {
+                var value: ?std.meta.FieldType(@This(), field) = undefined;
+                _ = objc.c.object_getInstanceVariable(instance.value, @tagName(field), @ptrCast(&value));
+                return value.?;
+            }
+
+            fn set(instance: objc.Object, comptime field: std.meta.FieldEnum(ivars), value: ?std.meta.FieldType(@This(), field)) void {
+                _ = objc.c.object_setInstanceVariable(instance.value, @tagName(field), @constCast(@ptrCast(value)));
+            }
+        };
+
+        pub fn setNeedsDisplay(self: CustomView, needs_display: bool) void {
+            self.msgSend(void, "setNeedsDisplay:", .{needs_display});
         }
 
-        fn set(instance: objc.Object, comptime field: std.meta.FieldEnum(ivars), value: ?std.meta.FieldType(@This(), field)) void {
-            _ = objc.c.object_setInstanceVariable(instance.value, @tagName(field), @constCast(@ptrCast(value)));
+        pub fn drawRect(self: CustomView, _: objc.Sel, _: appkit.cg.Rect) void {
+            const color_str = ivars.get(self.object, .color);
+            std.debug.print("ivar color {*}\n", .{color_str});
+
+            appkit.NSColor.classMsgSend(appkit.NSColor, if (color_str == 0) "redColor" else std.mem.sliceTo(color_str, 0), .{}).set();
+
+            appkit.NSRectFill(.{
+                .origin = .{
+                    .x = 21,
+                    .y = 21,
+                },
+                .size = .{
+                    .width = 210,
+                    .height = 210,
+                },
+            });
         }
-    };
 
-    pub fn drawRect(self: objc.Object, _: objc.Sel, _: c.CGRect) void {
-        const NSColor = objc.getClass("NSColor") orelse unreachable;
-
-        var color: objc.Object = undefined;
-        const color_str = ivars.get(self, .color);
-        std.debug.print("ivar color {*}\n", .{color_str});
-        if (color_str != 0) {
-            color = NSColor.msgSend(objc.Object, std.mem.sliceTo(color_str, 0), .{});
-        } else {
-            color = NSColor.msgSend(objc.Object, "redColor", .{});
+        pub fn mouseDown(self: CustomView, _: objc.Sel, event: objc.Object) void {
+            std.debug.print("mouse down {any}\n", .{event});
+            self.setNeedsDisplay(true);
+            ivars.set(self.object, .color, "blueColor");
         }
 
-        color.msgSend(void, "set", .{});
-
-        NSRectFill(.{
-            .origin = .{
-                .x = 21,
-                .y = 21,
-            },
-            .size = .{
-                .width = 210,
-                .height = 210,
-            },
-        });
-    }
-
-    pub fn mouseDown(self: objc.Object, _: objc.Sel, event: objc.Object) void {
-        std.debug.print("mouse down {any}\n", .{event});
-        self.msgSend(void, "setNeedsDisplay:", .{true});
-        ivars.set(self, .color, "blueColor");
-    }
-
-    pub fn mouseUp(self: objc.Object, _: objc.Sel, event: objc.Object) void {
-        std.debug.print("mouse up {any}\n", .{event});
-        self.msgSend(void, "setNeedsDisplay:", .{true});
-        ivars.set(self, .color, null);
-    }
-};
+        pub fn mouseUp(self: CustomView, _: objc.Sel, event: objc.Object) void {
+            std.debug.print("mouse up {any}\n", .{event});
+            self.setNeedsDisplay(true);
+            ivars.set(self.object, .color, null);
+        }
+    },
+);
 
 pub fn main() !void {
     const pool = objc.AutoreleasePool.init();
     defer pool.deinit();
 
-    const NSObject = objc.getClass("NSObject").?;
-    const NSView = objc.getClass("NSView").?;
-    const NSApplication = objc.getClass("NSApplication").?;
-    // const NSWindow = objc.getClass("NSWindow").?;
-    // const NSString = objc.getClass("NSString").?;
+    const app = appkit.NSApplication.sharedApplication();
+    app.setActivationPolicy(.regular);
 
-    const AppDelegateClass = objc.Class.registerStruct(AppDelegate, NSObject).?;
-    _ = objc.Class.registerStruct(CustomView, NSView).?;
-    // const AppDelegateClass = objc.allocateClassPair(NSObject, "AppDelegate").?;
-    // _ = AppDelegateClass.addMethod(
-    //     "applicationDidFinishLaunching:",
-    //     AppDelegate.applicationDidFinishLaunching,
-    // ) catch unreachable;
-    // objc.registerClassPair(AppDelegateClass);
+    const delegate = AppDelegate.alloc();
+    delegate.init();
 
-    const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
-    app.msgSend(void, "setActivationPolicy:", .{0});
-
-    const app_del = AppDelegateClass.msgSend(objc.Object, "alloc", .{});
-    app_del.msgSend(void, "init", .{});
-
-    // const window = NSWindow.msgSend(objc.Object, "alloc", .{});
-    // window.msgSend(void, "initWithContentRect:styleMask:backing:defer:", .{
-    //     c.CGRect{
-    //         .origin = .{
-    //             .x = 0,
-    //             .y = 0,
-    //         },
-    //         .size = .{
-    //             .width = 600,
-    //             .height = 600,
-    //         },
-    //     },
-    //     NSWindowStyleMask{
-    //         .titled = true,
-    //         .closable = true,
-    //         .resizable = true,
-    //     },
-    //     NSBackingStoreType.buffered,
-    //     false,
-    // });
-    // window.msgSend(void, "setTitle:", .{title});
-    // window.msgSend(void, "makeKeyAndOrderFront:", .{null});
-
-    app.msgSend(void, "setDelegate:", .{app_del});
-    app.msgSend(void, "activateIgnoringOtherApps:", .{true});
-    app.msgSend(void, "run", .{});
+    app.setDelegate(delegate);
+    app.activateIgnoringOtherApps(true);
+    app.run();
 }
