@@ -12,6 +12,12 @@
         .objc = .{
             .path = "../zig-objc",
         },
+        .clay = .{
+            .path = "../zig-clay",
+        },
+        .cairo = .{
+            .path = "../zig-cairo-bindings",
+        },
     },
     .paths = .{
         "build.zig",

@@ -4,11 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const clay_dep = b.dependency("clay", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    exe_mod.addImport("clay", clay_dep.module("clay"));
 
     const exe = b.addExecutable(.{
         .name = "open_etcher",
@@ -42,6 +49,13 @@ pub fn build(b: *std.Build) void {
         })) |objc_dep| {
             exe_mod.addImport("objc", objc_dep.module("objc"));
             exe.linkFramework("Cocoa");
+        }
+
+        if (b.lazyDependency("cairo", .{
+            .target = target,
+            .optimize = optimize,
+        })) |cairo_dep| {
+            exe_mod.addImport("cairo", cairo_dep.module("cairo"));
         }
     }
 }
