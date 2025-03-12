@@ -93,14 +93,59 @@ pub extern const NSWindowWillCloseNotification: NSNotification.Name;
 pub const NSWindow = ExternalClass(
     "NSWindow",
     struct {
+        /// NSWindowStyleMask
+        ///
+        /// See https://github.com/hexops/xcode-frameworks/blob/8a1cfb373587ea4c9bb1468b7c986462d8d4e10e/Frameworks/AppKit.framework/Headers/NSWindow.h#L54
         pub const StyleMask = packed struct(u32) {
             titled: bool = false,
             closable: bool = false,
             miniaturizable: bool = false,
             resizable: bool = false,
-            _: u28 = 0,
 
-            pub const fullscreen: StyleMask = .{};
+            /// Only applicable for \c NSPanel (or a subclass thereof).
+            utility_window: bool = false,
+
+            _0: u1 = 0,
+
+            /// Only applicable for \c NSPanel (or a subclass thereof).
+            doc_modal_window: bool = false,
+
+            /// Specifies that a panel that does not activate the owning application. Only applicable for \c NSPanel (or a subclass thereof).
+            non_activating_panel: bool = false,
+
+            /// Textured window style is deprecated and should no longer be used. Specifies a window with textured background. Textured windows generally don't draw a top border line under the titlebar/toolbar. To get that line, use the \c NSUnifiedTitleAndToolbarWindowMask mask.
+            textured_background: bool = false,
+
+            _1: u3 = 0,
+
+            /// Specifies a window whose titlebar and toolbar have a unified look - that is, a continuous background. Under the titlebar and toolbar a horizontal separator line will appear.
+            unified_title_and_toolbar: bool = false,
+
+            /// Specifies a heads up display panel.  Only applicable for \c NSPanel (or a subclass thereof).
+            hud_window: bool = false,
+
+            /// When present, the window will appear full screen. This mask is automatically toggled when \c -toggleFullScreen: is called.
+            fullscreen: bool = false,
+
+            /// If set, the \c contentView will consume the full size of the window; it can be combined with other window style masks, but is only respected for windows with a titlebar. Utilizing this mask opts-in to layer-backing. Utilize the \c contentLayoutRect or auto-layout \c contentLayoutGuide to layout views underneath the titlebar/toolbar area.
+            full_size_content_view: bool = false,
+
+            _2: u16 = 0,
+
+            test {
+                try std.testing.expectEqual(1 << 0, @as(u32, @bitCast(StyleMask{ .titled = true })));
+                try std.testing.expectEqual(1 << 1, @as(u32, @bitCast(StyleMask{ .closable = true })));
+                try std.testing.expectEqual(1 << 2, @as(u32, @bitCast(StyleMask{ .miniaturizable = true })));
+                try std.testing.expectEqual(1 << 3, @as(u32, @bitCast(StyleMask{ .resizable = true })));
+                try std.testing.expectEqual(1 << 4, @as(u32, @bitCast(StyleMask{ .utility_window = true })));
+                try std.testing.expectEqual(1 << 6, @as(u32, @bitCast(StyleMask{ .doc_modal_window = true })));
+                try std.testing.expectEqual(1 << 7, @as(u32, @bitCast(StyleMask{ .non_activating_panel = true })));
+                try std.testing.expectEqual(1 << 8, @as(u32, @bitCast(StyleMask{ .textured_background = true })));
+                try std.testing.expectEqual(1 << 12, @as(u32, @bitCast(StyleMask{ .unified_title_and_toolbar = true })));
+                try std.testing.expectEqual(1 << 13, @as(u32, @bitCast(StyleMask{ .hud_window = true })));
+                try std.testing.expectEqual(1 << 14, @as(u32, @bitCast(StyleMask{ .fullscreen = true })));
+                try std.testing.expectEqual(1 << 15, @as(u32, @bitCast(StyleMask{ .full_size_content_view = true })));
+            }
         };
 
         pub fn init(self: NSWindow, rect: cg.Rect, window_style: StyleMask, backing: NSBackingStoreType, @"defer": bool) void {
@@ -122,8 +167,16 @@ pub const NSWindow = ExternalClass(
         pub fn makeKeyAndOrderFront(self: NSWindow, sender: anytype) void {
             self.msgSend(void, "makeKeyAndOrderFront:", .{sender});
         }
+
+        pub fn setTitlebarAppearsTransparent(self: NSWindow, titlebarAppearsTransparent: bool) void {
+            self.msgSend(void, "setTitlebarAppearsTransparent:", .{titlebarAppearsTransparent});
+        }
     },
 );
+
+test {
+    _ = NSWindow.StyleMask;
+}
 
 pub const NSTrackingArea = ExternalClass(
     "NSTrackingArea",
@@ -172,6 +225,21 @@ pub const NSTrackingArea = ExternalClass(
             enabled_during_mouse_drag: bool = false,
 
             _: u21 = 0,
+
+            test {
+                try std.testing.expectEqual(0x001, @as(u32, @bitCast(Options{ .events = .{ .mouse_entered_and_exited = true } })));
+                try std.testing.expectEqual(0x002, @as(u32, @bitCast(Options{ .events = .{ .mouse_moved = true } })));
+                try std.testing.expectEqual(0x004, @as(u32, @bitCast(Options{ .events = .{ .cursor_update = true } })));
+
+                try std.testing.expectEqual(0x010, @as(u32, @bitCast(Options{ .active = .when_first_responder })));
+                try std.testing.expectEqual(0x020, @as(u32, @bitCast(Options{ .active = .in_key_window })));
+                try std.testing.expectEqual(0x030, @as(u32, @bitCast(Options{ .active = .in_active_app })));
+                try std.testing.expectEqual(0x040, @as(u32, @bitCast(Options{ .active = .always })));
+
+                try std.testing.expectEqual(0x100, @as(u32, @bitCast(Options{ .assume_inside = true })));
+                try std.testing.expectEqual(0x200, @as(u32, @bitCast(Options{ .in_visible_rect = true })));
+                try std.testing.expectEqual(0x400, @as(u32, @bitCast(Options{ .enabled_during_mouse_drag = true })));
+            }
         };
 
         pub fn init(self: NSTrackingArea, rect: cg.Rect, options: Options, owner: NSView, user_data: ?*anyopaque) void {
@@ -180,19 +248,8 @@ pub const NSTrackingArea = ExternalClass(
     },
 );
 
-test "NSTrackingArea Options" {
-    try std.testing.expectEqual(0x001, @as(u32, @bitCast(NSTrackingArea.Options{ .events = .{ .mouse_entered_and_exited = true } })));
-    try std.testing.expectEqual(0x002, @as(u32, @bitCast(NSTrackingArea.Options{ .events = .{ .mouse_moved = true } })));
-    try std.testing.expectEqual(0x004, @as(u32, @bitCast(NSTrackingArea.Options{ .events = .{ .cursor_update = true } })));
-
-    try std.testing.expectEqual(0x010, @as(u32, @bitCast(NSTrackingArea.Options{ .active = .when_first_responder })));
-    try std.testing.expectEqual(0x020, @as(u32, @bitCast(NSTrackingArea.Options{ .active = .in_key_window })));
-    try std.testing.expectEqual(0x030, @as(u32, @bitCast(NSTrackingArea.Options{ .active = .in_active_app })));
-    try std.testing.expectEqual(0x040, @as(u32, @bitCast(NSTrackingArea.Options{ .active = .always })));
-
-    try std.testing.expectEqual(0x100, @as(u32, @bitCast(NSTrackingArea.Options{ .assume_inside = true })));
-    try std.testing.expectEqual(0x200, @as(u32, @bitCast(NSTrackingArea.Options{ .in_visible_rect = true })));
-    try std.testing.expectEqual(0x400, @as(u32, @bitCast(NSTrackingArea.Options{ .enabled_during_mouse_drag = true })));
+test "NSTrackingArea.Options" {
+    _ = NSTrackingArea.Options;
 }
 
 pub const NSString = ExternalClass(
