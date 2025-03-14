@@ -1,9 +1,8 @@
 const std = @import("std");
 const clay = @import("clay");
 
-const fonts: []const [*]const u8 = &[_][*]const u8{
-    "Callistoga",
-    "Quicksand Semibold",
+const fonts: []const [*:0]const u8 = &.{
+    "sans-serif",
 };
 
 var reinitialize_clay = false;
@@ -54,3 +53,10 @@ pub fn AppState(comptime T: type) type {
 pub fn render(commands: clay.RenderCommandArray) void {
     clay.renderers.cairo.render(commands, @ptrCast(fonts.ptr));
 }
+
+pub const Cursor = enum {
+    arrow,
+    pointer,
+
+    pub const default = Cursor.arrow;
+};

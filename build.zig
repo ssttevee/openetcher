@@ -1,4 +1,5 @@
 const std = @import("std");
+const clay = @import("clay");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -7,6 +8,7 @@ pub fn build(b: *std.Build) void {
     const clay_dep = b.dependency("clay", .{
         .target = target,
         .optimize = optimize,
+        .renderers = @as([]const []const u8, @ptrCast(&[_][]const u8{"cairo"})),
     });
 
     const exe_mod = b.createModule(.{

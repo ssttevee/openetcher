@@ -10,13 +10,22 @@ const CustomClass = @import("macos/objc.zig").CustomClass;
 extern fn CGContextTranslateCTM(cg_context: *anyopaque, tx: f64, ty: f64) void;
 extern fn CGContextScaleCTM(cg_context: *anyopaque, sx: f64, sy: f64) void;
 
-pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T)) clay.RenderCommandArray) type {
+pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArray) type {
     return struct {
         const State = common.AppState(T);
 
         const AppDelegate = CustomClass(
             appkit.NSObject,
             struct {
+                const Configuration = struct {
+                    initial_width: f64,
+                    initial_height: f64,
+                };
+
+                pub const ivars = struct {
+                    config: Configuration,
+                };
+
                 pub fn init(self: AppDelegate) void {
                     self.msgSend(void, "init", .{});
                 }
@@ -33,11 +42,11 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
                     return true;
                 }
 
-                pub fn windowWillClose(self: AppDelegate, _: objc.Sel, _: appkit.NSNotification) void {
-                    _ = self;
+                // pub fn windowWillClose(self: AppDelegate, _: objc.Sel, _: appkit.NSNotification) void {
+                //     _ = self;
 
-                    std.debug.print("window is closing\n", .{});
-                }
+                //     // std.debug.print("window is closing\n", .{});
+                // }
 
                 pub fn applicationDidFinishLaunching(self: AppDelegate, _: objc.Sel) bool {
                     const window = appkit.NSWindow.alloc();
@@ -48,8 +57,8 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
                                 .y = 100,
                             },
                             .size = .{
-                                .width = 600,
-                                .height = 600,
+                                .width = 800,
+                                .height = 480,
                             },
                         },
                         .{
@@ -73,8 +82,8 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
 
                     const view = CustomView.init(.{
                         .origin = .{
-                            .x = 14,
-                            .y = 14,
+                            .x = 0,
+                            .y = 0,
                         },
                         .size = view_size,
                     });
@@ -82,13 +91,13 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
                     window.setContentView(view);
                     window.becomeFirstResponder();
 
-                    const title = appkit.NSString.stringWithUTF8String("OpenEtcher");
+                    // const title = appkit.NSString.stringWithUTF8String("OpenEtcher");
 
-                    window.setTitle(title);
+                    // window.setTitle(title);
                     window.makeKeyAndOrderFront(null);
                     window.setTitlebarAppearsTransparent(true);
 
-                    appkit.NSNotificationCenter.defaultCenter().addObserver(self, "windowWillClose:", appkit.NSWindowWillCloseNotification, window);
+                    // appkit.NSNotificationCenter.defaultCenter().addObserver(self, "windowWillClose:", appkit.NSWindowWillCloseNotification, window);
 
                     self.setWindow(window);
 
@@ -142,20 +151,24 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
                 }
 
                 pub fn mouseMoved(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
-                    self.setNeedsDisplay(true);
                     clay.setPointerState(self.getPointerPosition(event), self.state().common.mouse_down);
+                    self.setNeedsDisplay(true);
                 }
 
                 pub fn mouseDown(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
-                    self.setNeedsDisplay(true);
                     self.state().common.mouse_down = true;
-                    clay.setPointerState(self.getPointerPosition(event), false);
+                    // not sure why this needs to be called twice to take effect for onHover
+                    clay.setPointerState(self.getPointerPosition(event), true);
+                    clay.setPointerState(self.getPointerPosition(event), true);
+                    self.setNeedsDisplay(true);
                 }
 
                 pub fn mouseUp(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
-                    self.setNeedsDisplay(true);
                     self.state().common.mouse_down = false;
+                    // not sure why this needs to be called twice to take effect for onHover
                     clay.setPointerState(self.getPointerPosition(event), false);
+                    clay.setPointerState(self.getPointerPosition(event), false);
+                    self.setNeedsDisplay(true);
                 }
 
                 pub fn drawRect(self: CustomView, _: objc.Sel, _: appkit.cg.Rect) void {
@@ -177,7 +190,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
 
                     clay.renderers.cairo.initialize(cairo_ctx);
 
-                    common.render(layoutFn(self.state()));
+                    common.render(layoutFn(&self.state().data));
                 }
             },
         );
@@ -212,3 +225,12 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *const common.AppState(T))
         }
     };
 }
+
+pub const platform = struct {
+    pub fn setCursor(cursor: common.Cursor) void {
+        (switch (cursor) {
+            .arrow => appkit.NSCursor.arrowCursor(),
+            .pointer => appkit.NSCursor.pointingHandCursor(),
+        }).set();
+    }
+};

@@ -306,3 +306,82 @@ pub const NSNotificationCenter = ExternalClass(
         }
     },
 );
+
+pub const NSCursor = ExternalClass(
+    "NSCursor",
+    struct {
+        /// Returns the pointing-hand system cursor.
+        pub fn pointingHandCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "pointingHandCursor", .{});
+        }
+
+        /// Returns the default cursor, the arrow cursor.
+        pub fn arrowCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "arrowCursor", .{});
+        }
+
+        /// Returns the contextual menu system cursor.
+        pub fn contextualMenuCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "contextualMenuCursor", .{});
+        }
+
+        /// Returns the closed-hand system cursor.
+        pub fn closedHandCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "closedHandCursor", .{});
+        }
+
+        /// Returns the cross-hair system cursor.
+        pub fn crosshairCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "crosshairCursor", .{});
+        }
+
+        /// Returns a cursor indicating that the current operation will result in a disappearing item.
+        pub fn disappearingItemCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "disappearingItemCursor", .{});
+        }
+
+        /// Returns a cursor indicating that the current operation will result in a copy action.
+        pub fn dragCopyCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "dragCopyCursor", .{});
+        }
+
+        /// Returns a cursor indicating that the current operation will result in a link action.
+        pub fn dragLinkCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "dragLinkCursor", .{});
+        }
+
+        /// Returns a cursor that looks like a capital I with a tiny crossbeam at its middle.
+        pub fn iBeamCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "iBeamCursor", .{});
+        }
+
+        /// Returns the open-hand system cursor.
+        pub fn openHandCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "openHandCursor", .{});
+        }
+
+        /// Returns the operation not allowed cursor.
+        pub fn operationNotAllowedCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "operationNotAllowedCursor", .{});
+        }
+
+        /// Returns the resize-down system cursor.
+        pub fn resizeDownCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "resizeDownCursor", .{});
+        }
+
+        /// Returns the resize-left system cursor.
+        pub fn resizeLeftCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "resizeLeftCursor", .{});
+        }
+
+        /// Returns the resize-left-and-right system cursor.
+        pub fn resizeLeftRightCursor() NSCursor {
+            return NSCursor.class().msgSend(NSCursor, "resizeLeftRightCursor", .{});
+        }
+
+        pub fn set(self: NSCursor) void {
+            self.msgSend(void, "set", .{});
+        }
+    },
+);
