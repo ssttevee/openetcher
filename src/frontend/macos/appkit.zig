@@ -9,6 +9,24 @@ pub const NSObject = ExternalClass(
     struct {},
 );
 
+pub const NSThread = ExternalClass(
+    "NSThread",
+    struct {
+        pub inline fn isMainThread() bool {
+            return NSThread.class().msgSend(bool, "isMainThread", .{});
+        }
+    },
+);
+
+pub const NSNumber = ExternalClass(
+    "NSNumber",
+    struct {
+        pub inline fn numberWithBool(value: bool) NSNumber {
+            return NSNumber.class().msgSend(NSNumber, "numberWithBool:", .{value});
+        }
+    },
+);
+
 pub const NSView = ExternalClass(
     "NSView",
     struct {

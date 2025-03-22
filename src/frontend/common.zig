@@ -41,12 +41,22 @@ pub fn setLayoutDimensions(layout_dimensions: clay.Dimensions) !void {
 
 pub const CommonState = struct {
     mouse_down: bool = false,
+
+    redraw_ptr: ?*anyopaque = null,
+    redraw_fn: ?*const fn (?*anyopaque) void = null,
 };
 
 pub fn AppState(comptime T: type) type {
     return struct {
         common: CommonState = .{},
         data: T = .default,
+
+        pub inline fn redraw(data_ptr: *const T) void {
+            const self: *const @This() = @fieldParentPtr("data", data_ptr);
+            if (self.common.redraw_fn) |f| {
+                f(self.common.redraw_ptr);
+            }
+        }
     };
 }
 

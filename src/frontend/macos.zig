@@ -118,7 +118,22 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                     self.super().initWithFrame(frame);
 
                     const view_state = std.heap.page_allocator.create(State) catch unreachable;
-                    view_state.* = .{};
+                    view_state.* = .{
+                        .common = .{
+                            .redraw_ptr = @ptrCast(self.object.value),
+                            .redraw_fn = struct {
+                                fn redraw(ptr: ?*anyopaque) void {
+                                    const view: CustomView = .{ .object = .{ .value = @alignCast(@ptrCast(ptr)) } };
+                                    const ismain = appkit.NSThread.isMainThread();
+                                    if (ismain) {
+                                        view.msgSend(void, "setNeedsDisplay:", .{true});
+                                    } else {
+                                        view.msgSend(void, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("setNeedsDisplay:"), appkit.NSNumber.numberWithBool(true), false });
+                                    }
+                                }
+                            }.redraw,
+                        },
+                    };
 
                     self.ivarSet(.state, view_state);
 
@@ -138,7 +153,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                     return self.ivarGet(.state).?;
                 }
 
-                pub fn setNeedsDisplay(self: CustomView, needs_display: bool) void {
+                pub inline fn setNeedsDisplay(self: CustomView, needs_display: bool) void {
                     self.msgSend(void, "setNeedsDisplay:", .{needs_display});
                 }
 
@@ -152,7 +167,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
 
                 pub fn mouseMoved(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
                     clay.setPointerState(self.getPointerPosition(event), self.state().common.mouse_down);
-                    self.setNeedsDisplay(true);
+                    // self.setNeedsDisplay(true);
                 }
 
                 pub fn mouseDown(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
@@ -160,7 +175,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                     // not sure why this needs to be called twice to take effect for onHover
                     clay.setPointerState(self.getPointerPosition(event), true);
                     clay.setPointerState(self.getPointerPosition(event), true);
-                    self.setNeedsDisplay(true);
+                    // self.setNeedsDisplay(true);
                 }
 
                 pub fn mouseUp(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
@@ -168,7 +183,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                     // not sure why this needs to be called twice to take effect for onHover
                     clay.setPointerState(self.getPointerPosition(event), false);
                     clay.setPointerState(self.getPointerPosition(event), false);
-                    self.setNeedsDisplay(true);
+                    // self.setNeedsDisplay(true);
                 }
 
                 pub fn drawRect(self: CustomView, _: objc.Sel, _: appkit.cg.Rect) void {
@@ -223,6 +238,8 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
             app.activateIgnoringOtherApps(true);
             app.run();
         }
+
+        pub const redraw = State.redraw;
     };
 }
 
