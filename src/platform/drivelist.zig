@@ -9,6 +9,7 @@ pub const DeviceDescriptor = struct {
     };
 
     pub const Enumerator = enum {
+        none,
         /// macos DeviceArbitration
         device_arbitration,
     };
@@ -27,7 +28,7 @@ pub const DeviceDescriptor = struct {
     bus_type: ?[]const u8 = null,
     bus_version: ?[]const u8 = null,
     device: []const u8,
-    device_path: ?[]const u8,
+    device_path: ?[]const u8 = null,
     raw: []const u8,
     description: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
@@ -37,19 +38,19 @@ pub const DeviceDescriptor = struct {
     logical_block_size: u32 = 512,
     mount_points: []const MountPoint = &.{},
     /// Device is read-only
-    is_read_only: bool,
+    is_read_only: bool = false,
     /// Device is a system drive
-    is_system: bool,
+    is_system: bool = false,
     /// Device is a virtual storage device
-    is_virtual: bool,
+    is_virtual: bool = false,
     /// Device is removable from the running system
-    is_removable: bool,
+    is_removable: bool = false,
     /// Device is an SD-card
-    is_card: bool,
+    is_card: bool = false,
     /// Connected via the Small Computer System Interface (SCSI)
-    is_scsi: bool,
+    is_scsi: bool = false,
     /// Connected via Universal Serial Bus (USB)
-    is_usb: bool,
+    is_usb: bool = false,
     /// Connected via the USB Attached SCSI (UAS)
     is_uas: ?bool = null,
 

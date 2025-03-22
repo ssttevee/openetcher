@@ -17,18 +17,60 @@ const colors = struct {
     const loading_bar_fg = clay.Color.rgb(39, 202, 32);
 };
 
+var disks: ?[]const platform.DeviceDescriptor = &.{
+    .{
+        .enumerator = .none,
+        .device = "/dev/null",
+        .raw = "/dev/null",
+        .size = std.math.maxInt(u64),
+        .is_system = true,
+    },
+};
+
 const FrontPage = struct {
-    current_step: u8 = 0,
     highlighted_button: u8 = 0,
     prev_highlighted_button: u8 = 0,
     hovering_button: bool = false,
     prev_hovering: bool = false,
+    override_view_state: union(enum) {
+        none,
+        url_input: []const u8,
+        disk_input: usize,
+        disk_output: []const usize,
+    } = .none,
     selected_image: ?struct {
         kind: enum { file, url, disk },
         path: []const u8,
-        size: usize,
-        real_size: usize,
+        size: ?struct {
+            compressed: usize,
+            compression: CompressionType,
+            decompressed: usize,
+        } = null,
+
+        fn ready(self: @This()) bool {
+            return self.size != null;
+        }
     } = null,
+    selected_disks: ?[]const usize = null,
+
+    var compressed_size_buf: [32]u8 = undefined;
+    var decompressed_size_buf: [32]u8 = undefined;
+
+    const CompressionType = enum { none, gzip, xz, zstd };
+
+    fn currentStep(self: *const FrontPage) u8 {
+        if (self.selected_disks) |_| {
+            return 2;
+        }
+
+        if (self.selected_image) |selected_image| {
+            if (selected_image.ready()) {
+                return 1;
+            }
+        }
+
+        return 0;
+    }
 
     const step_buttons = [_][]const [2][]const u8{
         &[_][2][]const u8{
@@ -48,8 +90,18 @@ const FrontPage = struct {
         return @as(*MyState, @alignCast(@fieldParentPtr("front_page", self)));
     }
 
+    fn ready(self: *const FrontPage) bool {
+        if (self.selected_image) |selected_image| {
+            if (!selected_image.ready()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     fn buttonColor(state: *const FrontPage, step_number: u8, button_number: u8) clay.Color {
-        if (state.current_step != step_number) {
+        if (state.currentStep() != step_number or !state.ready()) {
             return colors.disabled_btn;
         }
 
@@ -63,7 +115,7 @@ const FrontPage = struct {
     const btn_text_size = 14;
 
     fn buttonTextConfig(state: *const FrontPage, comptime step_number: u8, comptime button_number: u8) *const clay.TextElementConfig {
-        if (state.current_step != step_number) {
+        if (state.currentStep() != step_number) {
             return comptime &.{ .font_size = btn_text_size, .text_color = colors.disabled_btn_text };
         }
 
@@ -85,7 +137,14 @@ const FrontPage = struct {
         };
     }
 
-    inline fn buttonLayout(state: *FrontPage, comptime step_number: u8, comptime button_number: u8, comptime element_id_label: []const u8, comptime button_text: []const u8) void {
+    inline fn buttonLayout(
+        state: *FrontPage,
+        comptime step_number: u8,
+        comptime button_number: u8,
+        comptime element_id_label: []const u8,
+        comptime button_text: []const u8,
+        onHoverFn: ?*const clay.OnHoverFn,
+    ) void {
         clay.ui()(.{
             .id = clay.id(element_id_label),
             .layout = .{
@@ -98,12 +157,16 @@ const FrontPage = struct {
             .background_color = state.buttonColor(step_number, button_number),
             .corner_radius = .all(22),
         })({
+            if (onHoverFn) |onHover| {
+                clay.setOnHover(onHover, @ptrCast(state));
+            }
+
             clay.text(button_text, state.buttonTextConfig(step_number, button_number));
         });
     }
 
-    inline fn createLayout(state: *FrontPage) void {
-        clay.setOnHover(onHoverButtonStack, @ptrCast(state));
+    inline fn createLayout(self: *FrontPage) void {
+        clay.setOnHover(onHoverButtonStack, @ptrCast(self));
 
         clay.ui()(.{
             .layout = .{
@@ -179,23 +242,230 @@ const FrontPage = struct {
                 .child_gap = 48,
             },
         })({
-            inline for (step_buttons, 0..) |buttons, step_number| {
-                clay.ui()(.{
-                    .layout = .{
-                        .sizing = .{ .width = .fixed(200) },
-                        .layout_direction = .top_to_bottom,
-                    },
-                })({
-                    inline for (buttons, 0..) |btn, btn_number| {
-                        state.buttonLayout(step_number, btn_number, btn[0], btn[1]);
+            clay.ui()(.{
+                .layout = .{
+                    .sizing = .{ .width = .fixed(200) },
+                    .layout_direction = .top_to_bottom,
+                },
+            })({
+                if (self.selected_image) |selected_image| {
+                    clay.ui()(.{
+                        .layout = .{
+                            .sizing = .{
+                                .width = .grow(.{}),
+                            },
+                            .padding = .y(16),
+                            .child_alignment = .center,
+                        },
+                    })({
+                        clay.text(selected_image.path[std.mem.lastIndexOfScalar(u8, selected_image.path, '/').? + 1 ..], comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                    });
+
+                    if (selected_image.size) |size| {
+                        clay.ui()(.{
+                            .layout = .{
+                                .sizing = .{
+                                    .width = .grow(.{}),
+                                },
+                                .padding = .y(16),
+                                .child_alignment = .center,
+                            },
+                        })({
+                            clay.ui()(.{
+                                .id = clay.id("CancelImageButton"),
+                            })({
+                                clay.setOnHover(
+                                    struct {
+                                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                            _ = element_id;
+
+                                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                            if (pointer_data.state == .released_this_frame) {
+                                                state.selected_image = null;
+                                            }
+
+                                            state.parentState().redraw();
+                                        }
+                                    }.onHover,
+                                    @ptrCast(self),
+                                );
+                                clay.text("Cancel", if (clay.isPointerOver(clay.id("CancelImageButton"))) comptime &.{ .font_size = 14, .text_color = colors.highlighted_btn } else comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                            });
+                        });
+
+                        clay.ui()(.{
+                            .layout = .{
+                                .sizing = .{
+                                    .width = .grow(.{}),
+                                },
+                                .padding = .y(16),
+                                .child_alignment = .center,
+                            },
+                        })({
+                            clay.text(std.fmt.bufPrint(&decompressed_size_buf, "{0.2}", .{HumanizeBytes{ .bytes = @floatFromInt(size.decompressed) }}) catch unreachable, comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                        });
+                    } else {
+                        clay.ui()(.{
+                            .layout = .{
+                                .sizing = .{
+                                    .width = .grow(.{}),
+                                },
+                                .padding = .y(16),
+                                .child_alignment = .center,
+                            },
+                        })({
+                            clay.text("Calculating Size", comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                        });
                     }
-                });
-            }
+                } else {
+                    self.buttonLayout(
+                        0,
+                        0,
+                        step_buttons[0][0][0],
+                        step_buttons[0][0][1],
+                        struct {
+                            fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                _ = element_id;
+
+                                const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                if (pointer_data.state == .released_this_frame) {
+                                    const maybe_path = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
+                                    if (maybe_path) |path| {
+                                        state.selected_image = .{ .kind = .file, .path = path };
+                                    } else {
+                                        return;
+                                    }
+
+                                    const thread = std.Thread.spawn(.{}, calculateImageSize, .{state}) catch unreachable;
+                                    thread.detach();
+                                }
+                            }
+                        }.onHover,
+                    );
+                    self.buttonLayout(0, 1, step_buttons[0][1][0], step_buttons[0][1][1], null);
+                    self.buttonLayout(0, 2, step_buttons[0][2][0], step_buttons[0][2][1], null);
+                }
+            });
+
+            clay.ui()(.{
+                .layout = .{
+                    .sizing = .{ .width = .fixed(200) },
+                    .layout_direction = .top_to_bottom,
+                },
+            })({
+                self.buttonLayout(
+                    1,
+                    0,
+                    step_buttons[1][0][0],
+                    step_buttons[1][0][1],
+                    struct {
+                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                            _ = element_id;
+
+                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                            if (pointer_data.state == .released_this_frame) {
+                                state.selected_disks = &.{0};
+                            }
+                        }
+                    }.onHover,
+                );
+            });
+
+            clay.ui()(.{
+                .layout = .{
+                    .sizing = .{ .width = .fixed(200) },
+                    .layout_direction = .top_to_bottom,
+                },
+            })({
+                self.buttonLayout(
+                    2,
+                    0,
+                    step_buttons[2][0][0],
+                    step_buttons[2][0][1],
+                    struct {
+                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                            _ = element_id;
+
+                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                            if (pointer_data.state == .released_this_frame) {
+                                state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
+                                platform.setCursor(.default);
+                            }
+                        }
+                    }.onHover,
+                );
+            });
         });
     }
 
+    fn calculateImageSize(self: *FrontPage) !void {
+        if (self.selected_image) |*selected_image| {
+            if (selected_image.size == null) {
+                const file, const compressed_size = switch (selected_image.kind) {
+                    .file => blk: {
+                        const file = try std.fs.openFileAbsolute(selected_image.path, .{});
+                        const stat = try file.stat();
+
+                        break :blk .{ file, stat.size };
+                    },
+                    .url => std.debug.panic("not implemented", .{}),
+                    .disk => std.debug.panic("not implemented", .{}),
+                };
+                defer file.close();
+
+                var br = std.io.bufferedReader(file.reader());
+                var hack_buf: [0]u8 = undefined; // hack to peek
+                _ = try br.read(&hack_buf);
+
+                var decompressed_size: usize = 0;
+                var compression_type: CompressionType = .none;
+                if (std.mem.startsWith(u8, &br.buf, &.{ 0x1f, 0x8b })) {
+                    compression_type = .gzip;
+
+                    var d = std.compress.gzip.decompressor(br.reader());
+                    while (try d.next()) |bytes| {
+                        decompressed_size += bytes.len;
+                    }
+                } else if (std.mem.startsWith(u8, &br.buf, &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 })) {
+                    compression_type = .xz;
+
+                    var d = try std.compress.xz.decompress(std.heap.page_allocator, br.reader());
+                    defer d.deinit();
+
+                    var buf: [4096]u8 = undefined;
+                    while (true) {
+                        const n = try d.read(&buf);
+                        decompressed_size += n;
+                    }
+                } else if (std.mem.startsWith(u8, &br.buf, &.{ 0x28, 0xb5, 0x2f, 0xfd })) {
+                    compression_type = .zstd;
+
+                    var window_buf: [std.compress.zstd.DecompressorOptions.default_window_buffer_len]u8 = undefined;
+                    var d = std.compress.zstd.decompressor(br.reader(), .{ .window_buffer = &window_buf, .verify_checksum = false });
+
+                    var buf: [4096]u8 = undefined;
+                    while (true) {
+                        const n = try d.read(&buf);
+                        decompressed_size += n;
+                    }
+                } else {
+                    // assume image is not compressed
+                    decompressed_size = compressed_size;
+                }
+
+                selected_image.size = .{
+                    .compressed = compressed_size,
+                    .compression = compression_type,
+                    .decompressed = decompressed_size,
+                };
+            }
+        }
+
+        self.parentState().redraw();
+    }
+
     fn onHoverButtonStack(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-        _ = element_id;
+        std.debug.print("onHoverButtonStack {s}\n", .{element_id.string_id.asSlice()});
 
         const state: *FrontPage = @alignCast(@ptrCast(user_data));
         if (state.parentState().* != .front_page) {
@@ -203,7 +473,7 @@ const FrontPage = struct {
         }
 
         state.highlighted_button, state.hovering_button = blk: {
-            for (step_buttons[state.current_step], 0..) |btn, btn_number| {
+            for (step_buttons[state.currentStep()], 0..) |btn, btn_number| {
                 if (clay.getElementData(clay.getElementId(btn[0]))) |element_data| {
                     if (element_data.bounding_box.contains(pointer_data.position)) {
                         break :blk .{ @intCast(btn_number), true };
@@ -226,70 +496,73 @@ const FrontPage = struct {
             platform.setCursor(if (state.hovering_button) .pointer else .default);
         }
 
-        switch (pointer_data.state) {
-            .released_this_frame => {
-                if (state.hovering_button) {
-                    // TODO: handle button click
-                    // std.debug.print("button {d} onmouseup\n", .{state.highlighted_button});
-                    if (state.current_step == 2) {
-                        state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
+        // switch (pointer_data.state) {
+        //     .released_this_frame => {
+        //         if (state.hovering_button) {
+        //             // TODO: handle button click
+        //             // std.debug.print("button {d} onmouseup\n", .{state.highlighted_button});
+        //             switch (state.currentStep()) {
+        //                 0 => {
+        //                     if (state.highlighted_button == 0) {
+        //                         const maybe_path = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
+        //                         if (maybe_path) |path| {
+        //                             state.selected_image = .{ .kind = .file, .path = path };
+        //                         }
 
-                        platform.setCursor(.default);
-                    } else if (state.current_step < step_buttons.len - 1) {
-                        if (state.current_step == 0 and state.highlighted_button == 0) {
-                            const maybe_url = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
-                            defer {
-                                if (maybe_url) |url| {
-                                    std.heap.page_allocator.free(url);
-                                }
-                            }
+        //                         const thread = std.Thread.spawn(.{}, calculateImageSize, .{state}) catch unreachable;
+        //                         thread.detach();
 
-                            std.debug.print("{?s}\n", .{maybe_url});
-                        }
+        //                         return;
+        //                     }
+        //                 },
+        //                 1 => {},
+        //                 2 => {
+        //                     state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
+        //                     platform.setCursor(.default);
+        //                 },
+        //                 else => unreachable,
+        //             }
 
-                        state.current_step += 1;
-                    }
-
-                    state.parentState().redraw();
-                }
-            },
-            // .pressed_this_frame => {
-            //     if (state.hovering_button) {
-            //         // TODO: handle button click
-            //         std.debug.print("button {d} onmousedown\n", .{state.highlighted_button});
-            //     }
-            // },
-            else => {},
-        }
+        //             state.parentState().redraw();
+        //         }
+        //     },
+        //     // .pressed_this_frame => {
+        //     //     if (state.hovering_button) {
+        //     //         // TODO: handle button click
+        //     //         std.debug.print("button {d} onmousedown\n", .{state.highlighted_button});
+        //     //     }
+        //     // },
+        //     else => {},
+        // }
 
         // std.debug.print("pointer_data.state {any}\n", .{pointer_data.state});
     }
 };
 
-const HumanizeBytesPerSecond = struct {
-    bytes_per_second: f64,
+const HumanizeBytes = struct {
+    bytes: f64,
 
     const units = [_][]const u8{
-        "B/s",
-        "KB/s",
-        "MB/s",
-        "GB/s",
-        "TB/s",
-        "PB/s",
-        "EB/s",
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB",
+        "PB",
+        "EB",
     };
 
-    pub fn format(self: HumanizeBytesPerSecond, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: HumanizeBytes, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = options;
 
         const unit, const num = blk: {
-            if (!std.math.isNormal(self.bytes_per_second)) {
+            if (!std.math.isNormal(self.bytes)) {
                 break :blk .{ units[0], @as(f64, 0.0) };
             }
             inline for (units, 0..) |unit, i| {
                 const magnitude = comptime std.math.pow(f64, 1000, i);
-                if (self.bytes_per_second < magnitude * 1000 or i == units.len - 1) {
-                    break :blk .{ unit, self.bytes_per_second / magnitude };
+                if (self.bytes < magnitude * 1000 or i == units.len - 1) {
+                    break :blk .{ unit, self.bytes / magnitude };
                 }
             }
         };
@@ -456,7 +729,7 @@ const Flashing = struct {
             });
         });
 
-        clay.text(std.fmt.bufPrint(&rate_buf, "{0.2}", .{HumanizeBytesPerSecond{ .bytes_per_second = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+        clay.text(std.fmt.bufPrint(&rate_buf, "{0.2}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
 
         if (percent == 1) {
             clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
