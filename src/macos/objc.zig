@@ -21,8 +21,8 @@ fn MappedClass(comptime Declarations: fn (type) type, comptime getClass: fn (typ
             return class().msgSend(@This(), "alloc", .{});
         }
 
-        pub fn release() @This() {
-            return class().msgSend(@This(), "release", .{});
+        pub fn release(self: @This()) void {
+            return self.msgSend(void, "release", .{});
         }
 
         pub inline fn classMsgSend(comptime Return: type, sel_raw: anytype, args: anytype) Return {

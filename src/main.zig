@@ -1,6 +1,7 @@
 const std = @import("std");
 const clay = @import("clay");
 
+const drivelist = @import("drivelist.zig");
 const frontend = @import("frontend.zig");
 const svg = @import("svg.zig");
 
@@ -269,6 +270,21 @@ const app = frontend.App(
 
 pub fn main() !void {
     app.run();
+}
+
+test "drivelist" {
+    const devices = try drivelist.listStorageDevices(std.testing.allocator);
+    defer {
+        for (devices) |device| {
+            device.deinit(std.testing.allocator);
+        }
+
+        std.testing.allocator.free(devices);
+    }
+
+    // for (devices) |device| {
+    //     std.debug.print("device: {s} {?s} {?s} {?s}\n", .{ device.device, device.device_path, device.bus_type, device.description });
+    // }
 }
 
 test {

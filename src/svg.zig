@@ -454,7 +454,7 @@ const parsePath = struct {
 }.parsePath;
 
 test parsePath {
-    const info = comptime parsePath("m5.5-6.343");
+    const info = comptime parsePath(1, "m5.5-6.343");
     try std.testing.expectEqual(2, info.path.num_data);
     try std.testing.expectEqual(@as(f64, 5.5), info.path.data[1].point.x);
     try std.testing.expectEqual(@as(f64, -6.343), info.path.data[1].point.y);

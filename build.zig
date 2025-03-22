@@ -45,12 +45,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
 
     if (target.result.os.tag == .macos) {
+        exe.linkFramework("Cocoa");
+        exe.linkFramework("DiskArbitration");
+
         if (b.lazyDependency("objc", .{
             .target = target,
             .optimize = optimize,
         })) |objc_dep| {
             exe_mod.addImport("objc", objc_dep.module("objc"));
-            exe.linkFramework("Cocoa");
         }
 
         if (b.lazyDependency("cairo", .{

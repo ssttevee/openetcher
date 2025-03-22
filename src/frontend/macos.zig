@@ -5,7 +5,7 @@ const clay = @import("clay");
 const cairo = @import("cairo");
 const common = @import("common.zig");
 
-const CustomClass = @import("macos/objc.zig").CustomClass;
+const CustomClass = @import("../macos/objc.zig").CustomClass;
 
 extern fn CGContextTranslateCTM(cg_context: *anyopaque, tx: f64, ty: f64) void;
 extern fn CGContextScaleCTM(cg_context: *anyopaque, sx: f64, sy: f64) void;
