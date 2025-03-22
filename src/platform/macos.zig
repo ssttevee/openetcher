@@ -9,3 +9,4 @@ pub fn setCursor(cursor: @import("common.zig").Cursor) void {
 
 pub const App = @import("macos/frontend.zig").App;
 pub const listStorageDevices = @import("macos/drivelist.zig").listStorageDevices;
+pub const selectImageFile = @import("macos/fileselector.zig").selectImageFile;

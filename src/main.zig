@@ -23,6 +23,12 @@ const FrontPage = struct {
     prev_highlighted_button: u8 = 0,
     hovering_button: bool = false,
     prev_hovering: bool = false,
+    selected_image: ?struct {
+        kind: enum { file, url, disk },
+        path: []const u8,
+        size: usize,
+        real_size: usize,
+    } = null,
 
     const step_buttons = [_][]const [2][]const u8{
         &[_][2][]const u8{
@@ -230,6 +236,17 @@ const FrontPage = struct {
 
                         platform.setCursor(.default);
                     } else if (state.current_step < step_buttons.len - 1) {
+                        if (state.current_step == 0 and state.highlighted_button == 0) {
+                            const maybe_url = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
+                            defer {
+                                if (maybe_url) |url| {
+                                    std.heap.page_allocator.free(url);
+                                }
+                            }
+
+                            std.debug.print("{?s}\n", .{maybe_url});
+                        }
+
                         state.current_step += 1;
                     }
 

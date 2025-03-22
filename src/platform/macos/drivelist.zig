@@ -1,11 +1,17 @@
 const std = @import("std");
 const drivelist = @import("../drivelist.zig");
 const objc = @import("objc.zig");
+const common = @import("common.zig");
 
 const c = @cImport({
     @cInclude("DiskArbitration/DiskArbitration.h");
     // @cInclude("Foundation/Foundation.h");
 });
+
+const NSString = common.NSString;
+const NSNumber = common.NSNumber;
+const NSArray = common.NSArray;
+const NSURL = common.NSURL;
 
 const CFRunLoop = objc.ExternalClass(
     "CFRunLoop",
@@ -25,23 +31,6 @@ const NSRunLoop = objc.ExternalClass(
     },
 );
 
-const NSArray = objc.ExternalClass(
-    "NSArray",
-    struct {
-        pub fn arrayWithObjects(objects: []const @import("objc").Object) NSArray {
-            return NSArray.class().msgSend(NSArray, "arrayWithObjects:count:", .{ objects.ptr, objects.len });
-        }
-
-        pub fn count(self: NSArray) u32 {
-            return self.msgSend(u32, "count", .{});
-        }
-
-        pub fn objectAt(self: NSArray, T: type, index: u32) T {
-            return self.msgSend(T, "objectAtIndex:", .{index});
-        }
-    },
-);
-
 const NSFileManager = objc.ExternalClass(
     "NSFileManager",
     struct {
@@ -51,21 +40,6 @@ const NSFileManager = objc.ExternalClass(
 
         pub fn mountedVolumeURLsIncludingResourceValuesForKeys(self: NSFileManager, keys: NSArray) NSArray {
             return self.msgSend(NSArray, "mountedVolumeURLsIncludingResourceValuesForKeys:options:", .{ keys, 0 });
-        }
-    },
-);
-
-const NSURL = objc.ExternalClass(
-    "NSURL",
-    struct {
-        pub fn getResourceValue(self: NSURL, key: NSString) ?*anyopaque {
-            var out: ?*anyopaque = undefined;
-            self.msgSend(void, "getResourceValue:forKey:error:", .{ &out, key, null });
-            return out;
-        }
-
-        pub fn path(self: NSURL) NSString {
-            return self.msgSend(NSString, "path", .{});
         }
     },
 );
@@ -118,42 +92,25 @@ test isDiskPartition {
     try std.testing.expect(!isDiskPartition("disk1sf"));
 }
 
-const NSString = objc.ExternalClass(
-    "NSString",
-    struct {
-        pub fn UTF8String(self: NSString) [*c]const u8 {
-            return self.msgSend([*c]const u8, "UTF8String", .{});
-        }
-    },
-);
-
 fn convertString(ptr: ?*const anyopaque) ?[]const u8 {
     if (@intFromPtr(ptr) % @alignOf(@import("objc").c.id) != 0) {
         return null;
     }
 
-    const cstr = (NSString{
-        .object = .{
-            .value = @constCast(@alignCast(@ptrCast(ptr orelse return null))),
-        },
-    }).UTF8String();
-    return std.mem.span(cstr);
+    return std.mem.span(
+        (NSString{
+            .object = .{
+                .value = @constCast(@alignCast(@ptrCast(ptr orelse return null))),
+            },
+        }).UTF8String(),
+    );
 }
 
-const NSNumber = objc.ExternalClass(
-    "NSNumber",
-    struct {
-        pub fn boolValue(self: NSNumber) bool {
-            return self.msgSend(bool, "boolValue", .{});
-        }
-
-        pub fn unsignedIntValue(self: NSNumber) u32 {
-            return self.msgSend(u32, "unsignedIntValue", .{});
-        }
-    },
-);
-
 fn convertBool(ptr: ?*const anyopaque) bool {
+    if (@intFromPtr(ptr) % @alignOf(@import("objc").c.id) != 0) {
+        return false;
+    }
+
     return (NSNumber{
         .object = .{
             .value = @constCast(@alignCast(@ptrCast(ptr orelse return false))),
@@ -162,7 +119,7 @@ fn convertBool(ptr: ?*const anyopaque) bool {
 }
 
 fn convertNumber(ptr: ?*const anyopaque) u32 {
-    if (@intFromPtr(ptr) % 8 != 0) {
+    if (@intFromPtr(ptr) % @alignOf(@import("objc").c.id) != 0) {
         return 0;
     }
 
@@ -247,7 +204,7 @@ extern const NSDefaultRunLoopMode: c.CFRunLoopMode;
 extern const NSURLVolumeNameKey: NSString;
 extern const NSURLVolumeLocalizedNameKey: NSString;
 
-pub fn listDeviceNames(allocator: std.mem.Allocator, session: *c.struct___DASession) ![]const []const u8 {
+fn listDeviceNames(allocator: std.mem.Allocator, session: *c.struct___DASession) ![]const []const u8 {
     var bsd_names: std.ArrayListUnmanaged([]const u8) = .{};
     defer {
         for (bsd_names.items) |bsd_name| {
@@ -284,6 +241,49 @@ pub fn listDeviceNames(allocator: std.mem.Allocator, session: *c.struct___DASess
     _ = c.CFRunLoopRunInMode(NSDefaultRunLoopMode, 0.05, 0);
 
     return bsd_names.toOwnedSlice(allocator);
+}
+
+fn handleApfs(
+    allocator: std.mem.Allocator,
+    devices: std.StringArrayHashMapUnmanaged(drivelist.DeviceDescriptor),
+    mount_points: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint)),
+) void {
+    // https://github.com/balena-io-modules/drivelist/blob/a616aa9875956ecf1a546cf1d2480ff281e54d2b/lib/index.ts#L69
+    var apfs: std.ArrayListUnmanaged(struct { *drivelist.DeviceDescriptor, *std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint) }) = .{};
+    defer apfs.deinit(allocator);
+
+    var other: std.StringHashMapUnmanaged(*std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint)) = .{};
+    defer other.deinit(allocator);
+
+    var device_iterator = devices.iterator();
+    while (device_iterator.next()) |entry| {
+        if (entry.value_ptr.device_path) |device_path| {
+            if (entry.value_ptr.description) |description| {
+                if (std.mem.eql(u8, description, "AppleAPFSMedia")) {
+                    if (mount_points.getPtr(entry.key_ptr.*)) |ptr| {
+                        try apfs.append(allocator, .{ entry.value_ptr, ptr });
+                    }
+                    continue;
+                }
+            }
+
+            if (!entry.value_ptr.is_virtual) {
+                if (mount_points.getPtr(entry.key_ptr.*)) |ptr| {
+                    try other.putNoClobber(allocator, device_path, ptr);
+                }
+            }
+        }
+    }
+
+    for (apfs.items) |item| {
+        const device, const device_mount_points = item;
+        if (device.device_path) |device_path| {
+            if (other.get(device_path)) |other_mount_points| {
+                try other_mount_points.appendSlice(allocator, device_mount_points.items);
+                device.is_virtual = true;
+            }
+        }
+    }
 }
 
 pub fn listStorageDevices(allocator: std.mem.Allocator) ![]drivelist.DeviceDescriptor {
@@ -343,9 +343,8 @@ pub fn listStorageDevices(allocator: std.mem.Allocator) ![]drivelist.DeviceDescr
     const volume_paths = NSFileManager.defaultManager().mountedVolumeURLsIncludingResourceValuesForKeys(volume_keys);
     defer volume_paths.release();
 
-    for (0..volume_paths.count()) |i| {
-        const path = volume_paths.objectAt(NSURL, @intCast(i));
-
+    var volume_paths_iterator = volume_paths.iterator();
+    while (volume_paths_iterator.next(NSURL)) |path| {
         const disk = c.DADiskCreateFromVolumePath(c.kCFAllocatorDefault, session, @ptrCast(path.object.value)) orelse continue;
         defer c.CFRelease(disk);
 
@@ -369,44 +368,7 @@ pub fn listStorageDevices(allocator: std.mem.Allocator) ![]drivelist.DeviceDescr
         }
     }
 
-    {
-        // handleApfs https://github.com/balena-io-modules/drivelist/blob/a616aa9875956ecf1a546cf1d2480ff281e54d2b/lib/index.ts#L69
-        var apfs: std.ArrayListUnmanaged(struct { *drivelist.DeviceDescriptor, *std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint) }) = .{};
-        defer apfs.deinit(allocator);
-
-        var other: std.StringHashMapUnmanaged(*std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint)) = .{};
-        defer other.deinit(allocator);
-
-        var device_iterator = devices.iterator();
-        while (device_iterator.next()) |entry| {
-            if (entry.value_ptr.device_path) |device_path| {
-                if (entry.value_ptr.description) |description| {
-                    if (std.mem.eql(u8, description, "AppleAPFSMedia")) {
-                        if (mount_points.getPtr(entry.key_ptr.*)) |ptr| {
-                            try apfs.append(allocator, .{ entry.value_ptr, ptr });
-                        }
-                        continue;
-                    }
-                }
-
-                if (!entry.value_ptr.is_virtual) {
-                    if (mount_points.getPtr(entry.key_ptr.*)) |ptr| {
-                        try other.putNoClobber(allocator, device_path, ptr);
-                    }
-                }
-            }
-        }
-
-        for (apfs.items) |item| {
-            const device, const device_mount_points = item;
-            if (device.device_path) |device_path| {
-                if (other.get(device_path)) |other_mount_points| {
-                    try other_mount_points.appendSlice(allocator, device_mount_points.items);
-                    device.is_virtual = true;
-                }
-            }
-        }
-    }
+    handleApfs(allocator, devices, mount_points);
 
     var device_iterator = devices.iterator();
     while (device_iterator.next()) |entry| {

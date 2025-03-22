@@ -6,6 +6,7 @@ const cairo = @import("cairo");
 const common = @import("../frontend.zig");
 
 const CustomClass = @import("objc.zig").CustomClass;
+const NSNumber = @import("common.zig").NSNumber;
 
 extern fn CGContextTranslateCTM(cg_context: *anyopaque, tx: f64, ty: f64) void;
 extern fn CGContextScaleCTM(cg_context: *anyopaque, sx: f64, sy: f64) void;
@@ -128,7 +129,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                                     if (ismain) {
                                         view.msgSend(void, "setNeedsDisplay:", .{true});
                                     } else {
-                                        view.msgSend(void, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("setNeedsDisplay:"), appkit.NSNumber.numberWithBool(true), false });
+                                        view.msgSend(void, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("setNeedsDisplay:"), NSNumber.numberWithBool(true), false });
                                     }
                                 }
                             }.redraw,

@@ -1,8 +1,12 @@
 const std = @import("std");
 const objc = @import("objc");
+const common = @import("common.zig");
 pub const cg = @import("core_graphics.zig");
 
 const ExternalClass = @import("objc.zig").ExternalClass;
+
+const NSString = common.NSString;
+const NSNumber = common.NSNumber;
 
 pub const NSObject = ExternalClass(
     "NSObject",
@@ -14,15 +18,6 @@ pub const NSThread = ExternalClass(
     struct {
         pub inline fn isMainThread() bool {
             return NSThread.class().msgSend(bool, "isMainThread", .{});
-        }
-    },
-);
-
-pub const NSNumber = ExternalClass(
-    "NSNumber",
-    struct {
-        pub inline fn numberWithBool(value: bool) NSNumber {
-            return NSNumber.class().msgSend(NSNumber, "numberWithBool:", .{value});
         }
     },
 );
@@ -269,15 +264,6 @@ pub const NSTrackingArea = ExternalClass(
 test "NSTrackingArea.Options" {
     _ = NSTrackingArea.Options;
 }
-
-pub const NSString = ExternalClass(
-    "NSString",
-    struct {
-        pub fn stringWithUTF8String(text: [:0]const u8) NSString {
-            return NSString.class().msgSend(NSString, "stringWithUTF8String:", .{text});
-        }
-    },
-);
 
 pub const NSGraphicsContext = ExternalClass(
     "NSGraphicsContext",
