@@ -1,6 +1,6 @@
 const std = @import("std");
 const drivelist = @import("../drivelist.zig");
-const objc = @import("../macos/objc.zig");
+const objc = @import("objc.zig");
 
 const c = @cImport({
     @cInclude("DiskArbitration/DiskArbitration.h");

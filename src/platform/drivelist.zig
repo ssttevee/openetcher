@@ -1,13 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const PartitionTableType = enum {
-    none,
-    mbr,
-    gpt,
-};
-
 pub const DeviceDescriptor = struct {
+    pub const PartitionTableType = enum {
+        none,
+        mbr,
+        gpt,
+    };
+
     pub const Enumerator = enum {
         /// macos DeviceArbitration
         device_arbitration,
@@ -84,5 +84,3 @@ pub const DeviceDescriptor = struct {
         allocator.free(self.device);
     }
 };
-
-pub usingnamespace if (builtin.os.tag == .macos) @import("drivelist/macos.zig") else @compileError("unsupported platform");

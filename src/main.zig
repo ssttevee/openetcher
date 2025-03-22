@@ -1,15 +1,14 @@
 const std = @import("std");
 const clay = @import("clay");
 
-const drivelist = @import("drivelist.zig");
-const frontend = @import("frontend.zig");
+const platform = @import("platform.zig");
 const svg = @import("svg.zig");
 
 const colors = struct {
     const bg = clay.Color.rgb(76, 80, 91);
     const btn = clay.Color.transparent;
     const btn_text = clay.Color.white.withAlpha(170);
-    const highlighted_btn = clay.Color.rgb(0, 135, 158);
+    const highlighted_btn = clay.Color.rgb(0, 135, 201);
     const highlighted_btn_text = clay.Color.white;
     const disabled_btn = clay.Color.rgb(55, 60, 63);
     const disabled_btn_text = clay.Color.white.withAlpha(85);
@@ -218,7 +217,7 @@ const FrontPage = struct {
             state.prev_hovering = state.hovering_button;
             state.parentState().redraw();
 
-            frontend.platform.setCursor(if (state.hovering_button) .pointer else .default);
+            platform.setCursor(if (state.hovering_button) .pointer else .default);
         }
 
         switch (pointer_data.state) {
@@ -229,7 +228,7 @@ const FrontPage = struct {
                     if (state.current_step == 2) {
                         state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
 
-                        frontend.platform.setCursor(.default);
+                        platform.setCursor(.default);
                     } else if (state.current_step < step_buttons.len - 1) {
                         state.current_step += 1;
                     }
@@ -494,7 +493,7 @@ pub fn createLayout(state: *MyState) clay.RenderCommandArray {
     });
 }
 
-const app = frontend.App(
+const app = platform.App(
     MyState,
     createLayout,
 );
@@ -504,7 +503,7 @@ pub fn main() !void {
 }
 
 test "drivelist" {
-    const devices = try drivelist.listStorageDevices(std.testing.allocator);
+    const devices = try platform.listStorageDevices(std.testing.allocator);
     defer {
         for (devices) |device| {
             device.deinit(std.testing.allocator);

@@ -2,7 +2,7 @@ const std = @import("std");
 const objc = @import("objc");
 pub const cg = @import("core_graphics.zig");
 
-const ExternalClass = @import("../../macos/objc.zig").ExternalClass;
+const ExternalClass = @import("objc.zig").ExternalClass;
 
 pub const NSObject = ExternalClass(
     "NSObject",

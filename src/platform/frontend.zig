@@ -63,10 +63,3 @@ pub fn AppState(comptime T: type) type {
 pub fn render(commands: clay.RenderCommandArray) void {
     clay.renderers.cairo.render(commands, @ptrCast(fonts.ptr));
 }
-
-pub const Cursor = enum {
-    arrow,
-    pointer,
-
-    pub const default = Cursor.arrow;
-};

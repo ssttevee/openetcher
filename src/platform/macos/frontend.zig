@@ -1,11 +1,11 @@
 const std = @import("std");
 const objc = @import("objc");
-const appkit = @import("macos/appkit.zig");
+const appkit = @import("appkit.zig");
 const clay = @import("clay");
 const cairo = @import("cairo");
-const common = @import("common.zig");
+const common = @import("../frontend.zig");
 
-const CustomClass = @import("../macos/objc.zig").CustomClass;
+const CustomClass = @import("objc.zig").CustomClass;
 
 extern fn CGContextTranslateCTM(cg_context: *anyopaque, tx: f64, ty: f64) void;
 extern fn CGContextScaleCTM(cg_context: *anyopaque, sx: f64, sy: f64) void;
@@ -242,12 +242,3 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
         pub const redraw = State.redraw;
     };
 }
-
-pub const platform = struct {
-    pub fn setCursor(cursor: common.Cursor) void {
-        (switch (cursor) {
-            .arrow => appkit.NSCursor.arrowCursor(),
-            .pointer => appkit.NSCursor.pointingHandCursor(),
-        }).set();
-    }
-};
