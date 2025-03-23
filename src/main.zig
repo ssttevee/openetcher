@@ -37,17 +37,17 @@ const FrontPage = struct {
     selected_image: ?struct {
         kind: enum { file, url, disk },
         path: []const u8,
-        size: ?struct {
-            compressed: usize,
-            compression: CompressionType,
-            decompressed: usize,
-        } = null,
+        size: usize = 0,
+        real_size: usize = 0,
+        compression_type: ?CompressionType = null,
+        done: bool = false,
 
         fn ready(self: @This()) bool {
-            return self.size != null;
+            return self.done;
         }
     } = null,
     selected_disks: ?[]const usize = null,
+    mutex: std.Thread.Mutex = .{},
 
     current_hover_state: HoverState = .{},
     prev_hover_state: HoverState = .{},
@@ -205,7 +205,14 @@ const FrontPage = struct {
                         .layout_direction = .top_to_bottom,
                     },
                 })({
-                    if (self.selected_image) |selected_image| {
+                    const selected_image_copy = blk: {
+                        self.mutex.lock();
+                        defer self.mutex.unlock();
+
+                        break :blk self.selected_image;
+                    };
+
+                    if (selected_image_copy) |selected_image| {
                         clay.ui()(.{
                             .layout = .{
                                 .sizing = .{
@@ -218,50 +225,57 @@ const FrontPage = struct {
                             clay.text(selected_image.path[std.mem.lastIndexOfScalar(u8, selected_image.path, '/').? + 1 ..], &btn_text_config);
                         });
 
-                        if (selected_image.size) |size| {
-                            clay.ui()(.{
-                                .layout = .{
-                                    .sizing = .{
-                                        .width = .grow(.{}),
-                                    },
-                                    .padding = .y(16),
-                                    .child_alignment = .center,
+                        clay.ui()(.{
+                            .layout = .{
+                                .sizing = .{
+                                    .width = .grow(.{}),
                                 },
+                                .padding = .y(16),
+                                .child_alignment = .center,
+                            },
+                        })({
+                            clay.ui()(.{
+                                .id = clay.id("CancelImageButton"),
                             })({
-                                clay.ui()(.{
-                                    .id = clay.id("CancelImageButton"),
-                                })({
-                                    clay.setOnHover(
-                                        struct {
-                                            fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-                                                _ = element_id;
+                                clay.setOnHover(
+                                    struct {
+                                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                            _ = element_id;
 
-                                                const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                                                state.current_hover_state.cancel_image = true;
+                                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                            state.current_hover_state.cancel_image = true;
 
-                                                if (pointer_data.state == .released_this_frame) {
-                                                    state.selected_image = null;
-                                                }
+                                            if (pointer_data.state == .released_this_frame) {
+                                                state.mutex.lock();
+                                                defer state.mutex.unlock();
+
+                                                state.selected_image = null;
                                             }
-                                        }.onHover,
-                                        @ptrCast(self),
-                                    );
-                                    clay.text("Cancel", if (clay.isPointerOver(clay.id("CancelImageButton"))) comptime &.{ .font_size = 14, .text_color = colors.highlighted_btn } else &btn_text_config);
-                                });
+                                        }
+                                    }.onHover,
+                                    @ptrCast(self),
+                                );
+                                clay.text("Cancel", if (clay.isPointerOver(clay.id("CancelImageButton"))) comptime &.{ .font_size = 14, .text_color = colors.highlighted_btn } else &btn_text_config);
                             });
+                        });
 
-                            clay.ui()(.{
-                                .layout = .{
-                                    .sizing = .{
-                                        .width = .grow(.{}),
-                                    },
-                                    .padding = .y(16),
-                                    .child_alignment = .center,
+                        clay.ui()(.{
+                            .layout = .{
+                                .sizing = .{
+                                    .width = .grow(.{}),
                                 },
-                            })({
-                                clay.text(std.fmt.bufPrint(&decompressed_size_buf, "{0.2}", .{HumanizeBytes{ .bytes = @floatFromInt(size.decompressed) }}) catch unreachable, &btn_text_config);
-                            });
+                                .padding = .y(16),
+                                .child_alignment = .center,
+                            },
+                        })({
+                            if (selected_image.done) {
+                                clay.text(std.fmt.bufPrint(&decompressed_size_buf, "{0.2}", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                            } else {
+                                clay.text(std.fmt.bufPrint(&decompressed_size_buf, "calculating size ({0.2})", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                            }
+                        });
 
+                        if (selected_image.compression_type) |compression_type| {
                             clay.ui()(.{
                                 .layout = .{
                                     .sizing = .{
@@ -271,19 +285,7 @@ const FrontPage = struct {
                                     .child_alignment = .center,
                                 },
                             })({
-                                clay.text(std.fmt.bufPrint(&compression_type_buf, "compression type: {s}", .{@tagName(size.compression)}) catch unreachable, &btn_text_config);
-                            });
-                        } else {
-                            clay.ui()(.{
-                                .layout = .{
-                                    .sizing = .{
-                                        .width = .grow(.{}),
-                                    },
-                                    .padding = .y(16),
-                                    .child_alignment = .center,
-                                },
-                            })({
-                                clay.text("calculating size", comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                                clay.text(std.fmt.bufPrint(&compression_type_buf, "compression type: {s}", .{@tagName(compression_type)}) catch unreachable, &btn_text_config);
                             });
                         }
                     } else {
@@ -360,14 +362,14 @@ const FrontPage = struct {
                     self.buttonLayout(
                         "SelectTargetButton",
                         "Select Target",
-                        if (self.selected_image != null and self.selected_image.?.size != null and self.selected_disks == null) colors.highlighted_btn else colors.btn,
-                        if (self.selected_image != null and self.selected_image.?.size != null and self.selected_disks == null and self.current_hover_state.target_disk) &highlighted_btn_text_config else &btn_text_config,
+                        if (self.selected_image != null and self.selected_image.?.ready() and self.selected_disks == null) colors.highlighted_btn else colors.btn,
+                        if (self.selected_image != null and self.selected_image.?.ready() and self.selected_disks == null and self.current_hover_state.target_disk) &highlighted_btn_text_config else &btn_text_config,
                         struct {
                             fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
                                 _ = element_id;
 
                                 const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                                if (state.selected_image == null or state.selected_image.?.size == null or state.selected_disks != null) return;
+                                if (state.selected_image == null or !state.selected_image.?.ready() or state.selected_disks != null) return;
 
                                 state.current_hover_state.target_disk = true;
                                 if (pointer_data.state == .released_this_frame) {
@@ -410,69 +412,117 @@ const FrontPage = struct {
     }
 
     fn calculateImageSize(self: *FrontPage) !void {
-        if (self.selected_image) |*selected_image| {
-            if (selected_image.size == null) {
-                const file, const compressed_size = switch (selected_image.kind) {
-                    .file => blk: {
-                        const file = try std.fs.openFileAbsolute(selected_image.path, .{});
-                        const stat = try file.stat();
-
-                        break :blk .{ file, stat.size };
-                    },
-                    .url => std.debug.panic("not implemented", .{}),
-                    .disk => std.debug.panic("not implemented", .{}),
-                };
-                defer file.close();
-
-                var br = std.io.bufferedReader(file.reader());
-                var hack_buf: [0]u8 = undefined; // hack to peek
-                _ = try br.read(&hack_buf);
-
-                var decompressed_size: usize = 0;
-                var compression_type: CompressionType = .none;
-                if (std.mem.startsWith(u8, &br.buf, &.{ 0x1f, 0x8b })) {
-                    compression_type = .gzip;
-
-                    var d = std.compress.gzip.decompressor(br.reader());
-                    while (try d.next()) |bytes| {
-                        decompressed_size += bytes.len;
-                    }
-                } else if (std.mem.startsWith(u8, &br.buf, &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 })) {
-                    compression_type = .xz;
-
-                    var d = try std.compress.xz.decompress(std.heap.page_allocator, br.reader());
-                    defer d.deinit();
-
-                    var buf: [4096]u8 = undefined;
-                    while (true) {
-                        const n = try d.read(&buf);
-                        decompressed_size += n;
-                    }
-                } else if (std.mem.startsWith(u8, &br.buf, &.{ 0x28, 0xb5, 0x2f, 0xfd })) {
-                    compression_type = .zstd;
-
-                    var window_buf: [std.compress.zstd.DecompressorOptions.default_window_buffer_len]u8 = undefined;
-                    var d = std.compress.zstd.decompressor(br.reader(), .{ .window_buffer = &window_buf, .verify_checksum = false });
-
-                    var buf: [4096]u8 = undefined;
-                    while (true) {
-                        const n = try d.read(&buf);
-                        decompressed_size += n;
-                    }
-                } else {
-                    // assume image is not compressed
-                    decompressed_size = compressed_size;
-                }
-
-                selected_image.size = .{
-                    .compressed = compressed_size,
-                    .compression = compression_type,
-                    .decompressed = decompressed_size,
-                };
-            }
+        self.mutex.lock();
+        if (self.selected_image == null) {
+            self.mutex.unlock();
+            return;
         }
 
-        self.parentState().redraw();
+        defer self.parentState().redraw();
+
+        const file, self.selected_image.?.size = switch (self.selected_image.?.kind) {
+            .file => blk: {
+                errdefer self.mutex.unlock();
+                const file = try std.fs.openFileAbsolute(self.selected_image.?.path, .{});
+                const stat = try file.stat();
+
+                break :blk .{ file, stat.size };
+            },
+            .url => std.debug.panic("not implemented", .{}),
+            .disk => std.debug.panic("not implemented", .{}),
+        };
+        defer file.close();
+
+        var br = std.io.bufferedReader(file.reader());
+        var hack_buf: [0]u8 = undefined; // hack to peek
+        _ = br.read(&hack_buf) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+
+        if (std.mem.startsWith(u8, &br.buf, &.{ 0x1f, 0x8b })) {
+            self.selected_image.?.compression_type = .gzip;
+            self.mutex.unlock();
+
+            self.parentState().redraw();
+
+            var d = std.compress.gzip.decompressor(br.reader());
+            while (try d.next()) |bytes| {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                if (self.selected_image) |*selected_image| {
+                    selected_image.real_size += bytes.len;
+                } else {
+                    std.debug.print("image size calculation cancelled\n", .{});
+                    return;
+                }
+
+                self.parentState().redraw();
+            }
+        } else if (std.mem.startsWith(u8, &br.buf, &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 })) {
+            self.selected_image.?.compression_type = .xz;
+            self.mutex.unlock();
+
+            self.parentState().redraw();
+
+            var d = try std.compress.xz.decompress(std.heap.page_allocator, br.reader());
+            defer d.deinit();
+
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = try d.read(&buf);
+
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                if (self.selected_image) |*selected_image| {
+                    selected_image.real_size += n;
+                } else {
+                    std.debug.print("image size calculation cancelled\n", .{});
+                    return;
+                }
+
+                self.parentState().redraw();
+            }
+        } else if (std.mem.startsWith(u8, &br.buf, &.{ 0x28, 0xb5, 0x2f, 0xfd })) {
+            self.selected_image.?.compression_type = .zstd;
+            self.mutex.unlock();
+
+            self.parentState().redraw();
+
+            var window_buf: [std.compress.zstd.DecompressorOptions.default_window_buffer_len]u8 = undefined;
+            var d = std.compress.zstd.decompressor(br.reader(), .{ .window_buffer = &window_buf, .verify_checksum = false });
+
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = try d.read(&buf);
+
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                if (self.selected_image) |*selected_image| {
+                    selected_image.real_size += n;
+                } else {
+                    std.debug.print("image size calculation cancelled\n", .{});
+                    return;
+                }
+
+                self.parentState().redraw();
+            }
+        } else {
+            // assume image is not compressed
+            if (self.selected_image) |*selected_image| {
+                selected_image.real_size += selected_image.size;
+            }
+            self.mutex.unlock();
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.selected_image) |*selected_image| {
+            selected_image.done = true;
+        }
     }
 
     fn handleMouseOut(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
