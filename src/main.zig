@@ -28,10 +28,6 @@ var disks: ?[]const platform.DeviceDescriptor = &.{
 };
 
 const FrontPage = struct {
-    highlighted_button: u8 = 0,
-    prev_highlighted_button: u8 = 0,
-    hovering_button: bool = false,
-    prev_hovering: bool = false,
     override_view_state: union(enum) {
         none,
         url_input: []const u8,
@@ -53,38 +49,22 @@ const FrontPage = struct {
     } = null,
     selected_disks: ?[]const usize = null,
 
-    var compressed_size_buf: [32]u8 = undefined;
+    current_hover_state: HoverState = .{},
+    prev_hover_state: HoverState = .{},
+
+    const HoverState = struct {
+        image_from_file: bool = false,
+        image_from_url: bool = false,
+        image_from_disk: bool = false,
+        cancel_image: bool = false,
+        target_disk: bool = false,
+        flash: bool = false,
+    };
+
+    var compression_type_buf: [32]u8 = undefined;
     var decompressed_size_buf: [32]u8 = undefined;
 
     const CompressionType = enum { none, gzip, xz, zstd };
-
-    fn currentStep(self: *const FrontPage) u8 {
-        if (self.selected_disks) |_| {
-            return 2;
-        }
-
-        if (self.selected_image) |selected_image| {
-            if (selected_image.ready()) {
-                return 1;
-            }
-        }
-
-        return 0;
-    }
-
-    const step_buttons = [_][]const [2][]const u8{
-        &[_][2][]const u8{
-            .{ "ImageFromFileButton", "Flash from file" },
-            .{ "ImageFromURLButton", "Flash from URL" },
-            .{ "ImageFromDiskButton", "Clone a disk" },
-        },
-        &[_][2][]const u8{
-            .{ "SelectTargetButton", "Select Target" },
-        },
-        &[_][2][]const u8{
-            .{ "FlashButton", "Flash!" },
-        },
-    };
 
     inline fn parentState(self: *FrontPage) *MyState {
         return @as(*MyState, @alignCast(@fieldParentPtr("front_page", self)));
@@ -100,49 +80,18 @@ const FrontPage = struct {
         return true;
     }
 
-    fn buttonColor(state: *const FrontPage, step_number: u8, button_number: u8) clay.Color {
-        if (state.currentStep() != step_number or !state.ready()) {
-            return colors.disabled_btn;
-        }
-
-        if (state.highlighted_button == button_number) {
-            return colors.highlighted_btn;
-        }
-
-        return colors.btn;
-    }
-
     const btn_text_size = 14;
 
-    fn buttonTextConfig(state: *const FrontPage, comptime step_number: u8, comptime button_number: u8) *const clay.TextElementConfig {
-        if (state.currentStep() != step_number) {
-            return comptime &.{ .font_size = btn_text_size, .text_color = colors.disabled_btn_text };
-        }
-
-        if (state.hovering_button and state.highlighted_button == button_number) {
-            return comptime &.{ .font_size = btn_text_size, .text_color = colors.highlighted_btn_text };
-        }
-
-        return comptime &.{ .font_size = btn_text_size, .text_color = colors.btn_text };
-    }
-
-    fn getButtonIndex(comptime step_number: u8, comptime button_number: u8) usize {
-        return switch (step_number) {
-            0 => switch (button_number) {
-                0, 1, 2 => button_number,
-                else => unreachable,
-            },
-            1, 2 => step_number + 2,
-            else => unreachable,
-        };
-    }
+    const btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.btn_text };
+    const disabled_btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.disabled_btn_text };
+    const highlighted_btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.highlighted_btn_text };
 
     inline fn buttonLayout(
         state: *FrontPage,
-        comptime step_number: u8,
-        comptime button_number: u8,
         comptime element_id_label: []const u8,
         comptime button_text: []const u8,
+        button_color: clay.Color,
+        label_text_config: *const clay.TextElementConfig,
         onHoverFn: ?*const clay.OnHoverFn,
     ) void {
         clay.ui()(.{
@@ -154,114 +103,109 @@ const FrontPage = struct {
                 .padding = .y(16),
                 .child_alignment = .center,
             },
-            .background_color = state.buttonColor(step_number, button_number),
+            .background_color = button_color,
             .corner_radius = .all(22),
         })({
             if (onHoverFn) |onHover| {
                 clay.setOnHover(onHover, @ptrCast(state));
             }
 
-            clay.text(button_text, state.buttonTextConfig(step_number, button_number));
+            clay.text(button_text, label_text_config);
         });
     }
 
     inline fn createLayout(self: *FrontPage) void {
-        clay.setOnHover(onHoverButtonStack, @ptrCast(self));
-
         clay.ui()(.{
             .layout = .{
-                .sizing = .{ .width = .grow(.{}) },
-                .padding = .{
-                    .top = 16,
-                    .bottom = 80,
-                },
-                .child_alignment = .center,
+                .sizing = .grow(.{}),
+                .layout_direction = .top_to_bottom,
+                .child_alignment = .center_top,
+                .child_gap = 40,
             },
         })({
-            clay.text("OpenEtcher", comptime &.{ .font_size = 16, .text_color = .white });
-        });
+            clay.setOnHover(handleMouseOut, @ptrCast(self));
 
-        clay.ui()(.{
-            .layout = .{
-                .sizing = .{ .width = .grow(.{}) },
-                .child_alignment = .center,
-                .child_gap = 44,
-            },
-        })({
-            clay.ui()(.{
-                .id = clay.id("ImageIcon"),
-                .layout = .{
-                    .sizing = .fixed(60),
-                    .child_alignment = .center,
-                },
-            })({
-                svg.clayImage(.add_document, 10, .white, .fixed(42));
-            });
             clay.ui()(.{
                 .layout = .{
-                    .sizing = .{
-                        .width = .fixed(100),
-                        .height = .fixed(2),
+                    .sizing = .{ .width = .grow(.{}) },
+                    .padding = .{
+                        .top = 16,
+                        .bottom = 80,
                     },
-                },
-                .background_color = .rgba(255, 255, 255, 127),
-            })({});
-            clay.ui()(.{
-                .id = clay.id("DiskIcon"),
-                .layout = .{
-                    .sizing = .fixed(60),
                     .child_alignment = .center,
                 },
             })({
-                svg.clayImage(.hdd, 10, .white, .fixed(42));
+                clay.text("OpenEtcher", comptime &.{ .font_size = 16, .text_color = .white });
             });
-            clay.ui()(.{
-                .layout = .{
-                    .sizing = .{
-                        .width = .fixed(100),
-                        .height = .fixed(2),
-                    },
-                },
-                .background_color = .rgba(255, 255, 255, 127),
-            })({});
-            clay.ui()(.{
-                .id = clay.id("FlashIcon"),
-                .layout = .{
-                    .sizing = .fixed(60),
-                    .child_alignment = .center,
-                },
-            })({
-                svg.clayImage(.bolt, 10, .white, .fixed(42));
-            });
-        });
 
-        clay.ui()(.{
-            .layout = .{
-                .sizing = .{ .width = .grow(.{}) },
-                .child_alignment = .top_center,
-                .child_gap = 48,
-            },
-        })({
             clay.ui()(.{
                 .layout = .{
-                    .sizing = .{ .width = .fixed(200) },
-                    .layout_direction = .top_to_bottom,
+                    .sizing = .{ .width = .grow(.{}) },
+                    .child_alignment = .center,
+                    .child_gap = 44,
                 },
             })({
-                if (self.selected_image) |selected_image| {
-                    clay.ui()(.{
-                        .layout = .{
-                            .sizing = .{
-                                .width = .grow(.{}),
-                            },
-                            .padding = .y(16),
-                            .child_alignment = .center,
+                clay.ui()(.{
+                    .id = clay.id("ImageIcon"),
+                    .layout = .{
+                        .sizing = .fixed(60),
+                        .child_alignment = .center,
+                    },
+                })({
+                    svg.clayImage(.add_document, 10, .white, .fixed(42));
+                });
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{
+                            .width = .fixed(100),
+                            .height = .fixed(2),
                         },
-                    })({
-                        clay.text(selected_image.path[std.mem.lastIndexOfScalar(u8, selected_image.path, '/').? + 1 ..], comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
-                    });
+                    },
+                    .background_color = .rgba(255, 255, 255, 127),
+                })({});
+                clay.ui()(.{
+                    .id = clay.id("DiskIcon"),
+                    .layout = .{
+                        .sizing = .fixed(60),
+                        .child_alignment = .center,
+                    },
+                })({
+                    svg.clayImage(.hdd, 10, .white, .fixed(42));
+                });
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{
+                            .width = .fixed(100),
+                            .height = .fixed(2),
+                        },
+                    },
+                    .background_color = .rgba(255, 255, 255, 127),
+                })({});
+                clay.ui()(.{
+                    .id = clay.id("FlashIcon"),
+                    .layout = .{
+                        .sizing = .fixed(60),
+                        .child_alignment = .center,
+                    },
+                })({
+                    svg.clayImage(.bolt, 10, .white, .fixed(42));
+                });
+            });
 
-                    if (selected_image.size) |size| {
+            clay.ui()(.{
+                .layout = .{
+                    .sizing = .{ .width = .grow(.{}) },
+                    .child_alignment = .top_center,
+                    .child_gap = 48,
+                },
+            })({
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{ .width = .fixed(200) },
+                        .layout_direction = .top_to_bottom,
+                    },
+                })({
+                    if (self.selected_image) |selected_image| {
                         clay.ui()(.{
                             .layout = .{
                                 .sizing = .{
@@ -271,129 +215,196 @@ const FrontPage = struct {
                                 .child_alignment = .center,
                             },
                         })({
+                            clay.text(selected_image.path[std.mem.lastIndexOfScalar(u8, selected_image.path, '/').? + 1 ..], &btn_text_config);
+                        });
+
+                        if (selected_image.size) |size| {
                             clay.ui()(.{
-                                .id = clay.id("CancelImageButton"),
+                                .layout = .{
+                                    .sizing = .{
+                                        .width = .grow(.{}),
+                                    },
+                                    .padding = .y(16),
+                                    .child_alignment = .center,
+                                },
                             })({
-                                clay.setOnHover(
-                                    struct {
-                                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-                                            _ = element_id;
+                                clay.ui()(.{
+                                    .id = clay.id("CancelImageButton"),
+                                })({
+                                    clay.setOnHover(
+                                        struct {
+                                            fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                                _ = element_id;
 
-                                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                                            if (pointer_data.state == .released_this_frame) {
-                                                state.selected_image = null;
+                                                const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                                state.current_hover_state.cancel_image = true;
+
+                                                if (pointer_data.state == .released_this_frame) {
+                                                    state.selected_image = null;
+                                                }
                                             }
-
-                                            state.parentState().redraw();
-                                        }
-                                    }.onHover,
-                                    @ptrCast(self),
-                                );
-                                clay.text("Cancel", if (clay.isPointerOver(clay.id("CancelImageButton"))) comptime &.{ .font_size = 14, .text_color = colors.highlighted_btn } else comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                                        }.onHover,
+                                        @ptrCast(self),
+                                    );
+                                    clay.text("Cancel", if (clay.isPointerOver(clay.id("CancelImageButton"))) comptime &.{ .font_size = 14, .text_color = colors.highlighted_btn } else &btn_text_config);
+                                });
                             });
-                        });
 
-                        clay.ui()(.{
-                            .layout = .{
-                                .sizing = .{
-                                    .width = .grow(.{}),
+                            clay.ui()(.{
+                                .layout = .{
+                                    .sizing = .{
+                                        .width = .grow(.{}),
+                                    },
+                                    .padding = .y(16),
+                                    .child_alignment = .center,
                                 },
-                                .padding = .y(16),
-                                .child_alignment = .center,
-                            },
-                        })({
-                            clay.text(std.fmt.bufPrint(&decompressed_size_buf, "{0.2}", .{HumanizeBytes{ .bytes = @floatFromInt(size.decompressed) }}) catch unreachable, comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
-                        });
+                            })({
+                                clay.text(std.fmt.bufPrint(&decompressed_size_buf, "{0.2}", .{HumanizeBytes{ .bytes = @floatFromInt(size.decompressed) }}) catch unreachable, &btn_text_config);
+                            });
+
+                            clay.ui()(.{
+                                .layout = .{
+                                    .sizing = .{
+                                        .width = .grow(.{}),
+                                    },
+                                    .padding = .y(16),
+                                    .child_alignment = .center,
+                                },
+                            })({
+                                clay.text(std.fmt.bufPrint(&compression_type_buf, "compression type: {s}", .{@tagName(size.compression)}) catch unreachable, &btn_text_config);
+                            });
+                        } else {
+                            clay.ui()(.{
+                                .layout = .{
+                                    .sizing = .{
+                                        .width = .grow(.{}),
+                                    },
+                                    .padding = .y(16),
+                                    .child_alignment = .center,
+                                },
+                            })({
+                                clay.text("calculating size", comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
+                            });
+                        }
                     } else {
-                        clay.ui()(.{
-                            .layout = .{
-                                .sizing = .{
-                                    .width = .grow(.{}),
-                                },
-                                .padding = .y(16),
-                                .child_alignment = .center,
-                            },
-                        })({
-                            clay.text("Calculating Size", comptime &.{ .font_size = 14, .text_color = colors.disabled_btn_text });
-                        });
+                        self.buttonLayout(
+                            "ImageFromFileButton",
+                            "Flash from file",
+                            if (self.current_hover_state.image_from_file or (!self.current_hover_state.image_from_url and !self.current_hover_state.image_from_disk)) colors.highlighted_btn else colors.btn,
+                            if (self.current_hover_state.image_from_file) &highlighted_btn_text_config else &btn_text_config,
+                            struct {
+                                fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                    _ = element_id;
+
+                                    const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                    state.current_hover_state.image_from_file = true;
+                                    if (pointer_data.state == .released_this_frame) {
+                                        const maybe_path = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
+                                        if (maybe_path) |path| {
+                                            state.selected_image = .{ .kind = .file, .path = path };
+                                        } else {
+                                            return;
+                                        }
+
+                                        const thread = std.Thread.spawn(.{}, calculateImageSize, .{state}) catch unreachable;
+                                        thread.detach();
+                                    }
+                                }
+                            }.onHover,
+                        );
+
+                        self.buttonLayout(
+                            "ImageFromURLButton",
+                            "Flash from URL",
+                            if (self.current_hover_state.image_from_url) colors.highlighted_btn else colors.btn,
+                            if (self.current_hover_state.image_from_url) &highlighted_btn_text_config else &btn_text_config,
+                            struct {
+                                fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                    _ = element_id;
+
+                                    const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                    state.current_hover_state.image_from_url = true;
+                                    if (pointer_data.state == .released_this_frame) {
+                                        // TODO: implement me
+                                    }
+                                }
+                            }.onHover,
+                        );
+
+                        self.buttonLayout(
+                            "ImageFromDiskButton",
+                            "Clone a disk",
+                            if (self.current_hover_state.image_from_disk) colors.highlighted_btn else colors.btn,
+                            if (self.current_hover_state.image_from_disk) &highlighted_btn_text_config else &btn_text_config,
+                            struct {
+                                fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                    _ = element_id;
+
+                                    const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                    state.current_hover_state.image_from_disk = true;
+                                    if (pointer_data.state == .released_this_frame) {
+                                        // TODO: implement me
+                                    }
+                                }
+                            }.onHover,
+                        );
                     }
-                } else {
+                });
+
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{ .width = .fixed(200) },
+                        .layout_direction = .top_to_bottom,
+                    },
+                })({
                     self.buttonLayout(
-                        0,
-                        0,
-                        step_buttons[0][0][0],
-                        step_buttons[0][0][1],
+                        "SelectTargetButton",
+                        "Select Target",
+                        if (self.selected_image != null and self.selected_image.?.size != null and self.selected_disks == null) colors.highlighted_btn else colors.btn,
+                        if (self.selected_image != null and self.selected_image.?.size != null and self.selected_disks == null and self.current_hover_state.target_disk) &highlighted_btn_text_config else &btn_text_config,
                         struct {
                             fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
                                 _ = element_id;
 
                                 const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                                if (pointer_data.state == .released_this_frame) {
-                                    const maybe_path = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
-                                    if (maybe_path) |path| {
-                                        state.selected_image = .{ .kind = .file, .path = path };
-                                    } else {
-                                        return;
-                                    }
+                                if (state.selected_image == null or state.selected_image.?.size == null or state.selected_disks != null) return;
 
-                                    const thread = std.Thread.spawn(.{}, calculateImageSize, .{state}) catch unreachable;
-                                    thread.detach();
+                                state.current_hover_state.target_disk = true;
+                                if (pointer_data.state == .released_this_frame) {
+                                    state.selected_disks = &.{0};
                                 }
                             }
                         }.onHover,
                     );
-                    self.buttonLayout(0, 1, step_buttons[0][1][0], step_buttons[0][1][1], null);
-                    self.buttonLayout(0, 2, step_buttons[0][2][0], step_buttons[0][2][1], null);
-                }
-            });
+                });
 
-            clay.ui()(.{
-                .layout = .{
-                    .sizing = .{ .width = .fixed(200) },
-                    .layout_direction = .top_to_bottom,
-                },
-            })({
-                self.buttonLayout(
-                    1,
-                    0,
-                    step_buttons[1][0][0],
-                    step_buttons[1][0][1],
-                    struct {
-                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-                            _ = element_id;
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{ .width = .fixed(200) },
+                        .layout_direction = .top_to_bottom,
+                    },
+                })({
+                    self.buttonLayout(
+                        "FlashButton",
+                        "Flash!",
+                        if (self.selected_disks != null) colors.highlighted_btn else colors.btn,
+                        if (self.selected_disks != null and self.current_hover_state.flash) &highlighted_btn_text_config else &btn_text_config,
+                        struct {
+                            fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                _ = element_id;
 
-                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                            if (pointer_data.state == .released_this_frame) {
-                                state.selected_disks = &.{0};
+                                const state: *FrontPage = @alignCast(@ptrCast(user_data));
+                                if (state.selected_disks == null) return;
+
+                                state.current_hover_state.flash = true;
+                                if (pointer_data.state == .released_this_frame) {
+                                    state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
+                                    platform.setCursor(.default);
+                                }
                             }
-                        }
-                    }.onHover,
-                );
-            });
-
-            clay.ui()(.{
-                .layout = .{
-                    .sizing = .{ .width = .fixed(200) },
-                    .layout_direction = .top_to_bottom,
-                },
-            })({
-                self.buttonLayout(
-                    2,
-                    0,
-                    step_buttons[2][0][0],
-                    step_buttons[2][0][1],
-                    struct {
-                        fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-                            _ = element_id;
-
-                            const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                            if (pointer_data.state == .released_this_frame) {
-                                state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
-                                platform.setCursor(.default);
-                            }
-                        }
-                    }.onHover,
-                );
+                        }.onHover,
+                    );
+                });
             });
         });
     }
@@ -464,78 +475,22 @@ const FrontPage = struct {
         self.parentState().redraw();
     }
 
-    fn onHoverButtonStack(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-        std.debug.print("onHoverButtonStack {s}\n", .{element_id.string_id.asSlice()});
+    fn handleMouseOut(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+        _ = element_id;
+        _ = pointer_data;
 
         const state: *FrontPage = @alignCast(@ptrCast(user_data));
-        if (state.parentState().* != .front_page) {
-            return;
-        }
-
-        state.highlighted_button, state.hovering_button = blk: {
-            for (step_buttons[state.currentStep()], 0..) |btn, btn_number| {
-                if (clay.getElementData(clay.getElementId(btn[0]))) |element_data| {
-                    if (element_data.bounding_box.contains(pointer_data.position)) {
-                        break :blk .{ @intCast(btn_number), true };
-                    }
-                }
+        if (!std.mem.eql(u8, std.mem.asBytes(&state.prev_hover_state), std.mem.asBytes(&state.current_hover_state))) {
+            state.parentState().redraw();
+            if (std.mem.eql(u8, std.mem.asBytes(&state.current_hover_state), std.mem.asBytes(&HoverState{}))) {
+                platform.setCursor(.default);
+            } else {
+                platform.setCursor(.pointer);
             }
-
-            break :blk .{ 0, false };
-        };
-
-        if (state.prev_highlighted_button != state.highlighted_button) {
-            state.prev_highlighted_button = state.highlighted_button;
-            state.parentState().redraw();
         }
 
-        if (state.prev_hovering != state.hovering_button) {
-            state.prev_hovering = state.hovering_button;
-            state.parentState().redraw();
-
-            platform.setCursor(if (state.hovering_button) .pointer else .default);
-        }
-
-        // switch (pointer_data.state) {
-        //     .released_this_frame => {
-        //         if (state.hovering_button) {
-        //             // TODO: handle button click
-        //             // std.debug.print("button {d} onmouseup\n", .{state.highlighted_button});
-        //             switch (state.currentStep()) {
-        //                 0 => {
-        //                     if (state.highlighted_button == 0) {
-        //                         const maybe_path = platform.selectImageFile(std.heap.page_allocator) catch unreachable;
-        //                         if (maybe_path) |path| {
-        //                             state.selected_image = .{ .kind = .file, .path = path };
-        //                         }
-
-        //                         const thread = std.Thread.spawn(.{}, calculateImageSize, .{state}) catch unreachable;
-        //                         thread.detach();
-
-        //                         return;
-        //                     }
-        //                 },
-        //                 1 => {},
-        //                 2 => {
-        //                     state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
-        //                     platform.setCursor(.default);
-        //                 },
-        //                 else => unreachable,
-        //             }
-
-        //             state.parentState().redraw();
-        //         }
-        //     },
-        //     // .pressed_this_frame => {
-        //     //     if (state.hovering_button) {
-        //     //         // TODO: handle button click
-        //     //         std.debug.print("button {d} onmousedown\n", .{state.highlighted_button});
-        //     //     }
-        //     // },
-        //     else => {},
-        // }
-
-        // std.debug.print("pointer_data.state {any}\n", .{pointer_data.state});
+        state.prev_hover_state = state.current_hover_state;
+        state.current_hover_state = .{};
     }
 };
 
@@ -676,68 +631,77 @@ const Flashing = struct {
     inline fn createLayout(state: *Flashing) void {
         clay.ui()(.{
             .layout = .{
-                .sizing = .{ .width = .grow(.{}) },
-                .padding = .{
-                    .top = 16,
-                    .bottom = 80,
-                },
+                .sizing = .grow(.{}),
+                .layout_direction = .top_to_bottom,
                 .child_alignment = .center_top,
+                .child_gap = 40,
             },
-        })({
-            clay.text("flashing", comptime &.{ .font_size = 16, .text_color = .white });
-        });
-
-        const percent, const rate, const eta = blk: {
-            state.mu.lock();
-            defer state.mu.unlock();
-
-            var rates_sum: f64 = 0;
-            for (0..state.rates_len) |i| {
-                rates_sum += state.rates[i];
-            }
-
-            const rate = if (state.rates_len == 0) @as(f64, 0.0) else rates_sum / @as(f64, @floatFromInt(state.rates_len));
-
-            break :blk .{
-                if (state.total == 0) 0 else @as(f64, @floatFromInt(state.current)) / @as(f64, @floatFromInt(state.total)),
-                rate,
-                @as(f64, @floatFromInt(state.total - state.current)) / rate,
-            };
-        };
-
-        clay.ui()(.{
-            .id = clay.id("ProgressBar"),
-            .layout = .{
-                .sizing = .{ .width = .fixed(400), .height = .fixed(48) },
-            },
-            .background_color = colors.loading_bar_bg,
         })({
             clay.ui()(.{
                 .layout = .{
-                    .sizing = .{ .width = .percent(@floatCast(percent)), .height = .grow(.{}) },
-                },
-                .background_color = colors.loading_bar_fg,
-            })({});
-
-            clay.ui()(.{
-                .floating = .{
-                    .attach_points = .both(.center),
-                    .attach_to = .parent,
+                    .sizing = .{ .width = .grow(.{}) },
+                    .padding = .{
+                        .top = 16,
+                        .bottom = 80,
+                    },
+                    .child_alignment = .center_top,
                 },
             })({
-                clay.text(std.fmt.bufPrint(&percentage_buf, "{d:0.2}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                clay.text("flashing", comptime &.{ .font_size = 16, .text_color = .white });
             });
+
+            const percent, const rate, const eta = blk: {
+                state.mu.lock();
+                defer state.mu.unlock();
+
+                var rates_sum: f64 = 0;
+                for (0..state.rates_len) |i| {
+                    rates_sum += state.rates[i];
+                }
+
+                const rate = if (state.rates_len == 0) @as(f64, 0.0) else rates_sum / @as(f64, @floatFromInt(state.rates_len));
+
+                break :blk .{
+                    if (state.total == 0) 0 else @as(f64, @floatFromInt(state.current)) / @as(f64, @floatFromInt(state.total)),
+                    rate,
+                    @as(f64, @floatFromInt(state.total - state.current)) / rate,
+                };
+            };
+
+            clay.ui()(.{
+                .id = clay.id("ProgressBar"),
+                .layout = .{
+                    .sizing = .{ .width = .fixed(400), .height = .fixed(48) },
+                },
+                .background_color = colors.loading_bar_bg,
+            })({
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{ .width = .percent(@floatCast(percent)), .height = .grow(.{}) },
+                    },
+                    .background_color = colors.loading_bar_fg,
+                })({});
+
+                clay.ui()(.{
+                    .floating = .{
+                        .attach_points = .both(.center),
+                        .attach_to = .parent,
+                    },
+                })({
+                    clay.text(std.fmt.bufPrint(&percentage_buf, "{d:0.2}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                });
+            });
+
+            clay.text(std.fmt.bufPrint(&rate_buf, "{0.2}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+
+            if (percent == 1) {
+                clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
+            } else if (rate == 0 or state.total == 0) {
+                clay.text("calculating eta", comptime &.{ .font_size = 16, .text_color = .white });
+            } else {
+                clay.text(std.fmt.bufPrint(&eta_buf, "{0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+            }
         });
-
-        clay.text(std.fmt.bufPrint(&rate_buf, "{0.2}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
-
-        if (percent == 1) {
-            clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
-        } else if (rate == 0 or state.total == 0) {
-            clay.text("calculating eta", comptime &.{ .font_size = 16, .text_color = .white });
-        } else {
-            clay.text(std.fmt.bufPrint(&eta_buf, "{0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
-        }
     }
 };
 
@@ -772,9 +736,6 @@ pub fn createLayout(state: *MyState) clay.RenderCommandArray {
         clay.ui()(.{
             .layout = .{
                 .sizing = .grow(.{}),
-                .layout_direction = .top_to_bottom,
-                .child_alignment = .center_top,
-                .child_gap = 40,
             },
             .background_color = colors.bg,
         })({
