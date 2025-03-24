@@ -193,6 +193,14 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                 }
 
                 pub fn drawRect(self: CustomView, _: objc.Sel, _: appkit.cg.Rect) void {
+                    if (self.ivarGet(.state)) |s| {
+                        if (s.common.first_draw) {
+                            s.common.first_draw = false;
+
+                            s.data.setState(.default);
+                        }
+                    }
+
                     const bounds = self.super().bounds();
                     common.setLayoutDimensions(convertDimensions(bounds.size)) catch unreachable;
 

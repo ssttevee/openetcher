@@ -41,6 +41,7 @@ pub fn setLayoutDimensions(layout_dimensions: clay.Dimensions) !void {
 
 pub const CommonState = struct {
     mouse_down: bool = false,
+    first_draw: bool = true,
 
     redraw_ptr: ?*anyopaque = null,
     redraw_fn: ?*const fn (?*anyopaque) void = null,
