@@ -338,10 +338,10 @@ pub fn listStorageDevices(allocator: std.mem.Allocator) ![]drivelist.DeviceDescr
 
     // add mount points
     const volume_keys = NSArray.arrayWithObjects(&.{ NSURLVolumeNameKey.object, NSURLVolumeLocalizedNameKey.object });
-    defer volume_keys.release();
+    // defer volume_keys.release(); // TODO: investigate why this causes a crash (maybe autorelease pool double free?)
 
     const volume_paths = NSFileManager.defaultManager().mountedVolumeURLsIncludingResourceValuesForKeys(volume_keys);
-    defer volume_paths.release();
+    // defer volume_paths.release(); // TODO: investigate why this causes a crash (maybe autorelease pool double free?)
 
     var volume_paths_iterator = volume_paths.iterator();
     while (volume_paths_iterator.next(NSURL)) |path| {
