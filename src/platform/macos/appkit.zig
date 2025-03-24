@@ -7,6 +7,7 @@ const ExternalClass = @import("objc.zig").ExternalClass;
 
 const NSString = common.NSString;
 const NSNumber = common.NSNumber;
+const NSArray = common.NSArray;
 
 pub const NSObject = ExternalClass(
     "NSObject",
@@ -386,6 +387,23 @@ pub const NSCursor = ExternalClass(
 
         pub fn set(self: NSCursor) void {
             self.msgSend(void, "set", .{});
+        }
+    },
+);
+
+pub const NSScreen = ExternalClass(
+    "NSScreen",
+    struct {
+        pub fn screens() NSArray {
+            return NSScreen.class().msgSend(NSArray, "screens", .{});
+        }
+
+        pub fn mainScreen() NSScreen {
+            return NSScreen.class().msgSend(NSScreen, "mainScreen", .{});
+        }
+
+        pub fn visibleFrame(self: NSScreen) cg.Rect {
+            return self.msgSend(cg.Rect, "visibleFrame", .{});
         }
     },
 );

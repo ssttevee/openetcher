@@ -50,17 +50,22 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                 // }
 
                 pub fn applicationDidFinishLaunching(self: AppDelegate, _: objc.Sel) bool {
+                    const main_screen = appkit.NSScreen.mainScreen();
+                    const screen_rect = main_screen.visibleFrame();
+
+                    const window_size = appkit.cg.Size{
+                        .width = 800,
+                        .height = 480,
+                    };
+
                     const window = appkit.NSWindow.alloc();
                     window.init(
                         .{
                             .origin = .{
-                                .x = 100,
-                                .y = 100,
+                                .x = (screen_rect.size.width - window_size.width) / 2,
+                                .y = (screen_rect.size.height - window_size.height) / 2,
                             },
-                            .size = .{
-                                .width = 800,
-                                .height = 480,
-                            },
+                            .size = window_size,
                         },
                         .{
                             .titled = true,
