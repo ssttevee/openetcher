@@ -247,7 +247,7 @@ fn handleApfs(
     allocator: std.mem.Allocator,
     devices: std.StringArrayHashMapUnmanaged(drivelist.DeviceDescriptor),
     mount_points: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint)),
-) void {
+) !void {
     // https://github.com/balena-io-modules/drivelist/blob/a616aa9875956ecf1a546cf1d2480ff281e54d2b/lib/index.ts#L69
     var apfs: std.ArrayListUnmanaged(struct { *drivelist.DeviceDescriptor, *std.ArrayListUnmanaged(drivelist.DeviceDescriptor.MountPoint) }) = .{};
     defer apfs.deinit(allocator);
@@ -368,7 +368,7 @@ pub fn listStorageDevices(allocator: std.mem.Allocator) ![]drivelist.DeviceDescr
         }
     }
 
-    handleApfs(allocator, devices, mount_points);
+    try handleApfs(allocator, devices, mount_points);
 
     var device_iterator = devices.iterator();
     while (device_iterator.next()) |entry| {
