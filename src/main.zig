@@ -672,8 +672,7 @@ const Flashing = struct {
         }
     }
 
-    fn onSwap(self: *Flashing, old_state: MyState) !void {
-        _ = old_state;
+    fn onMount(self: *Flashing) !void {
         const thread = try std.Thread.spawn(.{}, doflash, .{self});
         thread.detach();
     }
@@ -765,12 +764,11 @@ const MyState = union(enum) {
         app.redraw(self);
     }
 
-    fn setState(self: *MyState, new_state: MyState) void {
-        const old_state = self.*;
+    pub fn setState(self: *MyState, new_state: MyState) void {
         self.* = new_state;
 
         switch (self.*) {
-            inline else => |*inner_state| if (@hasDecl(@TypeOf(inner_state.*), "onSwap")) inner_state.onSwap(old_state) catch unreachable,
+            inline else => |*inner_state| if (@hasDecl(@TypeOf(inner_state.*), "onMount")) inner_state.onMount() catch unreachable,
         }
     }
 
