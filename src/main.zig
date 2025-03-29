@@ -44,6 +44,8 @@ const FrontPage = struct {
     current_hover_state: HoverState = .{},
     prev_hover_state: HoverState = .{},
 
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+
     const HoverState = struct {
         image_from_file: bool = false,
         image_from_url: bool = false,
@@ -52,9 +54,6 @@ const FrontPage = struct {
         flash: bool = false,
         target_disk_index: ?usize = null,
     };
-
-    var compression_type_buf: [32]u8 = undefined;
-    var decompressed_size_buf: [32]u8 = undefined;
 
     var disks_mutex: std.Thread.Mutex = .{};
     var disks: ?[]const platform.DeviceDescriptor = null;
@@ -73,6 +72,10 @@ const FrontPage = struct {
         }
 
         return true;
+    }
+
+    fn deinit(self: *const FrontPage) void {
+        self.arena.deinit();
     }
 
     const btn_text_size = 14;
@@ -111,6 +114,8 @@ const FrontPage = struct {
     }
 
     inline fn createLayout(self: *FrontPage) void {
+        _ = self.arena.reset(.retain_capacity);
+
         clay.ui()(.{
             .layout = .{
                 .sizing = .grow(.{}),
@@ -265,9 +270,9 @@ const FrontPage = struct {
                             },
                         })({
                             if (selected_image.done) {
-                                clay.text(std.fmt.bufPrint(&decompressed_size_buf, "{0.2}", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{3.0}", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
                             } else {
-                                clay.text(std.fmt.bufPrint(&decompressed_size_buf, "calculating size ({0.2})", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({3.0})", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
                             }
                         });
 
@@ -281,7 +286,7 @@ const FrontPage = struct {
                                     .child_alignment = .center,
                                 },
                             })({
-                                clay.text(std.fmt.bufPrint(&compression_type_buf, "compression type: {s}", .{@tagName(compression_type)}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "compression type: {s}", .{@tagName(compression_type)}) catch unreachable, &btn_text_config);
                             });
                         }
                     } else {
@@ -776,12 +781,14 @@ const Flashing = struct {
     rates_pos: usize = 0,
     rates_len: usize = 0,
 
-    var percentage_buf: [8]u8 = undefined;
-    var rate_buf: [16]u8 = undefined;
-    var eta_buf: [32]u8 = undefined;
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
 
     inline fn parentState(self: *Flashing) *MyState {
         return @as(*MyState, @fieldParentPtr("flashing", self));
+    }
+
+    fn deinit(self: *const Flashing) void {
+        self.arena.deinit();
     }
 
     fn doflash(self: *Flashing) void {
@@ -826,7 +833,9 @@ const Flashing = struct {
         thread.detach();
     }
 
-    inline fn createLayout(state: *Flashing) void {
+    inline fn createLayout(self: *Flashing) void {
+        _ = self.arena.reset(.retain_capacity);
+
         clay.ui()(.{
             .layout = .{
                 .sizing = .grow(.{}),
@@ -849,20 +858,20 @@ const Flashing = struct {
             });
 
             const percent, const rate, const eta = blk: {
-                state.mu.lock();
-                defer state.mu.unlock();
+                self.mu.lock();
+                defer self.mu.unlock();
 
                 var rates_sum: f64 = 0;
-                for (0..state.rates_len) |i| {
-                    rates_sum += state.rates[i];
+                for (0..self.rates_len) |i| {
+                    rates_sum += self.rates[i];
                 }
 
-                const rate = if (state.rates_len == 0) @as(f64, 0.0) else rates_sum / @as(f64, @floatFromInt(state.rates_len));
+                const rate = if (self.rates_len == 0) @as(f64, 0.0) else rates_sum / @as(f64, @floatFromInt(self.rates_len));
 
                 break :blk .{
-                    if (state.total == 0) 0 else @as(f64, @floatFromInt(state.current)) / @as(f64, @floatFromInt(state.total)),
+                    if (self.total == 0) 0 else @as(f64, @floatFromInt(self.current)) / @as(f64, @floatFromInt(self.total)),
                     rate,
-                    @as(f64, @floatFromInt(state.total - state.current)) / rate,
+                    @as(f64, @floatFromInt(self.total - self.current)) / rate,
                 };
             };
 
@@ -886,18 +895,18 @@ const Flashing = struct {
                         .attach_to = .parent,
                     },
                 })({
-                    clay.text(std.fmt.bufPrint(&percentage_buf, "{d:0.2}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.2}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
                 });
             });
 
-            clay.text(std.fmt.bufPrint(&rate_buf, "{0.2}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+            clay.text(std.fmt.allocPrint(self.arena.allocator(), "{3.0}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
 
             if (percent == 1) {
                 clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
-            } else if (rate == 0 or state.total == 0) {
+            } else if (rate == 0 or self.total == 0) {
                 clay.text("calculating eta", comptime &.{ .font_size = 16, .text_color = .white });
             } else {
-                clay.text(std.fmt.bufPrint(&eta_buf, "{0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
             }
         });
     }
@@ -914,6 +923,10 @@ const MyState = union(enum) {
     }
 
     pub fn setState(self: *MyState, new_state: MyState) void {
+        switch (self.*) {
+            inline else => |*inner_state| if (@hasDecl(@TypeOf(inner_state.*), "deinit")) inner_state.deinit(),
+        }
+
         self.* = new_state;
 
         switch (self.*) {
