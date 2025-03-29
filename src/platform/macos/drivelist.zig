@@ -93,42 +93,30 @@ test isDiskPartition {
 }
 
 fn convertString(ptr: ?*const anyopaque) ?[]const u8 {
-    if (@intFromPtr(ptr) % @alignOf(@import("objc").c.id) != 0) {
+    std.debug.assert(@sizeOf(NSString) == @sizeOf(@TypeOf(ptr)));
+    if (ptr == null) {
         return null;
     }
 
-    return std.mem.span(
-        (NSString{
-            .object = .{
-                .value = @constCast(@alignCast(@ptrCast(ptr orelse return null))),
-            },
-        }).UTF8String(),
-    );
+    return std.mem.span(@as(NSString, @bitCast(@intFromPtr(ptr))).UTF8String());
 }
 
 fn convertBool(ptr: ?*const anyopaque) bool {
-    if (@intFromPtr(ptr) % @alignOf(@import("objc").c.id) != 0) {
+    std.debug.assert(@sizeOf(NSNumber) == @sizeOf(@TypeOf(ptr)));
+    if (ptr == null) {
         return false;
     }
 
-    return (NSNumber{
-        .object = .{
-            .value = @constCast(@alignCast(@ptrCast(ptr orelse return false))),
-        },
-    }).boolValue();
+    return @as(NSNumber, @bitCast(@intFromPtr(ptr))).boolValue();
 }
 
 fn convertNumber(ptr: ?*const anyopaque) u32 {
-    if (@intFromPtr(ptr) % @alignOf(@import("objc").c.id) != 0) {
+    std.debug.assert(@sizeOf(NSNumber) == @sizeOf(@TypeOf(ptr)));
+    if (ptr == null) {
         return 0;
     }
 
-    // std.debug.print("convertNumber {*} {d}\n", .{ ptr, @as(*const u8, @alignCast(@ptrCast(ptr orelse return 0))).* });
-    return (NSNumber{
-        .object = .{
-            .value = @constCast(@alignCast(@ptrCast(ptr orelse return 0))),
-        },
-    }).unsignedIntValue();
+    return @as(NSNumber, @bitCast(@intFromPtr(ptr))).unsignedIntValue();
 }
 
 fn convertDescriptor(allocator: std.mem.Allocator, bsd_name: []const u8, description: c.CFDictionaryRef) !drivelist.DeviceDescriptor {
