@@ -1,7 +1,8 @@
 const std = @import("std");
 const clay = @import("clay");
+const renderer = @import("../renderer.zig");
 
-const fonts: []const [*:0]const u8 = &.{
+const fonts: []const [:0]const u8 = &.{
     "sans-serif",
 };
 
@@ -26,7 +27,7 @@ const error_handler: clay.ErrorHandler = .{ .handler = handleClayErrors };
 
 pub fn initClayContext(layout_dimensions: clay.Dimensions) !void {
     _ = try clay.Context.init(std.heap.page_allocator, layout_dimensions, error_handler);
-    clay.setMeasureTextFunction(clay.renderers.cairo.measureText, @constCast(@ptrCast(fonts.ptr)));
+    clay.setMeasureTextFunction(renderer.measureText, @constCast(@ptrCast(&fonts)));
 }
 
 pub fn setLayoutDimensions(layout_dimensions: clay.Dimensions) !void {
@@ -62,5 +63,5 @@ pub fn AppState(comptime T: type) type {
 }
 
 pub fn render(commands: clay.RenderCommandArray) void {
-    clay.renderers.cairo.render(commands, @ptrCast(fonts.ptr));
+    renderer.render(commands, fonts);
 }

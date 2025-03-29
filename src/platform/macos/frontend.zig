@@ -4,6 +4,7 @@ const appkit = @import("appkit.zig");
 const clay = @import("clay");
 const cairo = @import("cairo");
 const common = @import("../frontend.zig");
+const renderer = @import("../../renderer.zig");
 
 const CustomClass = @import("objc.zig").CustomClass;
 const NSNumber = @import("common.zig").NSNumber;
@@ -217,7 +218,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                     const cairo_ctx = cairo.Context.init(surface) catch unreachable;
                     defer cairo_ctx.deinit();
 
-                    clay.renderers.cairo.initialize(cairo_ctx);
+                    renderer.initialize(cairo_ctx);
 
                     common.render(layoutFn(&self.state().data));
                 }

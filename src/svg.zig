@@ -1,7 +1,6 @@
 const std = @import("std");
 const clay = @import("clay");
-
-const cairo = clay.renderers.cairo.cairo;
+const cairo = @import("cairo");
 
 fn mergeCommands(comptime commands: anytype) []const cairo.Path.Data {
     var data: []const cairo.Path.Data = &.{};

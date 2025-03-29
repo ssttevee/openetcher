@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     const clay_dep = b.dependency("clay", .{
         .target = target,
         .optimize = optimize,
-        .renderers = @as([]const []const u8, @ptrCast(&[_][]const u8{"cairo"})),
+        .renderers = @as([]const []const u8, &.{}),
     });
 
     const exe_mod = b.createModule(.{
