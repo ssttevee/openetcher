@@ -193,6 +193,14 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                     // self.setNeedsDisplay(true);
                 }
 
+                pub fn scrollWheel(self: CustomView, _: objc.Sel, event: appkit.NSEvent) void {
+                    clay.updateScrollContainers(false, .{
+                        .x = @floatCast(event.msgSend(f64, "scrollingDeltaX", .{})),
+                        .y = @floatCast(event.msgSend(f64, "scrollingDeltaY", .{})),
+                    }, 0);
+                    self.setNeedsDisplay(true);
+                }
+
                 pub fn drawRect(self: CustomView, _: objc.Sel, _: appkit.cg.Rect) void {
                     if (self.ivarGet(.state)) |s| {
                         if (s.common.first_draw) {
