@@ -270,9 +270,9 @@ const FrontPage = struct {
                             },
                         })({
                             if (selected_image.done) {
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{3.0}", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
                             } else {
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({3.0})", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({d:3.2})", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
                             }
                         });
 
@@ -712,8 +712,6 @@ const HumanizeBytes = struct {
     };
 
     pub fn format(self: HumanizeBytes, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = options;
-
         const unit, const num = blk: {
             if (!std.math.isNormal(self.bytes)) {
                 break :blk .{ units[0], @as(f64, 0.0) };
@@ -726,7 +724,8 @@ const HumanizeBytes = struct {
             }
         };
 
-        try std.fmt.format(writer, "{d:" ++ fmt ++ "}{s}", .{ num, unit });
+        try std.fmt.formatType(num, fmt, options, writer, 4);
+        try writer.writeAll(unit);
     }
 };
 
@@ -734,8 +733,6 @@ const HumanizeDuration = struct {
     seconds: f64,
 
     pub fn format(self: HumanizeDuration, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = options;
-
         const unit, const num = blk: {
             if (!std.math.isNormal(self.seconds)) {
                 break :blk .{ "s", @as(f64, 0.0) };
@@ -768,7 +765,9 @@ const HumanizeDuration = struct {
             break :blk .{ "days", self.seconds / 86400.0 };
         };
 
-        try std.fmt.format(writer, "{d:" ++ fmt ++ "} {s}", .{ num, unit });
+        try std.fmt.formatType(num, fmt, options, writer, 4);
+        try writer.writeByte(' ');
+        try writer.writeAll(unit);
     }
 };
 
@@ -895,18 +894,18 @@ const Flashing = struct {
                         .attach_to = .parent,
                     },
                 })({
-                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.2}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.1}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
                 });
             });
 
-            clay.text(std.fmt.allocPrint(self.arena.allocator(), "{3.0}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+            clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
 
             if (percent == 1) {
                 clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
             } else if (rate == 0 or self.total == 0) {
                 clay.text("calculating eta", comptime &.{ .font_size = 16, .text_color = .white });
             } else {
-                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
             }
         });
     }
