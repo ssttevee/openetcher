@@ -15,6 +15,10 @@ fn nt(s: []const u8) [:0]const u8 {
 }
 
 pub fn measureText(str: clay.String.Slice, config: *clay.TextElementConfig, user_data: ?*anyopaque) callconv(.C) clay.Dimensions {
+    if (str.len == 0) {
+        return .{};
+    }
+
     const cr = cairo_context orelse std.debug.panic("not initialized", .{});
     const text = str.asSlice();
 
@@ -58,6 +62,9 @@ pub fn measureText(str: clay.String.Slice, config: *clay.TextElementConfig, user
 
     const glyphs = scaled_font.textToGlyphs(0, 0, text, null, null) catch |err| {
         std.log.err("failed to generate glyphs: {}", .{err});
+        return .{};
+    } orelse {
+        std.log.err("failed to generate glyphs for string with length {d}: \"{s}\"", .{ text.len, text });
         return .{};
     };
     defer cairo.Glyph.free(glyphs);

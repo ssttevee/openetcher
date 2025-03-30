@@ -206,7 +206,7 @@ pub fn App(comptime T: type, layoutFn: fn (app_state: *T) clay.RenderCommandArra
                         if (s.common.first_draw) {
                             s.common.first_draw = false;
 
-                            s.data.setState(.default);
+                            s.data.onFirstDraw();
                         }
                     }
 

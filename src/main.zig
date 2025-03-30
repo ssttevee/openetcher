@@ -39,6 +39,8 @@ const FrontPage = struct {
         }
     } = null,
     selected_disks: std.StaticBitSet(64) = .initEmpty(), // use as flags, only support up to 64 bits
+    show_system_disks: bool = false,
+    prev_show_system_disks: bool = false,
     mutex: std.Thread.Mutex = .{},
 
     current_hover_state: HoverState = .{},
@@ -53,6 +55,7 @@ const FrontPage = struct {
         cancel_image: bool = false,
         flash: bool = false,
         target_disk_index: ?usize = null,
+        show_system_disks: bool = false,
     };
 
     var disks_mutex: std.Thread.Mutex = .{};
@@ -61,7 +64,7 @@ const FrontPage = struct {
     const CompressionType = enum { none, gzip, xz, zstd };
 
     inline fn parentState(self: *FrontPage) *MyState {
-        return @as(*MyState, @alignCast(@fieldParentPtr("front_page", self)));
+        return @as(*MyState, @fieldParentPtr("view", @as(*MyState.View, @fieldParentPtr("front_page", self))));
     }
 
     fn ready(self: *const FrontPage) bool {
@@ -270,9 +273,9 @@ const FrontPage = struct {
                             },
                         })({
                             if (selected_image.done) {
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}", .{HumanizeBytes.init(selected_image.real_size)}) catch unreachable, &btn_text_config);
                             } else {
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({d:3.2})", .{HumanizeBytes{ .bytes = @floatFromInt(selected_image.real_size) }}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({d:3.2})", .{HumanizeBytes.init(selected_image.real_size)}) catch unreachable, &btn_text_config);
                             }
                         });
 
@@ -356,118 +359,160 @@ const FrontPage = struct {
 
                 clay.ui()(.{
                     .layout = .{
-                        .sizing = .{
-                            .width = .fixed(200),
-                            .height = .fit(.{ .max = 170 }),
-                        },
                         .layout_direction = .top_to_bottom,
                     },
-                    .background_color = clay.Color.white.withAlpha(220),
-                    .border = .{
-                        .width = .outside(2),
-                        .color = clay.Color.black.withAlpha(100),
-                    },
                 })({
-                    const disks_copy = blk: {
-                        disks_mutex.lock();
-                        defer disks_mutex.unlock();
-
-                        break :blk disks;
-                    };
-
-                    if (disks_copy) |devices| {
-                        clay.ui()(.{
-                            .id = clay.id("TargetDiskSelector"),
-                            .layout = .{
-                                .sizing = .{
-                                    .width = .grow(.{}),
-                                },
-                                .layout_direction = .top_to_bottom,
+                    var has_system_disk = false;
+                    clay.ui()(.{
+                        .layout = .{
+                            .sizing = .{
+                                .width = .fixed(200),
+                                .height = .fixed(170),
                             },
-                            .scroll = .{ .vertical = true },
-                        })({
-                            for (devices, 0..) |*disk, i| {
-                                clay.ui()(.{
-                                    .id = clay.idi("TargetDiskOption", @intCast(i)),
-                                    .layout = .{
-                                        .sizing = .{
-                                            .width = .grow(.{}),
-                                        },
-                                        .child_alignment = .left_center,
-                                        .padding = .all(12),
-                                        .child_gap = 12,
+                            .layout_direction = .top_to_bottom,
+                        },
+                        .background_color = clay.Color.white.withAlpha(220),
+                        .border = .{
+                            .width = .outside(2),
+                            .color = clay.Color.black.withAlpha(100),
+                        },
+                    })({
+                        const disks_copy = blk: {
+                            disks_mutex.lock();
+                            defer disks_mutex.unlock();
+
+                            break :blk disks;
+                        };
+
+                        if (disks_copy) |devices| {
+                            clay.ui()(.{
+                                .id = clay.id("TargetDiskSelector"),
+                                .layout = .{
+                                    .sizing = .{
+                                        .width = .grow(.{}),
                                     },
-                                    .background_color = if (self.current_hover_state.target_disk_index == i) clay.Color.black.withAlpha(60) else .{},
-                                })({
-                                    clay.setOnHover(
-                                        struct {
-                                            fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
-                                                const state: *FrontPage = @alignCast(@ptrCast(user_data));
-
-                                                const selector_data = clay.getElementData(clay.id("TargetDiskSelector")) orelse return;
-                                                if (!selector_data.bounding_box.contains(pointer_data.position)) return;
-
-                                                state.current_hover_state.target_disk_index = element_id.offset;
-
-                                                if (pointer_data.state == .released_this_frame) {
-                                                    state.selected_disks.toggle(element_id.offset);
-                                                    state.parentState().redraw();
-                                                }
-                                            }
-                                        }.onHover,
-                                        @ptrCast(self),
-                                    );
+                                    .layout_direction = .top_to_bottom,
+                                },
+                                .scroll = .{ .vertical = true },
+                            })({
+                                for (devices, 0..) |*disk, i| {
+                                    if (disk.is_system) {
+                                        has_system_disk = true;
+                                        if (!self.show_system_disks) {
+                                            break;
+                                        }
+                                    }
 
                                     clay.ui()(.{
+                                        .id = clay.idi("TargetDiskOption", @intCast(i)),
                                         .layout = .{
-                                            .sizing = .fixed(14),
-                                            .child_alignment = .center,
+                                            .sizing = .{
+                                                .width = .grow(.{}),
+                                            },
+                                            .child_alignment = .left_center,
+                                            .padding = .all(12),
+                                            .child_gap = 12,
                                         },
-                                        .border = .{
-                                            .width = .outside(2),
-                                            .color = .black,
-                                        },
+                                        .background_color = if (self.current_hover_state.target_disk_index == i) clay.Color.black.withAlpha(60) else .{},
                                     })({
-                                        if (self.selected_disks.isSet(i)) {
-                                            clay.ui()(.{
-                                                .layout = .{
-                                                    .sizing = .fixed(8),
-                                                },
-                                                .background_color = .black,
-                                            })({});
-                                        }
-                                    });
+                                        clay.setOnHover(
+                                            struct {
+                                                fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                                    const state: *FrontPage = @alignCast(@ptrCast(user_data));
 
-                                    clay.text(disk.device, &selector_text_config);
-                                    std.debug.print("{s} {?s} {} {}\n", .{ disk.device, disk.description, disk.is_system, disk.is_card });
+                                                    const selector_data = clay.getElementData(clay.id("TargetDiskSelector")) orelse return;
+                                                    if (!selector_data.bounding_box.contains(pointer_data.position)) return;
 
-                                    clay.ui()(.{ .layout = .{ .sizing = .grow(.{}) } })({});
+                                                    state.current_hover_state.target_disk_index = element_id.offset;
 
-                                    if (disk.is_system) {
+                                                    if (pointer_data.state == .released_this_frame) {
+                                                        state.selected_disks.toggle(element_id.offset);
+                                                        state.parentState().redraw();
+                                                    }
+                                                }
+                                            }.onHover,
+                                            @ptrCast(self),
+                                        );
+
+                                        clay.ui()(.{
+                                            .layout = .{
+                                                .sizing = .fixed(14),
+                                                .child_alignment = .center,
+                                            },
+                                            .border = .{
+                                                .width = .outside(2),
+                                                .color = .black,
+                                            },
+                                        })({
+                                            if (self.selected_disks.isSet(i)) {
+                                                clay.ui()(.{
+                                                    .layout = .{
+                                                        .sizing = .fixed(8),
+                                                    },
+                                                    .background_color = .black,
+                                                })({});
+                                            }
+                                        });
+
+                                        clay.text(disk.device, &selector_text_config);
+
+                                        clay.ui()(.{ .layout = .{ .sizing = .grow(.{}) } })({});
+
+                                        clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.1}", .{HumanizeBytes.init(disk.size)}) catch unreachable, &selector_text_config);
+
                                         clay.ui()(.{
                                             .layout = .{
                                                 .sizing = .fixed(10),
                                                 .child_alignment = .center,
                                                 .padding = .x(3),
                                             },
-                                            .background_color = colors.system_disk_warning,
+                                            .background_color = if (disk.is_system) colors.system_disk_warning else .{},
                                             .corner_radius = .all(2),
                                         })({});
-                                    }
-                                });
-                            }
-                        });
-                    } else {
-                        clay.ui()(.{
-                            .layout = .{
-                                .sizing = .{
-                                    .width = .grow(.{}),
+                                    });
+                                }
+                            });
+                        } else {
+                            clay.ui()(.{
+                                .layout = .{
+                                    .sizing = .{
+                                        .width = .grow(.{}),
+                                    },
+                                    .padding = .y(16),
+                                    .child_alignment = .center,
                                 },
-                                .padding = .y(16),
-                                .child_alignment = .center,
-                            },
-                        })({
-                            clay.text("loading disks...", &selector_text_config);
+                            })({
+                                clay.text("loading disks...", &selector_text_config);
+                            });
+                        }
+                    });
+
+                    if (has_system_disk) {
+                        // not sure when this would be false tbh...
+
+                        clay.ui()(.{})({
+                            clay.setOnHover(
+                                struct {
+                                    fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                        _ = element_id;
+
+                                        const state: *FrontPage = @alignCast(@ptrCast(user_data));
+
+                                        state.current_hover_state.show_system_disks = true;
+
+                                        if (pointer_data.state == .released_this_frame) {
+                                            state.show_system_disks = !state.show_system_disks;
+                                            state.parentState().redraw();
+                                        }
+                                    }
+                                }.onHover,
+                                @ptrCast(self),
+                            );
+                            if (self.show_system_disks) {
+                                clay.text("hide system disks", if (self.current_hover_state.show_system_disks) &highlighted_btn_text_config else &btn_text_config);
+                            } else {
+                                clay.text("show system disks", if (self.current_hover_state.show_system_disks) &highlighted_btn_text_config else &btn_text_config);
+                            }
                         });
                     }
                 });
@@ -481,14 +526,14 @@ const FrontPage = struct {
                     self.buttonLayout(
                         "FlashButton",
                         "Flash!",
-                        if (self.selected_disks.count() != 0) colors.highlighted_btn else colors.btn,
-                        if (self.selected_disks.count() != 0 and self.current_hover_state.flash) &highlighted_btn_text_config else &btn_text_config,
+                        if (self.selected_image != null and self.selected_disks.count() != 0) colors.highlighted_btn else colors.btn,
+                        if (self.selected_image != null and self.selected_disks.count() != 0 and self.current_hover_state.flash) &highlighted_btn_text_config else &btn_text_config,
                         struct {
                             fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
                                 _ = element_id;
 
                                 const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                                if (state.selected_disks.count() == 0) return;
+                                if (state.selected_image == null or state.selected_disks.count() == 0) return;
 
                                 state.current_hover_state.flash = true;
                                 if (pointer_data.state == .released_this_frame) {
@@ -501,6 +546,11 @@ const FrontPage = struct {
                 });
             });
         });
+
+        if (self.prev_show_system_disks != self.show_system_disks) {
+            self.prev_show_system_disks = self.show_system_disks;
+            self.parentState().fixScroll();
+        }
     }
 
     fn onMount(self: *FrontPage) !void {
@@ -699,10 +749,13 @@ const FrontPage = struct {
 };
 
 const HumanizeBytes = struct {
-    bytes: f64,
+    bytes: usize,
+
+    pub fn init(bytes: usize) HumanizeBytes {
+        return .{ .bytes = bytes };
+    }
 
     const units = [_][]const u8{
-        "B",
         "KB",
         "MB",
         "GB",
@@ -712,19 +765,24 @@ const HumanizeBytes = struct {
     };
 
     pub fn format(self: HumanizeBytes, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        if (self.bytes < 1000) {
+            try std.fmt.formatType(self.bytes, fmt, options, writer, 1);
+            try writer.writeByte('B');
+            return;
+        }
+
         const unit, const num = blk: {
-            if (!std.math.isNormal(self.bytes)) {
-                break :blk .{ units[0], @as(f64, 0.0) };
-            }
-            inline for (units, 0..) |unit, i| {
-                const magnitude = comptime std.math.pow(f64, 1000, i);
-                if (self.bytes < magnitude * 1000 or i == units.len - 1) {
-                    break :blk .{ unit, self.bytes / magnitude };
+            inline for (units[0 .. units.len - 1], 0..) |unit, i| {
+                const magnitude = comptime std.math.powi(usize, 1000, i + 1) catch unreachable;
+                if (self.bytes / magnitude < 1000) {
+                    break :blk .{ unit, @as(f64, @floatFromInt(self.bytes)) / @as(f64, @floatFromInt(magnitude)) };
                 }
             }
+
+            break :blk .{ units[units.len - 1], @as(f64, @floatFromInt(self.bytes)) / comptime std.math.pow(f64, 1000, units.len) };
         };
 
-        try std.fmt.formatType(num, fmt, options, writer, 4);
+        try std.fmt.formatType(num, fmt, options, writer, 1);
         try writer.writeAll(unit);
     }
 };
@@ -765,7 +823,7 @@ const HumanizeDuration = struct {
             break :blk .{ "days", self.seconds / 86400.0 };
         };
 
-        try std.fmt.formatType(num, fmt, options, writer, 4);
+        try std.fmt.formatType(num, fmt, options, writer, 1);
         try writer.writeByte(' ');
         try writer.writeAll(unit);
     }
@@ -783,7 +841,7 @@ const Flashing = struct {
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
 
     inline fn parentState(self: *Flashing) *MyState {
-        return @as(*MyState, @fieldParentPtr("flashing", self));
+        return @as(*MyState, @fieldParentPtr("view", @as(*MyState.View, @fieldParentPtr("flashing", self))));
     }
 
     fn deinit(self: *const Flashing) void {
@@ -898,7 +956,7 @@ const Flashing = struct {
                 });
             });
 
-            clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}/s", .{HumanizeBytes{ .bytes = rate }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+            clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}/s", .{HumanizeBytes.init(@intFromFloat(rate))}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
 
             if (percent == 1) {
                 clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
@@ -911,30 +969,54 @@ const Flashing = struct {
     }
 };
 
-const MyState = union(enum) {
-    front_page: FrontPage,
-    flashing: Flashing,
+const MyState = struct {
+    const View = union(enum) {
+        front_page: FrontPage,
+        flashing: Flashing,
+    };
 
-    pub const default: MyState = .{ .front_page = .{} };
+    view: View = .{ .front_page = .{} },
 
-    inline fn redraw(self: *const MyState) void {
-        app.redraw(self);
-    }
+    pub const default: MyState = .{};
 
-    pub fn setState(self: *MyState, new_state: MyState) void {
-        switch (self.*) {
+    const redraw = app.redraw;
+
+    pub fn setState(self: *MyState, new_view: View) void {
+        switch (self.view) {
             inline else => |*inner_state| if (@hasDecl(@TypeOf(inner_state.*), "deinit")) inner_state.deinit(),
         }
 
-        self.* = new_state;
+        self.view = new_view;
 
-        switch (self.*) {
+        switch (self.view) {
             inline else => |*inner_state| if (@hasDecl(@TypeOf(inner_state.*), "onMount")) inner_state.onMount() catch unreachable,
         }
     }
 
+    pub fn onFirstDraw(self: *MyState) void {
+        switch (self.view) {
+            inline else => |*inner_state| if (@hasDecl(@TypeOf(inner_state.*), "onMount")) inner_state.onMount() catch unreachable,
+        }
+    }
+
+    // Fix scroll position after the contents shrink to scroll back to the content.
+    inline fn fixScroll(self: *MyState) void {
+        const thread = std.Thread.spawn(
+            .{},
+            struct {
+                fn run(state: *MyState) !void {
+                    std.Thread.yield() catch {};
+                    clay.updateScrollContainers(false, .{}, 0);
+                    state.redraw();
+                }
+            }.run,
+            .{self},
+        ) catch unreachable;
+        thread.detach();
+    }
+
     inline fn createLayout(self: *MyState) void {
-        switch (self.*) {
+        switch (self.view) {
             inline else => |*inner_state| inner_state.createLayout(),
         }
     }
