@@ -56,6 +56,8 @@ const FrontPage = struct {
         flash: bool = false,
         target_disk_index: ?usize = null,
         show_system_disks: bool = false,
+        reload_disks: bool = false,
+        expand_disks: bool = false,
     };
 
     var disks_mutex: std.Thread.Mutex = .{};
@@ -362,6 +364,69 @@ const FrontPage = struct {
                         .layout_direction = .top_to_bottom,
                     },
                 })({
+                    clay.ui()(.{
+                        .floating = .{
+                            .offset = .{ .y = -8 },
+                            .attach_points = .{
+                                .element = .bottom_left,
+                                .parent = .top_left,
+                            },
+                            .attach_to = .parent,
+                        },
+                    })({
+                        clay.setOnHover(
+                            struct {
+                                fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                    const state: *FrontPage = @alignCast(@ptrCast(user_data));
+
+                                    state.current_hover_state.reload_disks = true;
+
+                                    if (pointer_data.state == .released_this_frame) {
+                                        state.reloadDiskList() catch |err| {
+                                            std.debug.print("failed to reload disk list: {}\n", .{err});
+                                            return;
+                                        };
+                                        state.parentState().redraw();
+                                    }
+
+                                    handleMouseOut(element_id, pointer_data, user_data);
+                                }
+                            }.onHover,
+                            @ptrCast(self),
+                        );
+                        clay.text("reload", if (self.prev_hover_state.reload_disks) &highlighted_btn_text_config else &btn_text_config);
+                    });
+
+                    clay.ui()(.{
+                        .floating = .{
+                            .offset = .{ .y = -8 },
+                            .attach_points = .{
+                                .element = .bottom_right,
+                                .parent = .top_right,
+                            },
+                            .attach_to = .parent,
+                        },
+                    })({
+                        clay.setOnHover(
+                            struct {
+                                fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                    const state: *FrontPage = @alignCast(@ptrCast(user_data));
+
+                                    state.current_hover_state.expand_disks = true;
+
+                                    if (pointer_data.state == .released_this_frame) {
+                                        // TODO: implement me
+                                        // state.parentState().redraw();
+                                    }
+
+                                    handleMouseOut(element_id, pointer_data, user_data);
+                                }
+                            }.onHover,
+                            @ptrCast(self),
+                        );
+                        clay.text("expand", if (self.prev_hover_state.expand_disks) &highlighted_btn_text_config else &btn_text_config);
+                    });
+
                     var has_system_disk = false;
                     clay.ui()(.{
                         .layout = .{
@@ -458,7 +523,7 @@ const FrontPage = struct {
 
                                         clay.ui()(.{ .layout = .{ .sizing = .grow(.{}) } })({});
 
-                                        clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.1}", .{HumanizeBytes.init(disk.size)}) catch unreachable, &selector_text_config);
+                                        clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.1}", .{HumanizeBytes.init(disk.size * disk.block_size)}) catch unreachable, &selector_text_config);
 
                                         clay.ui()(.{
                                             .layout = .{
@@ -558,19 +623,23 @@ const FrontPage = struct {
     }
 
     fn reloadDiskList(self: *FrontPage) !void {
-        disks_mutex.lock();
-        if (disks) |prev| {
+        {
+            disks_mutex.lock();
             defer disks_mutex.unlock();
 
-            for (prev) |device| {
-                device.deinit(std.heap.page_allocator);
+            if (disks) |prev| {
+                for (prev) |device| {
+                    if (std.mem.eql(u8, "/dev/null", device.device)) {
+                        continue;
+                    }
+
+                    device.deinit(std.heap.page_allocator);
+                }
+
+                std.heap.page_allocator.free(prev);
             }
 
-            std.heap.page_allocator.free(prev);
-
             disks = null;
-        } else {
-            disks_mutex.unlock();
         }
 
         const thread = try std.Thread.spawn(.{}, loadDiskList, .{ self, std.heap.page_allocator });
@@ -602,6 +671,8 @@ const FrontPage = struct {
             .device = "/dev/null",
             .raw = "/dev/null",
             .size = std.math.maxInt(u64),
+            .block_size = 1,
+            .logical_block_size = 1,
             .is_virtual = true,
         };
 
