@@ -814,6 +814,10 @@ const FrontPage = struct {
             }.lessThan,
         );
 
+        for (devices) |dev| {
+            std.debug.print("{s} {d:0.1} {d:0.1} {d:0.1}\n", .{ dev.device, HumanizeBytes.init(dev.size * dev.logical_block_size), HumanizeBytes.init(dev.size), HumanizeBytes.init(dev.size / 8) });
+        }
+
         const devices_with_devnull = try allocator.alloc(platform.DeviceDescriptor, devices.len + 1);
         devices_with_devnull[0] = .{
             .enumerator = .none,
@@ -937,12 +941,12 @@ const HumanizeBytes = struct {
     }
 
     const units = [_][]const u8{
-        "KB",
-        "MB",
-        "GB",
-        "TB",
-        "PB",
-        "EB",
+        "KiB",
+        "MiB",
+        "GiB",
+        "TiB",
+        "PiB",
+        "EiB",
     };
 
     pub fn format(self: HumanizeBytes, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
@@ -954,13 +958,13 @@ const HumanizeBytes = struct {
 
         const unit, const num = blk: {
             inline for (units[0 .. units.len - 1], 0..) |unit, i| {
-                const magnitude = comptime std.math.powi(usize, 1000, i + 1) catch unreachable;
-                if (self.bytes / magnitude < 1000) {
+                const magnitude = comptime std.math.powi(usize, 1024, i + 1) catch unreachable;
+                if (self.bytes / magnitude < 1024) {
                     break :blk .{ unit, @as(f64, @floatFromInt(self.bytes)) / @as(f64, @floatFromInt(magnitude)) };
                 }
             }
 
-            break :blk .{ units[units.len - 1], @as(f64, @floatFromInt(self.bytes)) / comptime std.math.pow(f64, 1000, units.len) };
+            break :blk .{ units[units.len - 1], @as(f64, @floatFromInt(self.bytes)) / comptime std.math.pow(f64, 1024, units.len) };
         };
 
         try std.fmt.formatType(num, fmt, options, writer, 1);
