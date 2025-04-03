@@ -151,6 +151,42 @@ const CompressionType = enum {
     }
 };
 
+const btn_text_size = 14;
+
+const text_config: clay.TextElementConfig = .{ .font_size = 16, .text_color = .white };
+const selector_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = .black };
+const btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.btn_text };
+const disabled_btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.disabled_btn_text };
+const highlighted_btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.highlighted_btn_text };
+
+inline fn buttonLayout(
+    state: anytype,
+    comptime element_id_label: []const u8,
+    comptime button_text: []const u8,
+    button_color: clay.Color,
+    label_text_config: *const clay.TextElementConfig,
+    onHoverFn: ?*const clay.OnHoverFn,
+) void {
+    clay.ui()(.{
+        .id = clay.id(element_id_label),
+        .layout = .{
+            .sizing = .{
+                .width = .grow(.{}),
+            },
+            .padding = .y(16),
+            .child_alignment = .center,
+        },
+        .background_color = button_color,
+        .corner_radius = .all(22),
+    })({
+        if (onHoverFn) |onHover| {
+            clay.setOnHover(onHover, @ptrCast(state));
+        }
+
+        clay.text(button_text, label_text_config);
+    });
+}
+
 var disks_mutex: std.Thread.Mutex = .{};
 var disks: ?[]const platform.DeviceDescriptor = null;
 
@@ -213,41 +249,6 @@ const FrontPage = struct {
         self.arena.deinit();
     }
 
-    const btn_text_size = 14;
-
-    const selector_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = .black };
-    const btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.btn_text };
-    const disabled_btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.disabled_btn_text };
-    const highlighted_btn_text_config: clay.TextElementConfig = .{ .font_size = btn_text_size, .text_color = colors.highlighted_btn_text };
-
-    inline fn buttonLayout(
-        state: *FrontPage,
-        comptime element_id_label: []const u8,
-        comptime button_text: []const u8,
-        button_color: clay.Color,
-        label_text_config: *const clay.TextElementConfig,
-        onHoverFn: ?*const clay.OnHoverFn,
-    ) void {
-        clay.ui()(.{
-            .id = clay.id(element_id_label),
-            .layout = .{
-                .sizing = .{
-                    .width = .grow(.{}),
-                },
-                .padding = .y(16),
-                .child_alignment = .center,
-            },
-            .background_color = button_color,
-            .corner_radius = .all(22),
-        })({
-            if (onHoverFn) |onHover| {
-                clay.setOnHover(onHover, @ptrCast(state));
-            }
-
-            clay.text(button_text, label_text_config);
-        });
-    }
-
     inline fn createLayout(self: *FrontPage) void {
         _ = self.arena.reset(.retain_capacity);
 
@@ -271,7 +272,7 @@ const FrontPage = struct {
                     .child_alignment = .center,
                 },
             })({
-                clay.text("OpenEtcher", comptime &.{ .font_size = 16, .text_color = .white });
+                clay.text("OpenEtcher", &text_config);
             });
 
             clay.ui()(.{
@@ -385,6 +386,7 @@ const FrontPage = struct {
                                                 state.mutex.lock();
                                                 defer state.mutex.unlock();
 
+                                                std.heap.page_allocator.free(state.selected_image.?.path);
                                                 state.selected_image = null;
                                             }
                                         }
@@ -425,7 +427,8 @@ const FrontPage = struct {
                             });
                         }
                     } else {
-                        self.buttonLayout(
+                        buttonLayout(
+                            self,
                             "ImageFromFileButton",
                             "Flash from file",
                             if (self.current_hover_state.image_from_file or (!self.current_hover_state.image_from_url and !self.current_hover_state.image_from_disk)) colors.highlighted_btn else colors.btn,
@@ -451,7 +454,8 @@ const FrontPage = struct {
                             }.onHover,
                         );
 
-                        self.buttonLayout(
+                        buttonLayout(
+                            self,
                             "ImageFromURLButton",
                             "Flash from URL",
                             if (self.current_hover_state.image_from_url) colors.highlighted_btn else colors.btn,
@@ -469,7 +473,8 @@ const FrontPage = struct {
                             }.onHover,
                         );
 
-                        self.buttonLayout(
+                        buttonLayout(
+                            self,
                             "ImageFromDiskButton",
                             "Clone a disk",
                             if (self.current_hover_state.image_from_disk) colors.highlighted_btn else colors.btn,
@@ -718,7 +723,8 @@ const FrontPage = struct {
                         .layout_direction = .top_to_bottom,
                     },
                 })({
-                    self.buttonLayout(
+                    buttonLayout(
+                        self,
                         "FlashButton",
                         "Flash!",
                         if (self.selected_image != null and self.selected_image.?.ready() and self.selected_disks.count() != 0) colors.highlighted_btn else colors.btn,
@@ -836,7 +842,6 @@ const FrontPage = struct {
                 var source = try img.kind.open(img.path);
                 errdefer source.deinit();
 
-                std.debug.print("stat\n", .{});
                 img.size = (try source.size()) orelse 0;
 
                 var br = std.io.bufferedReader(source.reader());
@@ -1031,6 +1036,7 @@ fn timedReader(reader: anytype) TimedReader(@TypeOf(reader)) {
 }
 
 const Flashing = struct {
+    original_path: []const u8,
     source: ImageType.Source,
     compression_type: CompressionType,
     target_disks: []*const platform.DeviceDescriptor,
@@ -1041,8 +1047,16 @@ const Flashing = struct {
     rates: [32]f64 = [_]f64{0} ** 32,
     rates_pos: usize = 0,
     rates_len: usize = 0,
+    total_duration_ms: ?u64 = null,
+
+    current_hover_state: HoverState = .{},
+    prev_hover_state: HoverState = .{},
 
     arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+
+    const HoverState = struct {
+        back_btn: bool = false,
+    };
 
     inline fn parentState(self: *Flashing) *MyState {
         return @as(*MyState, @fieldParentPtr("view", @as(*MyState.View, @fieldParentPtr("flashing", self))));
@@ -1064,6 +1078,7 @@ const Flashing = struct {
         }
 
         return .{
+            .original_path = path,
             .source = source,
             .compression_type = compression_type,
             .total = real_size,
@@ -1241,6 +1256,8 @@ const Flashing = struct {
                 .child_gap = 40,
             },
         })({
+            clay.setOnHover(handleMouseOut, @ptrCast(self));
+
             clay.ui()(.{
                 .layout = .{
                     .sizing = .{ .width = .grow(.{}) },
@@ -1251,10 +1268,10 @@ const Flashing = struct {
                     .child_alignment = .center_top,
                 },
             })({
-                clay.text("flashing", comptime &.{ .font_size = 16, .text_color = .white });
+                clay.text("flashing", &text_config);
             });
 
-            const percent, const rate, const eta = blk: {
+            const percent, const rate, const eta, const total_ms = blk: {
                 self.mu.lock();
                 defer self.mu.unlock();
 
@@ -1269,6 +1286,7 @@ const Flashing = struct {
                     if (self.total == 0) 0 else @as(f64, @floatFromInt(self.current)) / @as(f64, @floatFromInt(self.total)),
                     rate,
                     @as(f64, @floatFromInt(self.total - self.current)) / rate,
+                    self.total_duration_ms,
                 };
             };
 
@@ -1292,20 +1310,83 @@ const Flashing = struct {
                         .attach_to = .parent,
                     },
                 })({
-                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.1}%", .{percent * 100.0}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                    clay.setOnHover(null, null);
+                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.1}%", .{percent * 100.0}) catch unreachable, &text_config);
                 });
             });
 
-            clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}/s", .{HumanizeBytes.init(@intFromFloat(rate))}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
-
-            if (percent == 1) {
-                clay.text("done", comptime &.{ .font_size = 16, .text_color = .white });
-            } else if (rate == 0 or self.total == 0) {
-                clay.text("calculating eta", comptime &.{ .font_size = 16, .text_color = .white });
+            if (total_ms) |duration| {
+                clay.text(std.fmt.allocPrint(self.arena.allocator(), "average {d:0.2}/s", .{HumanizeBytes.init(@intFromFloat(@as(f64, @floatFromInt(self.total)) / @as(f64, @floatFromInt(duration)) * 1000.0))}) catch unreachable, &text_config);
             } else {
-                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, comptime &.{ .font_size = 16, .text_color = .white });
+                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.2}/s", .{HumanizeBytes.init(@intFromFloat(rate))}) catch unreachable, &text_config);
+            }
+
+            if (total_ms) |duration| {
+                clay.text(std.fmt.allocPrint(self.arena.allocator(), "done in {d:0.0}", .{HumanizeDuration{ .seconds = @as(f64, @floatFromInt(duration)) / 1000.0 }}) catch unreachable, &text_config);
+
+                clay.ui()(.{
+                    .layout = .{
+                        .sizing = .{
+                            .width = .fixed(200),
+                        },
+                    },
+                })({
+                    buttonLayout(
+                        self,
+                        "BackButton",
+                        "Back",
+                        if (self.current_hover_state.back_btn) colors.highlighted_btn else colors.btn,
+                        if (self.current_hover_state.back_btn) &highlighted_btn_text_config else &btn_text_config,
+                        struct {
+                            fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+                                _ = element_id;
+
+                                const state: *Flashing = @alignCast(@ptrCast(user_data));
+                                state.current_hover_state.back_btn = true;
+                                if (pointer_data.state == .released_this_frame) {
+                                    state.parentState().setState(.{
+                                        .front_page = .{
+                                            .selected_image = .{
+                                                .kind = state.source,
+                                                .path = state.original_path,
+                                                .size = (state.source.size() catch 0) orelse 0,
+                                                .real_size = state.total,
+                                                .compression_type = state.compression_type,
+                                                .done = true,
+                                            },
+                                        },
+                                    });
+                                    platform.setCursor(.default);
+                                }
+                            }
+                        }.onHover,
+                    );
+                });
+            } else if (rate == 0 or self.total == 0) {
+                clay.text("calculating eta", &text_config);
+            } else {
+                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.0} remaining", .{HumanizeDuration{ .seconds = eta }}) catch unreachable, &text_config);
             }
         });
+    }
+
+    fn handleMouseOut(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
+        _ = element_id;
+        _ = pointer_data;
+
+        const state: *Flashing = @alignCast(@ptrCast(user_data));
+        if (!std.mem.eql(u8, std.mem.asBytes(&state.prev_hover_state), std.mem.asBytes(&state.current_hover_state))) {
+            state.parentState().redraw();
+            if (std.mem.eql(u8, std.mem.asBytes(&state.current_hover_state), std.mem.asBytes(&HoverState{}))) {
+                platform.setCursor(.default);
+            } else {
+                std.debug.print("setting cursor to pointer 2\n", .{});
+                platform.setCursor(.pointer);
+            }
+        }
+
+        state.prev_hover_state = state.current_hover_state;
+        state.current_hover_state = .{};
     }
 };
 
