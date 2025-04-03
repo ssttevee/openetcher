@@ -423,7 +423,11 @@ const FrontPage = struct {
                                     .child_alignment = .center,
                                 },
                             })({
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "compression type: {s}", .{@tagName(compression_type)}) catch unreachable, &btn_text_config);
+                                if (compression_type == .none or !selected_image.done) {
+                                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "compression type: {s}", .{@tagName(compression_type)}) catch unreachable, &btn_text_config);
+                                } else {
+                                    clay.text(std.fmt.allocPrint(self.arena.allocator(), "compression type: {s} ({d:0.0}%)", .{ @tagName(compression_type), @as(f64, @floatFromInt(selected_image.size)) / @as(f64, @floatFromInt(selected_image.real_size)) * 100.0 }) catch unreachable, &btn_text_config);
+                                }
                             });
                         }
                     } else {
