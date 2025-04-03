@@ -110,18 +110,27 @@ fn convertBool(ptr: ?*const anyopaque) bool {
     return @as(NSNumber, @bitCast(@intFromPtr(ptr))).boolValue();
 }
 
-fn convertNumber(ptr: ?*const anyopaque) u32 {
+fn convertInt(ptr: ?*const anyopaque) u32 {
     std.debug.assert(@sizeOf(NSNumber) == @sizeOf(@TypeOf(ptr)));
     if (ptr == null) {
         return 0;
     }
 
-    return @as(NSNumber, @bitCast(@intFromPtr(ptr))).unsignedIntValue();
+    return @intCast(@as(NSNumber, @bitCast(@intFromPtr(ptr))).unsignedIntValue());
+}
+
+fn convertLong(ptr: ?*const anyopaque) u64 {
+    std.debug.assert(@sizeOf(NSNumber) == @sizeOf(@TypeOf(ptr)));
+    if (ptr == null) {
+        return 0;
+    }
+
+    return @intCast(@as(NSNumber, @bitCast(@intFromPtr(ptr))).unsignedLongValue());
 }
 
 fn convertDescriptor(allocator: std.mem.Allocator, bsd_name: []const u8, description: c.CFDictionaryRef) !drivelist.DeviceDescriptor {
     const device_protocol = convertString(c.CFDictionaryGetValue(description, c.kDADiskDescriptionDeviceProtocolKey));
-    const block_size = convertNumber(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaBlockSizeKey));
+    const block_size = convertInt(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaBlockSizeKey));
     const is_internal = convertBool(c.CFDictionaryGetValue(description, c.kDADiskDescriptionDeviceInternalKey));
     const is_removable = convertBool(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaRemovableKey));
     const is_ejectable = convertBool(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaEjectableKey));
@@ -158,7 +167,7 @@ fn convertDescriptor(allocator: std.mem.Allocator, bsd_name: []const u8, descrip
         .description = media_name,
         .block_size = block_size,
         .logical_block_size = block_size,
-        .size = convertNumber(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaSizeKey)),
+        .size = convertLong(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaSizeKey)),
         .is_read_only = !convertBool(c.CFDictionaryGetValue(description, c.kDADiskDescriptionMediaWritableKey)),
         .is_system = is_internal and !is_removable,
         .is_virtual = if (device_protocol) |s| std.mem.eql(u8, s, "Virtual Interface") else false,

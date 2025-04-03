@@ -24,8 +24,16 @@ pub const NSNumber = ExternalClass(
             return self.msgSend(bool, "boolValue", .{});
         }
 
-        pub fn unsignedIntValue(self: NSNumber) u32 {
-            return self.msgSend(u32, "unsignedIntValue", .{});
+        pub fn unsignedIntValue(self: NSNumber) c_uint {
+            return self.msgSend(c_uint, "unsignedIntValue", .{});
+        }
+
+        pub fn unsignedLongValue(self: NSNumber) c_ulong {
+            return self.msgSend(c_ulong, "unsignedLongValue", .{});
+        }
+
+        pub fn unsignedLongLongValue(self: NSNumber) c_ulonglong {
+            return self.msgSend(c_ulonglong, "unsignedLongLongValue", .{});
         }
     },
 );

@@ -658,7 +658,7 @@ const FrontPage = struct {
 
                                         clay.ui()(.{ .layout = .{ .sizing = .grow(.{}) } })({});
 
-                                        clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.1}", .{HumanizeBytes.init(disk.size * disk.block_size)}) catch unreachable, &selector_text_config);
+                                        clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.1}", .{HumanizeBytes.init(disk.size)}) catch unreachable, &selector_text_config);
 
                                         clay.ui()(.{
                                             .layout = .{
@@ -814,16 +814,12 @@ const FrontPage = struct {
             }.lessThan,
         );
 
-        for (devices) |dev| {
-            std.debug.print("{s} {d:0.1} {d:0.1} {d:0.1}\n", .{ dev.device, HumanizeBytes.init(dev.size * dev.logical_block_size), HumanizeBytes.init(dev.size), HumanizeBytes.init(dev.size / 8) });
-        }
-
         const devices_with_devnull = try allocator.alloc(platform.DeviceDescriptor, devices.len + 1);
         devices_with_devnull[0] = .{
             .enumerator = .none,
             .device = "/dev/null",
             .raw = "/dev/null",
-            .size = std.math.maxInt(u64) / 512,
+            .size = std.math.maxInt(u64),
             .is_virtual = true,
         };
 
