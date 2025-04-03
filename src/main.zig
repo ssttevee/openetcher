@@ -19,6 +19,141 @@ const colors = struct {
     const loading_bar_fg = clay.Color.rgb(39, 202, 32);
 };
 
+var http_client: std.http.Client = .{ .allocator = std.heap.page_allocator };
+
+const ImageType = enum {
+    file,
+    url,
+    disk,
+
+    const Source = union(ImageType) {
+        file: std.fs.File,
+        url: std.http.Client.Request,
+        disk: std.fs.File,
+
+        fn size(self: *Source) !?usize {
+            return switch (self.*) {
+                inline .file, .disk => |*file| (try file.stat()).size,
+                .url => |*req| req.response.content_length,
+            };
+        }
+
+        fn deinit(self: *Source) void {
+            switch (self.*) {
+                inline .file, .disk => |file| file.close(),
+                .url => |*req| req.deinit(),
+            }
+        }
+
+        const Error = std.fs.File.Reader.Error || std.http.Client.Request.Reader.Error;
+
+        fn read(self: *Source, buf: []u8) Error!usize {
+            return switch (self.*) {
+                inline .file, .disk => |file| file.read(buf),
+                .url => |*req| req.read(buf),
+            };
+        }
+
+        const Reader = std.io.Reader(*Source, Error, read);
+
+        fn reader(self: *Source) Reader {
+            return .{ .context = self };
+        }
+    };
+
+    fn open(self: ImageType, path: []const u8) !Source {
+        switch (self) {
+            inline .file, .disk => |tag| {
+                return @unionInit(Source, @tagName(tag), try std.fs.openFileAbsolute(path, .{}));
+            },
+            .url => {
+                var buf: [8192]u8 = undefined;
+                var req = try http_client.open(.GET, try .parse(path), .{ .server_header_buffer = &buf });
+                try req.send();
+                try req.finish();
+                try req.wait();
+                return .{ .url = req };
+            },
+        }
+    }
+};
+const CompressionType = enum {
+    none,
+    gzip,
+    xz,
+    zstd,
+
+    fn fromLeadingBytes(bytes: []const u8) CompressionType {
+        if (std.mem.startsWith(u8, bytes, &.{ 0x1f, 0x8b })) {
+            return .gzip;
+        }
+
+        if (std.mem.startsWith(u8, bytes, &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 })) {
+            return .xz;
+        }
+
+        if (std.mem.startsWith(u8, bytes, &.{ 0x28, 0xb5, 0x2f, 0xfd })) {
+            return .zstd;
+        }
+
+        return .none;
+    }
+
+    fn Decompressor(InternalReader: type) type {
+        return union(CompressionType) {
+            none: InternalReader,
+            gzip: std.compress.gzip.Decompressor(InternalReader),
+            xz: std.compress.xz.Decompress(InternalReader),
+            zstd: std.compress.zstd.Decompressor(InternalReader),
+
+            fn deinit(self: *@This()) void {
+                switch (self.*) {
+                    .none, .gzip => {},
+                    .xz => |*xz| xz.deinit(),
+                    .zstd => |*zstd| std.heap.page_allocator.free(zstd.buffer.data),
+                }
+            }
+
+            const Error = InternalReader.Error || std.compress.gzip.Decompressor(InternalReader).Error || std.compress.xz.Decompress(InternalReader).Error || std.compress.zstd.Decompressor(InternalReader).Error;
+
+            fn read(self: *@This(), buf: []u8) Error!usize {
+                return switch (self.*) {
+                    inline else => |*r| r.read(buf),
+                };
+            }
+
+            pub const Reader = std.io.Reader(*@This(), Error, read);
+
+            fn reader(self: *@This()) Reader {
+                return .{ .context = self };
+            }
+        };
+    }
+
+    fn decompressor(self: CompressionType, reader: anytype) !Decompressor(@TypeOf(reader)) {
+        return switch (self) {
+            .none => .{ .none = reader },
+            .gzip => .{ .gzip = std.compress.gzip.decompressor(reader) },
+            .xz => .{ .xz = try std.compress.xz.decompress(std.heap.page_allocator, reader) },
+            .zstd => .{
+                .zstd = std.compress.zstd.decompressor(
+                    reader,
+                    .{
+                        .window_buffer = try std.heap.page_allocator.alloc(
+                            u8,
+                            std.compress.zstd.DecompressorOptions.default_window_buffer_len,
+                        ),
+                        .verify_checksum = false,
+                    },
+                ),
+            },
+        };
+    }
+};
+
+var disks_mutex: std.Thread.Mutex = .{};
+var disks: ?[]const platform.DeviceDescriptor = null;
+
 const FrontPage = struct {
     override_view_state: union(enum) {
         none,
@@ -27,7 +162,7 @@ const FrontPage = struct {
         disk_output: []const usize,
     } = .none,
     selected_image: ?struct {
-        kind: enum { file, url, disk },
+        kind: ImageType,
         path: []const u8,
         size: usize = 0,
         real_size: usize = 0,
@@ -59,11 +194,6 @@ const FrontPage = struct {
         reload_disks: bool = false,
         expand_disks: bool = false,
     };
-
-    var disks_mutex: std.Thread.Mutex = .{};
-    var disks: ?[]const platform.DeviceDescriptor = null;
-
-    const CompressionType = enum { none, gzip, xz, zstd };
 
     inline fn parentState(self: *FrontPage) *MyState {
         return @as(*MyState, @fieldParentPtr("view", @as(*MyState.View, @fieldParentPtr("front_page", self))));
@@ -275,9 +405,9 @@ const FrontPage = struct {
                             },
                         })({
                             if (selected_image.done) {
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:3.2}", .{HumanizeBytes.init(selected_image.real_size)}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "{d:0.2}", .{HumanizeBytes.init(selected_image.real_size)}) catch unreachable, &btn_text_config);
                             } else {
-                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({d:3.2})", .{HumanizeBytes.init(selected_image.real_size)}) catch unreachable, &btn_text_config);
+                                clay.text(std.fmt.allocPrint(self.arena.allocator(), "calculating size ({d:0.2})", .{HumanizeBytes.init(selected_image.real_size)}) catch unreachable, &btn_text_config);
                             }
                         });
 
@@ -591,19 +721,32 @@ const FrontPage = struct {
                     self.buttonLayout(
                         "FlashButton",
                         "Flash!",
-                        if (self.selected_image != null and self.selected_disks.count() != 0) colors.highlighted_btn else colors.btn,
-                        if (self.selected_image != null and self.selected_disks.count() != 0 and self.current_hover_state.flash) &highlighted_btn_text_config else &btn_text_config,
+                        if (self.selected_image != null and self.selected_image.?.ready() and self.selected_disks.count() != 0) colors.highlighted_btn else colors.btn,
+                        if (self.selected_image != null and self.selected_image.?.ready() and self.selected_disks.count() != 0 and self.current_hover_state.flash) &highlighted_btn_text_config else &btn_text_config,
                         struct {
                             fn onHover(element_id: clay.ElementId, pointer_data: clay.PointerData, user_data: ?*anyopaque) callconv(.c) void {
                                 _ = element_id;
 
                                 const state: *FrontPage = @alignCast(@ptrCast(user_data));
-                                if (state.selected_image == null or state.selected_disks.count() == 0) return;
+                                if (state.selected_disks.count() == 0) return;
+                                if (state.selected_image) |*img| {
+                                    if (!img.ready()) return;
 
-                                state.current_hover_state.flash = true;
-                                if (pointer_data.state == .released_this_frame) {
-                                    state.parentState().setState(.{ .flashing = .{ .total = 1000000000 } });
-                                    platform.setCursor(.default);
+                                    state.current_hover_state.flash = true;
+                                    if (img.compression_type) |compression_type| {
+                                        if (pointer_data.state == .released_this_frame and img.done) {
+                                            state.parentState().setState(.{
+                                                .flashing = Flashing.init(
+                                                    img.kind,
+                                                    img.path,
+                                                    img.real_size,
+                                                    compression_type,
+                                                    state.selected_disks,
+                                                ) catch unreachable,
+                                            });
+                                            platform.setCursor(.default);
+                                        }
+                                    }
                                 }
                             }
                         }.onHover,
@@ -670,9 +813,7 @@ const FrontPage = struct {
             .enumerator = .none,
             .device = "/dev/null",
             .raw = "/dev/null",
-            .size = std.math.maxInt(u64),
-            .block_size = 1,
-            .logical_block_size = 1,
+            .size = std.math.maxInt(u64) / 512,
             .is_virtual = true,
         };
 
@@ -687,114 +828,78 @@ const FrontPage = struct {
     }
 
     fn calculateImageSize(self: *FrontPage) !void {
-        self.mutex.lock();
-        if (self.selected_image == null) {
-            self.mutex.unlock();
-            return;
+        var source, const compression_type, var br = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.selected_image) |*img| {
+                var source = try img.kind.open(img.path);
+                errdefer source.deinit();
+
+                std.debug.print("stat\n", .{});
+                img.size = (try source.size()) orelse 0;
+
+                var br = std.io.bufferedReader(source.reader());
+                var hack_buf: [0]u8 = undefined; // hack to peek
+                _ = try br.read(&hack_buf);
+
+                const compression_type = CompressionType.fromLeadingBytes(&br.buf);
+                img.compression_type = compression_type;
+                if (compression_type == .none) {
+                    img.real_size = img.size;
+                }
+
+                break :blk .{ source, compression_type, br };
+            } else {
+                return;
+            }
+        };
+
+        defer source.deinit();
+
+        self.parentState().redraw();
+
+        // source ptr may have changed, set it again just in case
+        br.unbuffered_reader = source.reader();
+
+        switch (compression_type) {
+            .none => {},
+            else => {
+                var d = try compression_type.decompressor(br.reader().any());
+                defer d.deinit();
+
+                defer self.parentState().redraw();
+
+                var dr = d.reader();
+                var buf: [4096]u8 = undefined;
+                while (true) {
+                    const n = try dr.read(&buf);
+                    if (n == 0) {
+                        break;
+                    }
+
+                    {
+                        self.mutex.lock();
+                        defer self.mutex.unlock();
+
+                        if (self.selected_image) |*selected_image| {
+                            selected_image.real_size += n;
+                        } else {
+                            std.debug.print("image size calculation canceled\n", .{});
+                            return;
+                        }
+                    }
+
+                    self.parentState().redraw();
+                }
+            },
         }
 
         defer self.parentState().redraw();
 
-        const file, self.selected_image.?.size = switch (self.selected_image.?.kind) {
-            .file => blk: {
-                errdefer self.mutex.unlock();
-                const file = try std.fs.openFileAbsolute(self.selected_image.?.path, .{});
-                const stat = try file.stat();
-
-                break :blk .{ file, stat.size };
-            },
-            .url => std.debug.panic("not implemented", .{}),
-            .disk => std.debug.panic("not implemented", .{}),
-        };
-        defer file.close();
-
-        var br = std.io.bufferedReader(file.reader());
-        var hack_buf: [0]u8 = undefined; // hack to peek
-        _ = br.read(&hack_buf) catch |err| {
-            self.mutex.unlock();
-            return err;
-        };
-
-        if (std.mem.startsWith(u8, &br.buf, &.{ 0x1f, 0x8b })) {
-            self.selected_image.?.compression_type = .gzip;
-            self.mutex.unlock();
-
-            self.parentState().redraw();
-
-            var d = std.compress.gzip.decompressor(br.reader());
-            while (try d.next()) |bytes| {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-
-                if (self.selected_image) |*selected_image| {
-                    selected_image.real_size += bytes.len;
-                } else {
-                    std.debug.print("image size calculation cancelled\n", .{});
-                    return;
-                }
-
-                self.parentState().redraw();
-            }
-        } else if (std.mem.startsWith(u8, &br.buf, &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 })) {
-            self.selected_image.?.compression_type = .xz;
-            self.mutex.unlock();
-
-            self.parentState().redraw();
-
-            var d = try std.compress.xz.decompress(std.heap.page_allocator, br.reader());
-            defer d.deinit();
-
-            var buf: [4096]u8 = undefined;
-            while (true) {
-                const n = try d.read(&buf);
-
-                self.mutex.lock();
-                defer self.mutex.unlock();
-
-                if (self.selected_image) |*selected_image| {
-                    selected_image.real_size += n;
-                } else {
-                    std.debug.print("image size calculation cancelled\n", .{});
-                    return;
-                }
-
-                self.parentState().redraw();
-            }
-        } else if (std.mem.startsWith(u8, &br.buf, &.{ 0x28, 0xb5, 0x2f, 0xfd })) {
-            self.selected_image.?.compression_type = .zstd;
-            self.mutex.unlock();
-
-            self.parentState().redraw();
-
-            var window_buf: [std.compress.zstd.DecompressorOptions.default_window_buffer_len]u8 = undefined;
-            var d = std.compress.zstd.decompressor(br.reader(), .{ .window_buffer = &window_buf, .verify_checksum = false });
-
-            var buf: [4096]u8 = undefined;
-            while (true) {
-                const n = try d.read(&buf);
-
-                self.mutex.lock();
-                defer self.mutex.unlock();
-
-                if (self.selected_image) |*selected_image| {
-                    selected_image.real_size += n;
-                } else {
-                    std.debug.print("image size calculation cancelled\n", .{});
-                    return;
-                }
-
-                self.parentState().redraw();
-            }
-        } else {
-            // assume image is not compressed
-            if (self.selected_image) |*selected_image| {
-                selected_image.real_size += selected_image.size;
-            }
-            self.mutex.unlock();
-        }
-
         self.mutex.lock();
         defer self.mutex.unlock();
+
         if (self.selected_image) |*selected_image| {
             selected_image.done = true;
         }
@@ -900,7 +1005,35 @@ const HumanizeDuration = struct {
     }
 };
 
+fn TimedReader(Reader: type) type {
+    return struct {
+        internal_reader: Reader,
+        accumulated_nanos: usize = 0,
+
+        fn read(self: *@This(), buf: []u8) Reader.Error!usize {
+            const start = std.time.nanoTimestamp();
+            defer {
+                const d = std.time.nanoTimestamp() - start;
+                self.accumulated_nanos += @intCast(d);
+            }
+
+            return try self.internal_reader.read(buf);
+        }
+
+        fn reader(self: *@This()) std.io.Reader(*@This(), Reader.Error, read) {
+            return .{ .context = self };
+        }
+    };
+}
+
+fn timedReader(reader: anytype) TimedReader(@TypeOf(reader)) {
+    return .{ .internal_reader = reader };
+}
+
 const Flashing = struct {
+    source: ImageType.Source,
+    compression_type: CompressionType,
+    target_disks: []*const platform.DeviceDescriptor,
     total: usize,
     mu: std.Thread.Mutex = .{},
     current: usize = 0,
@@ -915,23 +1048,128 @@ const Flashing = struct {
         return @as(*MyState, @fieldParentPtr("view", @as(*MyState.View, @fieldParentPtr("flashing", self))));
     }
 
-    fn deinit(self: *const Flashing) void {
+    fn init(kind: ImageType, path: []const u8, real_size: usize, compression_type: CompressionType, selected_disks: std.StaticBitSet(64)) !Flashing {
+        const loaded_disks = disks orelse return error.DisksNotLoaded;
+
+        const source = try kind.open(path);
+        const target_disks = try std.heap.page_allocator.alloc(*const platform.DeviceDescriptor, selected_disks.count());
+
+        var it = selected_disks.iterator(.{});
+        var j: usize = 0;
+        while (it.next()) |i| {
+            std.debug.assert(loaded_disks.len > i);
+
+            target_disks[j] = &loaded_disks[i];
+            j += 1;
+        }
+
+        return .{
+            .source = source,
+            .compression_type = compression_type,
+            .total = real_size,
+            .target_disks = target_disks,
+        };
+    }
+
+    fn deinit(self: *Flashing) void {
+        std.heap.page_allocator.free(self.target_disks);
+        self.source.deinit();
         self.arena.deinit();
     }
 
-    fn doflash(self: *Flashing) void {
-        const rate_interval = 1000;
+    fn targetDisksBlockSizeLCM(self: *const Flashing) !usize {
+        std.debug.assert(self.target_disks.len > 0);
 
-        // TODO: replace with real implementation
-        var rng = std.Random.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
-        const rand = rng.random();
+        if (self.target_disks.len == 1) {
+            return self.target_disks[0].block_size;
+        }
+
+        const block_sizes = blk: {
+            var block_sizes: std.AutoArrayHashMapUnmanaged(u32, void) = .{};
+            defer block_sizes.deinit(std.heap.page_allocator);
+
+            try block_sizes.ensureUnusedCapacity(std.heap.page_allocator, self.target_disks.len);
+
+            for (self.target_disks) |disk| {
+                block_sizes.putAssumeCapacity(disk.block_size, {});
+            }
+
+            break :blk try std.heap.page_allocator.dupe(u32, block_sizes.keys());
+        };
+        defer std.heap.page_allocator.free(block_sizes);
+
+        if (block_sizes.len == 1) {
+            return block_sizes[0];
+        }
+
+        const multiples = try std.heap.page_allocator.dupe(u32, block_sizes);
+        defer std.heap.page_allocator.free(multiples);
+
+        while (!std.mem.allEqual(u32, multiples[1..], multiples[0])) {
+            const max = std.mem.max(u32, multiples);
+            for (block_sizes, multiples) |block_size, *multiple| {
+                if (multiple.* < max) {
+                    multiple.* += block_size;
+                }
+            }
+        }
+
+        return multiples[0];
+    }
+
+    fn doflash(self: *Flashing) !void {
+        const rate_interval = 1000000000; // at least 1s between each rate update
+
         var current: usize = 0;
-        var start = std.time.milliTimestamp();
+        var io_tr = timedReader(self.source.reader());
+        var dcompressor = try self.compression_type.decompressor(io_tr.reader());
+        var dc_tr = timedReader(dcompressor.reader());
+
+        // 65536 seems to be the largest block size people would consider using
+        var br = std.io.bufferedReaderSize(65536, dc_tr.reader());
+        const block_size_lcm = try self.targetDisksBlockSizeLCM();
+        std.debug.assert(br.buf.len > block_size_lcm);
+
+        const r = br.reader();
+
+        const buf = try std.heap.page_allocator.alloc(u8, block_size_lcm);
+        defer std.heap.page_allocator.free(buf);
+
+        var disk_files_len: usize = 0;
+        const disk_files = try std.heap.page_allocator.alloc(std.fs.File, self.target_disks.len);
+        defer {
+            for (0..disk_files_len) |i| {
+                disk_files[i].close();
+            }
+
+            std.heap.page_allocator.free(disk_files);
+        }
+
+        for (self.target_disks) |disk| {
+            disk_files[disk_files_len] = try std.fs.openFileAbsolute(disk.device, .{ .mode = .write_only, .lock = .exclusive });
+            disk_files_len += 1;
+        }
+
+        const disk_write_times = try std.heap.page_allocator.alloc(i128, self.target_disks.len);
+        defer std.heap.page_allocator.free(disk_write_times);
+
+        var start = std.time.nanoTimestamp();
         var last_progress: usize = 0;
         while (current < self.total) {
-            const now = std.time.milliTimestamp();
+            const n = try r.readAll(buf);
 
-            current += rand.intRangeAtMost(usize, 0, @min(self.total / 500, self.total - current));
+            for (self.target_disks, disk_files, 0..) |disk, file, i| {
+                // TODO: optimize with io uring
+                const write_start = std.time.nanoTimestamp();
+                for (0..@as(usize, @intCast(std.math.divCeil(usize, n, disk.block_size) catch unreachable))) |j| {
+                    try file.writeAll(buf[j * disk.block_size .. @min(n, (j + 1) * disk.block_size)]);
+                }
+                disk_write_times[i] += std.time.nanoTimestamp() - write_start;
+            }
+
+            current += n;
+
+            const now = std.time.nanoTimestamp();
 
             {
                 self.mu.lock();
@@ -945,14 +1183,27 @@ const Flashing = struct {
                     const delta = current - last_progress;
                     last_progress = current;
 
-                    self.rates[self.rates_pos] = @as(f64, @floatFromInt(delta)) / @as(f64, @floatFromInt(dt)) * 1000.0;
+                    self.rates[self.rates_pos] = @as(f64, @floatFromInt(delta)) / @as(f64, @floatFromInt(dt)) * 1000000000.0;
                     self.rates_len = @min(self.rates_len + 1, self.rates.len);
                     self.rates_pos = (self.rates_pos + 1) % self.rates.len;
+
+                    var total_us = @as(f64, @floatFromInt(dc_tr.accumulated_nanos));
+                    for (disk_write_times) |write_us| {
+                        total_us += @as(f64, @floatFromInt(write_us));
+                    }
+
+                    std.debug.print("read time: {d:0.1}%, decompression time: {d:0.1}%", .{ @as(f64, @floatFromInt(io_tr.accumulated_nanos)) / total_us * 100, @as(f64, @floatFromInt(dc_tr.accumulated_nanos - io_tr.accumulated_nanos)) / total_us * 100 });
+                    for (self.target_disks, disk_write_times) |disk, *write_us| {
+                        std.debug.print(", {s} write time: {d:0.1}%", .{ disk.device, @as(f64, @floatFromInt(write_us.*)) / total_us * 100 });
+                        write_us.* = 0;
+                    }
+                    std.debug.print("\n", .{});
+                    io_tr.accumulated_nanos = 0;
+                    dc_tr.accumulated_nanos = 0;
                 }
             }
 
             self.parentState().redraw();
-            std.Thread.sleep(10000000);
         }
     }
 
