@@ -1118,7 +1118,8 @@ const Flashing = struct {
     }
 
     fn doflash(self: *Flashing) !void {
-        const rate_interval = 1000000000; // at least 1s between each rate update
+        const rate_interval = 500000000; // at least 0.5s between each rate update
+        const redraw_interval = 10000000; // 10ms
 
         var current: usize = 0;
         var io_tr = timedReader(self.source.reader());
@@ -1153,7 +1154,18 @@ const Flashing = struct {
         const disk_write_times = try std.heap.page_allocator.alloc(i128, self.target_disks.len);
         defer std.heap.page_allocator.free(disk_write_times);
 
-        var start = std.time.nanoTimestamp();
+        @memset(disk_write_times, 0);
+
+        const start = std.time.milliTimestamp();
+        defer {
+            self.mu.lock();
+            defer self.mu.unlock();
+
+            self.total_duration_ms = @intCast(std.time.milliTimestamp() - start);
+        }
+
+        var rate_start = std.time.nanoTimestamp();
+        var redraw_start = std.time.nanoTimestamp();
         var last_progress: usize = 0;
         while (current < self.total) {
             const n = try r.readAll(buf);
@@ -1176,9 +1188,9 @@ const Flashing = struct {
                 defer self.mu.unlock();
                 self.current = current;
 
-                const dt = now - start;
+                const dt = now - rate_start;
                 if (dt >= rate_interval) {
-                    start = now;
+                    rate_start = now;
 
                     const delta = current - last_progress;
                     last_progress = current;
@@ -1203,6 +1215,12 @@ const Flashing = struct {
                 }
             }
 
+            if (now - redraw_start >= redraw_interval) {
+                redraw_start = now;
+
+                self.parentState().redraw();
+            }
+        } else {
             self.parentState().redraw();
         }
     }
