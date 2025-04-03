@@ -879,8 +879,16 @@ const FrontPage = struct {
 
                 defer self.parentState().redraw();
 
+                const redraw_interval_us = 50000; // 50ms
+
+                const start = std.time.microTimestamp();
+                defer {
+                    std.debug.print("decompression took {d:0.1}\n", .{HumanizeDuration{ .seconds = @as(f64, @floatFromInt(std.time.microTimestamp() - start)) / 1000000.0 }});
+                }
+
                 var dr = d.reader();
-                var buf: [4096]u8 = undefined;
+                var buf: [65536]u8 = undefined;
+                var last_redraw_us = std.time.microTimestamp();
                 while (true) {
                     const n = try dr.read(&buf);
                     if (n == 0) {
@@ -899,7 +907,11 @@ const FrontPage = struct {
                         }
                     }
 
-                    self.parentState().redraw();
+                    const now = std.time.microTimestamp();
+                    if (now - last_redraw_us >= redraw_interval_us) {
+                        last_redraw_us = now;
+                        self.parentState().redraw();
+                    }
                 }
             },
         }
