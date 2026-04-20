@@ -13,8 +13,8 @@ const Superblock = struct {
     bytes_used: u64,
 };
 
-pub fn probeSquashfsPartition(file: *std.Io.File, io: std.Io, start_offset: u64, size: u64) !PartitionInfo {
-    const superblock = try readSuperblock(file, io, start_offset, size);
+pub fn probeSquashfsPartition(io: std.Io, file: *std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
+    const superblock = try readSuperblock(io, file, start_offset, size);
 
     return .{
         .index = 0,
@@ -30,8 +30,8 @@ pub fn probeSquashfsPartition(file: *std.Io.File, io: std.Io, start_offset: u64,
     };
 }
 
-pub fn collectSquashfsRangesInRegion(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, start_offset: u64, size: u64) ![]ByteRange {
-    const superblock = try readSuperblock(file, io, start_offset, size);
+pub fn collectSquashfsRangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
+    const superblock = try readSuperblock(io, file, start_offset, size);
     const ranges = try allocator.alloc(ByteRange, 1);
     ranges[0] = .{
         .offset = start_offset,
@@ -40,7 +40,7 @@ pub fn collectSquashfsRangesInRegion(allocator: std.mem.Allocator, file: *std.Io
     return ranges;
 }
 
-fn readSuperblock(file: *std.Io.File, io: std.Io, start_offset: u64, size: u64) !Superblock {
+fn readSuperblock(io: std.Io, file: *std.Io.File, start_offset: u64, size: u64) !Superblock {
     var buffer: [superblock_size]u8 = undefined;
     const count = try file.readPositionalAll(io, &buffer, start_offset);
     if (count != buffer.len) return error.InvalidSquashfsSuperblock;
@@ -80,7 +80,7 @@ test "readSuperblock detects squashfs bytes_used" {
     try file.writeStreamingAll(io, &bytes);
     try file.sync(io);
 
-    const superblock = try readSuperblock(&file, io, 0, bytes.len);
+    const superblock = try readSuperblock(io, &file, 0, bytes.len);
     try std.testing.expectEqual(@as(u32, 131072), superblock.block_size);
     try std.testing.expectEqual(@as(u64, 1024), superblock.bytes_used);
 }
