@@ -1,8 +1,15 @@
 const std = @import("std");
 
-const types = @import("types.zig");
+const root = @import("../root.zig");
 
-pub const ByteRange = types.ByteRange;
+pub const ByteRange = struct {
+    offset: u64,
+    length: u64,
+
+    pub fn end(self: @This()) u64 {
+        return std.math.add(u64, self.offset, self.length) catch unreachable;
+    }
+};
 
 pub fn normalizeRanges(allocator: std.mem.Allocator, input: []const ByteRange) ![]ByteRange {
     var list: std.ArrayList(ByteRange) = .empty;
@@ -38,10 +45,6 @@ pub fn normalizeRanges(allocator: std.mem.Allocator, input: []const ByteRange) !
     return merged.toOwnedSlice(allocator);
 }
 
-pub fn freeRanges(allocator: std.mem.Allocator, ranges: []ByteRange) void {
-    allocator.free(ranges);
-}
-
 fn lessThan(_: void, lhs: ByteRange, rhs: ByteRange) bool {
     if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
     return lhs.length < rhs.length;
@@ -59,7 +62,7 @@ test "normalize ranges merges overlaps and adjacency" {
     };
 
     const normalized = try normalizeRanges(allocator, &input);
-    defer freeRanges(allocator, normalized);
+    defer allocator.free(normalized);
 
     try std.testing.expectEqual(@as(usize, 1), normalized.len);
     try std.testing.expectEqualDeep(ByteRange{ .offset = 0, .length = 11000 }, normalized[0]);

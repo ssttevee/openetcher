@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const std = @import("std");
 
 const openetcher = @import("openetcher");
@@ -81,7 +80,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "flash")) {
-        if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
         if (args.len != 4) {
             try writeUsage(stderr);
             try stderr.flush();

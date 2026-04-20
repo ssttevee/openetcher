@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const types = @import("../types.zig");
+const root = @import("../../root.zig");
 
-pub const ByteRange = types.ByteRange;
-pub const PartitionInfo = types.ImageInfo.PartitionInfo;
+pub const ByteRange = root.ByteRange;
+pub const PartitionInfo = root.ImageInfo.PartitionInfo;
 
 const squashfs_magic = 0x73717368;
 const superblock_size = 96;

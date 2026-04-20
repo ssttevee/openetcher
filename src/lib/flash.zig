@@ -1,46 +1,93 @@
-const builtin = @import("builtin");
 const std = @import("std");
 
-const ext4 = @import("fs/ext4.zig");
-const image = @import("image.zig");
-const range = @import("range.zig");
-const types = @import("types.zig");
+const device = @import("device.zig");
+const root = @import("../root.zig");
 
-pub const ByteRange = types.ByteRange;
-pub const FlashPlan = types.FlashPlan;
-pub const FlashOptions = types.FlashOptions;
-pub const FlashReport = types.FlashReport;
+pub const ByteRange = root.ByteRange;
 
-pub fn flashExt4Image(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, options: FlashOptions) !FlashReport {
-    return flashPlannedImage(allocator, io, image_path, destination_path, options);
-}
+pub const VerifyMode = enum {
+    none,
+    written,
+};
 
-pub fn flashPlannedImage(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, options: FlashOptions) !FlashReport {
-    const plan = try image.planImageFlash(allocator, io, image_path);
+pub const UnsupportedPolicy = enum {
+    fail,
+};
+
+pub const Options = struct {
+    block_size: usize = 1024 * 1024,
+    verify: VerifyMode = .written,
+    unsupported: UnsupportedPolicy = .fail,
+};
+
+pub const Report = struct {
+    image_size: u64,
+    bytes_read: u64,
+    bytes_written: u64,
+    bytes_skipped: u64,
+    range_count: usize,
+};
+
+pub const Plan = struct {
+    image_size: u64,
+    ranges: []ByteRange,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.ranges);
+    }
+};
+
+pub fn flashPlannedImage(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, options: Options) !Report {
+    const plan = try root.planImageFlash(allocator, io, image_path);
     defer plan.deinit(allocator);
     return flashToPath(io, image_path, destination_path, plan.image_size, plan.ranges, options);
 }
 
-pub fn flashToPath(io: std.Io, image_path: []const u8, destination_path: []const u8, image_size: u64, ranges: []const ByteRange, options: FlashOptions) !FlashReport {
+pub fn flashToPath(io: std.Io, image_path: []const u8, destination_path: []const u8, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
     var source = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
     defer source.close(io);
 
-    var destination = try std.Io.Dir.cwd().openFile(io, destination_path, .{ .mode = .read_write, .allow_directory = false });
-    defer destination.close(io);
+    var target = try device.openTarget(std.heap.page_allocator, io, destination_path);
+    defer target.close(std.heap.page_allocator, io);
 
-    return flashImageWithPath(&source, &destination, io, destination_path, image_size, ranges, options);
+    return flashImageWithTarget(&source, &target, io, image_size, ranges, options);
 }
 
-pub fn flashImage(source: *std.Io.File, destination: *std.Io.File, io: std.Io, image_size: u64, ranges: []const ByteRange, options: FlashOptions) !FlashReport {
-    return flashImageWithPath(source, destination, io, null, image_size, ranges, options);
+pub fn flashImage(source: *std.Io.File, destination: *std.Io.File, io: std.Io, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
+    const stat = try destination.stat(io);
+    const kind: device.TargetKind = switch (stat.kind) {
+        .block_device => .block_device,
+        .character_device => .character_device,
+        else => .regular_file,
+    };
+
+    var target = device.OpenTarget{
+        .file = destination.*,
+        .info = .{
+            .requested_path = "<open-file>",
+            .resolved_path = &.{},
+            .owns_resolved_path = false,
+            .capabilities = .{
+                .kind = kind,
+                .size = stat.size,
+                .read_alignment = if (kind == .regular_file) 1 else 512,
+                .write_alignment = if (kind == .regular_file) 1 else 512,
+                .optimal_io_size = stat.block_size,
+                .access_pattern = if (kind == .regular_file) .positional else .seek_and_stream,
+                .supports_verify_reads = true,
+            },
+        },
+    };
+    return flashImageWithTarget(source, &target, io, image_size, ranges, options);
 }
 
-fn flashImageWithPath(source: *std.Io.File, destination: *std.Io.File, io: std.Io, destination_path: ?[]const u8, image_size: u64, ranges: []const ByteRange, options: FlashOptions) !FlashReport {
+fn flashImageWithTarget(source: *std.Io.File, target: *device.OpenTarget, io: std.Io, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
     if (options.block_size == 0) return error.InvalidBlockSize;
 
-    const destination_device = isDeviceFile(destination, io);
-    const device_block_size: usize = if (destination_device) 512 else 1;
-    const dest_size = try destinationSize(destination, io, destination_path);
+    const destination = &target.file;
+    const destination_device = target.info.capabilities.kind != .regular_file;
+    const device_block_size: usize = target.info.capabilities.write_alignment;
+    const dest_size = target.info.capabilities.size;
     if (dest_size < image_size) return error.DestinationTooSmall;
 
     const buffer = try std.heap.page_allocator.alloc(u8, options.block_size);
@@ -78,26 +125,6 @@ fn flashImageWithPath(source: *std.Io.File, destination: *std.Io.File, io: std.I
         .bytes_skipped = image_size - bytes_written,
         .range_count = ranges.len,
     };
-}
-
-fn destinationSize(destination: *std.Io.File, io: std.Io, destination_path: ?[]const u8) !u64 {
-    const stat = destination.stat(io) catch null;
-    if (stat) |metadata| {
-        if (metadata.kind != .block_device and metadata.kind != .character_device) return metadata.size;
-    }
-
-    if (destination_path) |path| {
-        if (builtin.os.tag == .macos) {
-            if (try macosDiskSize(io, path)) |size| return size;
-        }
-    }
-
-    return destination.length(io);
-}
-
-fn isDeviceFile(file: *std.Io.File, io: std.Io) bool {
-    const stat = file.stat(io) catch return false;
-    return stat.kind == .block_device or stat.kind == .character_device;
 }
 
 fn seekDevice(fd: std.posix.fd_t, offset: u64) !void {
@@ -167,39 +194,8 @@ fn writeAlignedDeviceChunk(source: *std.Io.File, fd: std.posix.fd_t, io: std.Io,
     try writeDeviceAll(fd, aligned);
 }
 
-fn macosDiskSize(io: std.Io, path: []const u8) !?u64 {
-    if (!std.mem.startsWith(u8, path, "/dev/")) return null;
 
-    const result = try std.process.run(std.heap.page_allocator, io, .{
-        .argv = &.{ "diskutil", "info", path },
-        .stdout_limit = .limited(1024 * 64),
-        .stderr_limit = .limited(0),
-    });
-    defer std.heap.page_allocator.free(result.stdout);
-    defer std.heap.page_allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-
-    return parseDiskutilSize(result.stdout);
-}
-
-fn parseDiskutilSize(output: []const u8) ?u64 {
-    const marker = "Disk Size:";
-    const marker_index = std.mem.indexOf(u8, output, marker) orelse return null;
-    const tail = output[marker_index + marker.len ..];
-    const open_paren = std.mem.indexOfScalar(u8, tail, '(') orelse return null;
-    const after_open = tail[open_paren + 1 ..];
-    const close_paren = std.mem.indexOfScalar(u8, after_open, ')') orelse return null;
-    const paren_text = after_open[0..close_paren];
-    const space_index = std.mem.indexOfScalar(u8, paren_text, ' ') orelse return null;
-    const bytes_text = std.mem.trim(u8, paren_text[0..space_index], " ");
-    return std.fmt.parseInt(u64, bytes_text, 10) catch null;
-}
-
-fn maybeVerifyWrittenRanges(source: *std.Io.File, destination: *std.Io.File, io: std.Io, ranges: []const ByteRange, options: FlashOptions, buffer: []u8, destination_device: bool, device_block_size: usize) !void {
+fn maybeVerifyWrittenRanges(source: *std.Io.File, destination: *std.Io.File, io: std.Io, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize) !void {
     if (options.verify == .none) return;
 
     var verify_buffer = try std.heap.page_allocator.alloc(u8, buffer.len);
@@ -285,11 +281,4 @@ test "flashToPath rejects too-small destination" {
 
     const ranges = [_]ByteRange{.{ .offset = 0, .length = 4 }};
     try std.testing.expectError(error.DestinationTooSmall, flashImage(&source, &destination, io, 4, &ranges, .{}));
-}
-
-test "parseDiskutilSize reads byte count" {
-    const sample =
-        "   Disk Size:                 63.9 GB (63864569856 Bytes) (exactly 124735488 512-Byte-Units)\n";
-
-    try std.testing.expectEqual(@as(?u64, 63864569856), parseDiskutilSize(sample));
 }

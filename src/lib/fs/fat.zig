@@ -1,11 +1,10 @@
 const std = @import("std");
 
-const range = @import("../range.zig");
-const types = @import("../types.zig");
+const root = @import("../../root.zig");
 
-pub const ByteRange = types.ByteRange;
-pub const PartitionInfo = types.ImageInfo.PartitionInfo;
-pub const Filesystem = types.ImageInfo.Filesystem;
+pub const ByteRange = root.ByteRange;
+pub const PartitionInfo = root.ImageInfo.PartitionInfo;
+pub const Filesystem = root.ImageInfo.Filesystem;
 
 const sector_size: u64 = 512;
 
@@ -45,7 +44,7 @@ const BootSector = struct {
 pub fn probeFatPartition(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, start_offset: u64, size: u64) !PartitionInfo {
     const boot = try readBootSector(file, io, start_offset, size);
     const ranges = try collectFatRangesInRegion(allocator, file, io, start_offset, size);
-    defer range.freeRanges(allocator, ranges);
+    defer allocator.free(ranges);
 
     var used_bytes: u64 = 0;
     for (ranges) |segment| used_bytes += segment.length;
@@ -89,7 +88,7 @@ pub fn collectFatRangesInRegion(allocator: std.mem.Allocator, file: *std.Io.File
         });
     }
 
-    return range.normalizeRanges(allocator, ranges.items);
+    return root.normalizeRanges(allocator, ranges.items);
 }
 
 fn readBootSector(file: *std.Io.File, io: std.Io, start_offset: u64, size: u64) !BootSector {

@@ -1,11 +1,10 @@
 const std = @import("std");
 
-const range = @import("../range.zig");
-const types = @import("../types.zig");
+const root = @import("../../root.zig");
 
-pub const ByteRange = types.ByteRange;
-pub const ImageInfo = types.ImageInfo;
-pub const PartitionInfo = types.ImageInfo.PartitionInfo;
+pub const ByteRange = root.ByteRange;
+pub const ImageInfo = root.ImageInfo;
+pub const PartitionInfo = root.ImageInfo.PartitionInfo;
 
 const superblock_offset: u64 = 1024;
 const superblock_size: usize = 1024;
@@ -73,7 +72,7 @@ const GroupDescriptor = struct {
 
 pub fn probeExt4Image(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) !ImageInfo {
     const ranges = try collectExt4Ranges(allocator, io, image_path);
-    defer range.freeRanges(allocator, ranges);
+    defer allocator.free(ranges);
 
     var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
     defer file.close(io);
@@ -117,7 +116,7 @@ pub fn probeExt4Partition(allocator: std.mem.Allocator, file: *std.Io.File, io: 
     try validateSuperblock(superblock, size);
 
     const ranges = try collectExt4RangesFromFileRegion(allocator, file, io, start_offset, size, true);
-    defer range.freeRanges(allocator, ranges);
+    defer allocator.free(ranges);
 
     var used_bytes: u64 = 0;
     for (ranges) |segment| used_bytes += segment.length;
@@ -182,7 +181,7 @@ fn collectExt4RangesFromFileRegion(allocator: std.mem.Allocator, file: *std.Io.F
         }
     }
 
-    return range.normalizeRanges(allocator, used_blocks.items);
+    return root.normalizeRanges(allocator, used_blocks.items);
 }
 
 fn readSuperblock(file: *std.Io.File, io: std.Io, start_offset: u64) !Superblock {
