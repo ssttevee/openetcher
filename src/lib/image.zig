@@ -1,7 +1,10 @@
 const std = @import("std");
 
 const fs = @import("fs.zig");
+const layout = @import("image/layout.zig");
 const root = @import("../root.zig");
+
+const mbr = layout.mbr;
 
 pub const ByteRange = root.ByteRange;
 pub const FlashPlan = root.FlashPlan;
@@ -52,7 +55,7 @@ pub const Info = struct {
     }
 };
 
-const sector_size: usize = 512;
+const sector_size = mbr.sector_size;
 
 pub fn probeImage(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) !Info {
     var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
@@ -70,34 +73,25 @@ pub fn planImageFlash(allocator: std.mem.Allocator, io: std.Io, image_path: []co
     const count = try file.readPositionalAll(io, &mbr_sector, 0);
     if (count != mbr_sector.len) return error.InvalidImage;
 
-    if (!looksLikeMbr(&mbr_sector)) {
+    if (!mbr.looksLikeMbr(&mbr_sector)) {
         return .{
             .image_size = image_size,
             .ranges = try fs.ext4.collectExt4Ranges(allocator, io, image_path),
         };
     }
 
+    const partition_spans = try mbr.collectPartitionSpans(allocator, &mbr_sector, image_size);
+    defer allocator.free(partition_spans);
+
     var ranges: std.ArrayList(ByteRange) = .empty;
     defer ranges.deinit(allocator);
     var occupied: std.ArrayList(ByteRange) = .empty;
     defer occupied.deinit(allocator);
 
-    for (0..4) |entry_index| {
-        const entry_offset = 446 + (entry_index * 16);
-        const entry = mbr_sector[entry_offset .. entry_offset + 16];
-        const partition_type = entry[4];
-        const start_lba = readU32(entry[8..12]);
-        const size_lba = readU32(entry[12..16]);
+    for (partition_spans) |partition_span| {
+        try occupied.append(allocator, .{ .offset = partition_span.start_offset, .length = partition_span.size });
 
-        if (partition_type == 0 or size_lba == 0) continue;
-
-        const start_offset = @as(u64, start_lba) * sector_size;
-        const size = @as(u64, size_lba) * sector_size;
-        const end_offset = std.math.add(u64, start_offset, size) catch return error.InvalidPartitionTable;
-        if (start_offset >= image_size or end_offset > image_size) return error.InvalidPartitionTable;
-        try occupied.append(allocator, .{ .offset = start_offset, .length = size });
-
-        const partition = classifyPartition(allocator, io, &file, @intCast(entry_index + 1), partition_type, start_offset, size);
+        const partition = classifyPartition(allocator, io, &file, partition_span.index, partition_span.partition_type, partition_span.start_offset, partition_span.size);
         defer if (partition.reason) |reason| allocator.free(reason);
 
         if (!partition.supported) {
@@ -107,17 +101,17 @@ pub fn planImageFlash(allocator: std.mem.Allocator, io: std.Io, image_path: []co
 
         switch (partition.filesystem) {
             .ext4 => {
-                const ext4_ranges = try fs.ext4.collectExt4RangesInRegion(allocator, io, &file, start_offset, size);
+                const ext4_ranges = try fs.ext4.collectExt4RangesInRegion(allocator, io, &file, partition_span.start_offset, partition_span.size);
                 defer allocator.free(ext4_ranges);
                 try ranges.appendSlice(allocator, ext4_ranges);
             },
             .fat16, .fat32 => {
-                const fat_ranges = try fs.fat.collectFatRangesInRegion(allocator, io, &file, start_offset, size);
+                const fat_ranges = try fs.fat.collectFatRangesInRegion(allocator, io, &file, partition_span.start_offset, partition_span.size);
                 defer allocator.free(fat_ranges);
                 try ranges.appendSlice(allocator, fat_ranges);
             },
             .squashfs => {
-                const squashfs_ranges = try fs.squashfs.collectSquashfsRangesInRegion(allocator, io, &file, start_offset, size);
+                const squashfs_ranges = try fs.squashfs.collectSquashfsRangesInRegion(allocator, io, &file, partition_span.start_offset, partition_span.size);
                 defer allocator.free(squashfs_ranges);
                 try ranges.appendSlice(allocator, squashfs_ranges);
             },
@@ -142,28 +136,18 @@ fn probeImageFromFile(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.Fi
     const count = try file.readPositionalAll(io, &mbr_sector, 0);
     if (count != mbr_sector.len) return error.InvalidImage;
 
-    if (!looksLikeMbr(&mbr_sector)) {
+    if (!mbr.looksLikeMbr(&mbr_sector)) {
         return fs.ext4.probeExt4Image(allocator, io, image_path);
     }
+
+    const partition_spans = try mbr.collectPartitionSpans(allocator, &mbr_sector, image_size);
+    defer allocator.free(partition_spans);
 
     var partitions: std.ArrayList(Info.PartitionInfo) = .empty;
     defer partitions.deinit(allocator);
 
-    for (0..4) |entry_index| {
-        const entry_offset = 446 + (entry_index * 16);
-        const entry = mbr_sector[entry_offset .. entry_offset + 16];
-        const partition_type = entry[4];
-        const start_lba = readU32(entry[8..12]);
-        const size_lba = readU32(entry[12..16]);
-
-        if (partition_type == 0 or size_lba == 0) continue;
-
-        const start_offset = @as(u64, start_lba) * sector_size;
-        const size = @as(u64, size_lba) * sector_size;
-        const end_offset = std.math.add(u64, start_offset, size) catch return error.InvalidPartitionTable;
-        if (start_offset >= image_size or end_offset > image_size) return error.InvalidPartitionTable;
-
-        const partition = classifyPartition(allocator, io, file, @intCast(entry_index + 1), partition_type, start_offset, size);
+    for (partition_spans) |partition_span| {
+        const partition = classifyPartition(allocator, io, file, partition_span.index, partition_span.partition_type, partition_span.start_offset, partition_span.size);
         try partitions.append(allocator, partition);
     }
 
@@ -279,21 +263,6 @@ fn isAllZero(bytes: []const u8) bool {
     return true;
 }
 
-fn looksLikeMbr(sector: *const [sector_size]u8) bool {
-    if (readU16(sector[510..512]) != 0xAA55) return false;
-
-    for (0..4) |entry_index| {
-        const entry_offset = 446 + (entry_index * 16);
-        const entry = sector[entry_offset .. entry_offset + 16];
-        const partition_type = entry[4];
-        const start_lba = readU32(entry[8..12]);
-        const size_lba = readU32(entry[12..16]);
-        if (partition_type != 0 and size_lba != 0 and start_lba != 0) return true;
-    }
-
-    return false;
-}
-
 fn readU16(bytes: []const u8) u16 {
     return std.mem.readInt(u16, bytes[0..2], .little);
 }
@@ -301,6 +270,7 @@ fn readU16(bytes: []const u8) u16 {
 fn readU32(bytes: []const u8) u32 {
     return std.mem.readInt(u32, bytes[0..4], .little);
 }
+
 
 test "probeImage detects mbr partitions" {
     const io = std.testing.io;
