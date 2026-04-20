@@ -50,10 +50,10 @@ pub fn flashToPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const
     var target = try device.openTarget(allocator, io, destination_path);
     defer target.close(allocator, io);
 
-    return flashImageWithTarget(allocator, io, &source, &target, image_size, ranges, options);
+    return flashImageWithTarget(allocator, io, source, &target, image_size, ranges, options);
 }
 
-pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: *std.Io.File, destination: *std.Io.File, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
+pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
     const stat = try destination.stat(io);
     const kind: device.TargetKind = switch (stat.kind) {
         .block_device => .block_device,
@@ -62,7 +62,7 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: *std.Io.File
     };
 
     var target = device.OpenTarget{
-        .file = destination.*,
+        .file = destination,
         .info = .{
             .requested_path = "<open-file>",
             .resolved_path = &.{},
@@ -81,7 +81,7 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: *std.Io.File
     return flashImageWithTarget(allocator, io, source, &target, image_size, ranges, options);
 }
 
-fn flashImageWithTarget(allocator: std.mem.Allocator, io: std.Io, source: *std.Io.File, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
+fn flashImageWithTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
     if (options.block_size == 0) return error.InvalidBlockSize;
 
     const destination = &target.file;
@@ -116,7 +116,7 @@ fn flashImageWithTarget(allocator: std.mem.Allocator, io: std.Io, source: *std.I
     }
 
     try destination.sync(io);
-    try maybeVerifyWrittenRanges(allocator, io, source, destination, ranges, options, buffer, destination_device, device_block_size);
+    try maybeVerifyWrittenRanges(allocator, io, source, destination.*, ranges, options, buffer, destination_device, device_block_size);
 
     return .{
         .image_size = image_size,
@@ -172,7 +172,7 @@ fn readDeviceAll(fd: std.posix.fd_t, buffer: []u8) !usize {
     return index;
 }
 
-fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: *std.Io.File, fd: std.posix.fd_t, chunk: []const u8, offset: u64, block_size: usize) !void {
+fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, fd: std.posix.fd_t, chunk: []const u8, offset: u64, block_size: usize) !void {
     if (chunk.len % block_size == 0) {
         return writeDeviceAll(fd, chunk);
     }
@@ -195,7 +195,7 @@ fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: *st
 }
 
 
-fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: *std.Io.File, destination: *std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize) !void {
+fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize) !void {
     if (options.verify == .none) return;
 
     var verify_buffer = try allocator.alloc(u8, buffer.len);
@@ -254,7 +254,7 @@ test "flashImage copies only declared ranges" {
         .{ .offset = 4, .length = 2 },
     };
 
-    const report = try flashImage(std.testing.allocator, io, &source, &destination, source_bytes.len, &ranges, .{ .block_size = 2, .verify = .written });
+    const report = try flashImage(std.testing.allocator, io, source, destination, source_bytes.len, &ranges, .{ .block_size = 2, .verify = .written });
     try std.testing.expectEqual(@as(u64, 4), report.bytes_written);
     try std.testing.expectEqual(@as(u64, 4), report.bytes_skipped);
 
@@ -280,5 +280,5 @@ test "flashToPath rejects too-small destination" {
     try destination.sync(io);
 
     const ranges = [_]ByteRange{.{ .offset = 0, .length = 4 }};
-    try std.testing.expectError(error.DestinationTooSmall, flashImage(std.testing.allocator, io, &source, &destination, 4, &ranges, .{}));
+    try std.testing.expectError(error.DestinationTooSmall, flashImage(std.testing.allocator, io, source, destination, 4, &ranges, .{}));
 }

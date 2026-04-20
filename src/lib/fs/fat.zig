@@ -41,7 +41,7 @@ const BootSector = struct {
     }
 };
 
-pub fn probeFatPartition(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
+pub fn probeFatPartition(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
     const boot = try readBootSector(io, file, start_offset, size);
     const ranges = try collectFatRangesInRegion(allocator, io, file, start_offset, size);
     defer allocator.free(ranges);
@@ -63,7 +63,7 @@ pub fn probeFatPartition(allocator: std.mem.Allocator, io: std.Io, file: *std.Io
     };
 }
 
-pub fn collectFatRangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: *std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
+pub fn collectFatRangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
     const boot = try readBootSector(io, file, start_offset, size);
 
     var ranges: std.ArrayList(ByteRange) = .empty;
@@ -91,7 +91,7 @@ pub fn collectFatRangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: 
     return root.normalizeRanges(allocator, ranges.items);
 }
 
-fn readBootSector(io: std.Io, file: *std.Io.File, start_offset: u64, size: u64) !BootSector {
+fn readBootSector(io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !BootSector {
     var sector: [sector_size]u8 = undefined;
     const count = try file.readPositionalAll(io, &sector, start_offset);
     if (count != sector.len) return error.InvalidFatBootSector;
@@ -189,6 +189,6 @@ test "readBootSector detects fat16" {
     try file.writeStreamingAll(io, &bytes);
     try file.sync(io);
 
-    const boot = try readBootSector(io, &file, 0, bytes.len);
+    const boot = try readBootSector(io, file, 0, bytes.len);
     try std.testing.expectEqual(Filesystem.fat16, boot.filesystem);
 }
