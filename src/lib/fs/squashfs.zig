@@ -30,7 +30,7 @@ pub fn probeSquashfsPartition(io: std.Io, file: std.Io.File, start_offset: u64, 
     };
 }
 
-pub fn collectSquashfsRangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
+pub fn collectSquashfsRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
     const superblock = try readSuperblock(io, file, start_offset, size);
     const ranges = try allocator.alloc(ByteRange, 1);
     ranges[0] = .{

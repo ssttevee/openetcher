@@ -38,19 +38,19 @@ pub const Plan = struct {
 };
 
 pub fn flashPlannedImage(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, options: Options) !Report {
-    const plan = try root.planImageFlash(allocator, io, image_path);
+    const plan = try root.planImageFlashFromPath(allocator, io, image_path);
     defer plan.deinit(allocator);
-    return flashToPath(allocator, io, image_path, destination_path, plan.image_size, plan.ranges, options);
+    return flashToPathFromPath(allocator, io, image_path, destination_path, plan.image_size, plan.ranges, options);
 }
 
-pub fn flashToPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
+pub fn flashToPathFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
     var source = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
     defer source.close(io);
 
     var target = try device.openTarget(allocator, io, destination_path);
     defer target.close(allocator, io);
 
-    return flashImageWithTarget(allocator, io, source, &target, image_size, ranges, options);
+    return flashToTarget(allocator, io, source, &target, image_size, ranges, options);
 }
 
 pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
@@ -78,10 +78,10 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File,
             },
         },
     };
-    return flashImageWithTarget(allocator, io, source, &target, image_size, ranges, options);
+    return flashToTarget(allocator, io, source, &target, image_size, ranges, options);
 }
 
-fn flashImageWithTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
+fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
     if (options.block_size == 0) return error.InvalidBlockSize;
 
     const destination = &target.file;

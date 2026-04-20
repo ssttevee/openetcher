@@ -12,7 +12,9 @@ pub const normalizeRanges = range.normalizeRanges;
 
 pub const ImageInfo = image.Info;
 pub const probeImage = image.probeImage;
+pub const probeImageFromPath = image.probeImageFromPath;
 pub const planImageFlash = image.planImageFlash;
+pub const planImageFlashFromPath = image.planImageFlashFromPath;
 
 pub const UnsupportedPolicy = flash.UnsupportedPolicy;
 pub const VerifyMode = flash.VerifyMode;
@@ -21,7 +23,7 @@ pub const FlashReport = flash.Report;
 pub const FlashPlan = flash.Plan;
 pub const flashPlannedImage = flash.flashPlannedImage;
 pub const flashImage = flash.flashImage;
-pub const flashToPath = flash.flashToPath;
+pub const flashToPathFromPath = flash.flashToPathFromPath;
 
 test {
     _ = @import("lib/range.zig");

@@ -41,9 +41,9 @@ const BootSector = struct {
     }
 };
 
-pub fn probeFatPartition(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
+pub fn probeFatPartition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
     const boot = try readBootSector(io, file, start_offset, size);
-    const ranges = try collectFatRangesInRegion(allocator, io, file, start_offset, size);
+    const ranges = try collectFatRangesInRegion(io, allocator, file, start_offset, size);
     defer allocator.free(ranges);
 
     var used_bytes: u64 = 0;
@@ -63,7 +63,7 @@ pub fn probeFatPartition(allocator: std.mem.Allocator, io: std.Io, file: std.Io.
     };
 }
 
-pub fn collectFatRangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
+pub fn collectFatRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
     const boot = try readBootSector(io, file, start_offset, size);
 
     var ranges: std.ArrayList(ByteRange) = .empty;

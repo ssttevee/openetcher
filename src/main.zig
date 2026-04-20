@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const image_path = args[args.len - 1];
-        var info = openetcher.probeImage(arena, io, image_path) catch |err| {
+        var info = openetcher.probeImageFromPath(arena, io, image_path) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const image_path = args[args.len - 1];
-        const plan = openetcher.planImageFlash(arena, io, image_path) catch |err| {
+        const plan = openetcher.planImageFlashFromPath(arena, io, image_path) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);

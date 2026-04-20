@@ -70,12 +70,9 @@ const GroupDescriptor = struct {
     flags: u16,
 };
 
-pub fn probeExt4Image(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) !ImageInfo {
-    const ranges = try collectExt4Ranges(allocator, io, image_path);
+pub fn probeExt4Image(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !ImageInfo {
+    const ranges = try collectExt4Ranges(io, allocator, file);
     defer allocator.free(ranges);
-
-    var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
-    defer file.close(io);
 
     const image_size = try file.length(io);
     const superblock = try readSuperblock(io, file, 0);
@@ -95,27 +92,39 @@ pub fn probeExt4Image(allocator: std.mem.Allocator, io: std.Io, image_path: []co
     };
 }
 
-pub fn collectExt4Ranges(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) ![]ByteRange {
+pub fn probeExt4ImageFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) !ImageInfo {
     var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
     defer file.close(io);
-    return collectExt4RangesFromFile(allocator, io, file);
+
+    return probeExt4Image(io, allocator, file);
 }
 
-pub fn collectExt4RangesInRegion(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
-    return collectExt4RangesFromFileRegion(allocator, io, file, start_offset, size, true);
+pub fn collectExt4Ranges(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ![]ByteRange {
+    return collectExt4RangesFromFile(io, allocator, file);
 }
 
-fn collectExt4RangesFromFile(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) ![]ByteRange {
+pub fn collectExt4RangesFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) ![]ByteRange {
+    var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
+    defer file.close(io);
+
+    return collectExt4Ranges(io, allocator, file);
+}
+
+pub fn collectExt4RangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
+    return collectExt4RangesFromFileRegion(io, allocator, file, start_offset, size, true);
+}
+
+fn collectExt4RangesFromFile(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ![]ByteRange {
     const image_size = try file.length(io);
     try rejectUnsupportedImageLayout(io, file, image_size);
-    return collectExt4RangesFromFileRegion(allocator, io, file, 0, image_size, false);
+    return collectExt4RangesFromFileRegion(io, allocator, file, 0, image_size, false);
 }
 
-pub fn probeExt4Partition(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
+pub fn probeExt4Partition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
     const superblock = try readSuperblock(io, file, start_offset);
     try validateSuperblock(superblock, size);
 
-    const ranges = try collectExt4RangesFromFileRegion(allocator, io, file, start_offset, size, true);
+    const ranges = try collectExt4RangesFromFileRegion(io, allocator, file, start_offset, size, true);
     defer allocator.free(ranges);
 
     var used_bytes: u64 = 0;
@@ -135,7 +144,7 @@ pub fn probeExt4Partition(allocator: std.mem.Allocator, io: std.Io, file: std.Io
     };
 }
 
-fn collectExt4RangesFromFileRegion(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, start_offset: u64, size: u64, offset_ranges: bool) ![]ByteRange {
+fn collectExt4RangesFromFileRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64, offset_ranges: bool) ![]ByteRange {
     const superblock = try readSuperblock(io, file, start_offset);
     try validateSuperblock(superblock, size);
 
@@ -151,7 +160,7 @@ fn collectExt4RangesFromFileRegion(allocator: std.mem.Allocator, io: std.Io, fil
 
     const descriptors = try allocator.alloc(GroupDescriptor, groups_count);
     defer allocator.free(descriptors);
-    try readGroupDescriptors(allocator, io, file, superblock, descriptors, descriptor_table_block, desc_size, block_size, start_offset);
+    try readGroupDescriptors(io, allocator, file, superblock, descriptors, descriptor_table_block, desc_size, block_size, start_offset);
 
     const bitmap_buffer = try allocator.alloc(u8, block_size);
     defer allocator.free(bitmap_buffer);
@@ -275,7 +284,7 @@ fn inodeSize(superblock: Superblock) u16 {
     return if (superblock.inode_size >= 128) superblock.inode_size else 128;
 }
 
-fn readGroupDescriptors(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File, superblock: Superblock, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32, start_offset: u64) !void {
+fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, superblock: Superblock, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32, start_offset: u64) !void {
     var descriptor_buffer = try allocator.alloc(u8, @intCast(desc_size));
     defer allocator.free(descriptor_buffer);
 
@@ -381,7 +390,7 @@ test "probeExt4Image rejects invalid magic" {
     try file.writeStreamingAll(io, &bytes);
     try file.sync(io);
 
-    try std.testing.expectError(error.InvalidExt4Superblock, collectExt4RangesFromFile(std.testing.allocator, io, file));
+    try std.testing.expectError(error.InvalidExt4Superblock, collectExt4RangesFromFile(io, std.testing.allocator, file));
 }
 
 test "collectExt4Ranges rejects mbr disk images" {
@@ -401,5 +410,5 @@ test "collectExt4Ranges rejects mbr disk images" {
     try file.writeStreamingAll(io, &bytes);
     try file.sync(io);
 
-    try std.testing.expectError(error.UnsupportedImageLayout, collectExt4RangesFromFile(std.testing.allocator, io, file));
+    try std.testing.expectError(error.UnsupportedImageLayout, collectExt4RangesFromFile(io, std.testing.allocator, file));
 }
