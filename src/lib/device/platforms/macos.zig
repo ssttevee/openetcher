@@ -16,7 +16,7 @@ pub fn probeTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
     const resolved_path = try resolveDevicePath(allocator, path);
     errdefer allocator.free(resolved_path);
 
-    const size = (try macosDiskSize(io, resolved_path)) orelse return error.UnsupportedTargetType;
+    const size = (try macosDiskSize(allocator, io, resolved_path)) orelse return error.UnsupportedTargetType;
     const kind = if (stat.kind == .block_device) device.TargetKind.block_device else device.TargetKind.character_device;
 
     return .{
@@ -49,16 +49,16 @@ fn resolveDevicePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "/dev/r{s}", .{path[5..]});
 }
 
-fn macosDiskSize(io: std.Io, path: []const u8) !?u64 {
+fn macosDiskSize(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?u64 {
     if (!std.mem.startsWith(u8, path, "/dev/")) return null;
 
-    const result = try std.process.run(std.heap.page_allocator, io, .{
+    const result = try std.process.run(allocator, io, .{
         .argv = &.{ "diskutil", "info", path },
         .stdout_limit = .limited(1024 * 64),
         .stderr_limit = .limited(0),
     });
-    defer std.heap.page_allocator.free(result.stdout);
-    defer std.heap.page_allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
     switch (result.term) {
         .exited => |code| if (code != 0) return null,

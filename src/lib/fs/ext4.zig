@@ -151,7 +151,7 @@ fn collectExt4RangesFromFileRegion(allocator: std.mem.Allocator, file: *std.Io.F
 
     const descriptors = try allocator.alloc(GroupDescriptor, groups_count);
     defer allocator.free(descriptors);
-    try readGroupDescriptors(file, io, superblock, descriptors, descriptor_table_block, desc_size, block_size, start_offset);
+    try readGroupDescriptors(allocator, file, io, superblock, descriptors, descriptor_table_block, desc_size, block_size, start_offset);
 
     const bitmap_buffer = try allocator.alloc(u8, block_size);
     defer allocator.free(bitmap_buffer);
@@ -275,9 +275,9 @@ fn inodeSize(superblock: Superblock) u16 {
     return if (superblock.inode_size >= 128) superblock.inode_size else 128;
 }
 
-fn readGroupDescriptors(file: *std.Io.File, io: std.Io, superblock: Superblock, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32, start_offset: u64) !void {
-    var descriptor_buffer = try std.heap.page_allocator.alloc(u8, @intCast(desc_size));
-    defer std.heap.page_allocator.free(descriptor_buffer);
+fn readGroupDescriptors(allocator: std.mem.Allocator, file: *std.Io.File, io: std.Io, superblock: Superblock, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32, start_offset: u64) !void {
+    var descriptor_buffer = try allocator.alloc(u8, @intCast(desc_size));
+    defer allocator.free(descriptor_buffer);
 
     const table_offset = start_offset + (descriptor_table_block * block_size);
     for (descriptors, 0..) |*descriptor, index| {
