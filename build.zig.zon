@@ -1,0 +1,13 @@
+.{
+    .name = .openetcher,
+    .version = "0.0.0",
+    .fingerprint = 0xedfaf8588bd16018,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -1,0 +1,76 @@
+const std = @import("std");
+
+const types = @import("types.zig");
+
+pub const ByteRange = types.ByteRange;
+
+pub fn normalizeRanges(allocator: std.mem.Allocator, input: []const ByteRange) ![]ByteRange {
+    var list: std.ArrayList(ByteRange) = .empty;
+    defer list.deinit(allocator);
+
+    for (input) |item| {
+        if (item.length == 0) continue;
+        _ = std.math.add(u64, item.offset, item.length) catch return error.RangeOverflow;
+        try list.append(allocator, item);
+    }
+
+    std.mem.sort(ByteRange, list.items, {}, lessThan);
+
+    var merged: std.ArrayList(ByteRange) = .empty;
+    defer merged.deinit(allocator);
+
+    for (list.items) |item| {
+        if (merged.items.len == 0) {
+            try merged.append(allocator, item);
+            continue;
+        }
+
+        var previous = &merged.items[merged.items.len - 1];
+        if (item.offset <= previous.end()) {
+            const new_end = @max(previous.end(), item.end());
+            previous.length = new_end - previous.offset;
+            continue;
+        }
+
+        try merged.append(allocator, item);
+    }
+
+    return merged.toOwnedSlice(allocator);
+}
+
+pub fn freeRanges(allocator: std.mem.Allocator, ranges: []ByteRange) void {
+    allocator.free(ranges);
+}
+
+fn lessThan(_: void, lhs: ByteRange, rhs: ByteRange) bool {
+    if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
+    return lhs.length < rhs.length;
+}
+
+test "normalize ranges merges overlaps and adjacency" {
+    const allocator = std.testing.allocator;
+
+    const input = [_]ByteRange{
+        .{ .offset = 8192, .length = 1024 },
+        .{ .offset = 0, .length = 4096 },
+        .{ .offset = 4096, .length = 4096 },
+        .{ .offset = 9000, .length = 2000 },
+        .{ .offset = 0, .length = 0 },
+    };
+
+    const normalized = try normalizeRanges(allocator, &input);
+    defer freeRanges(allocator, normalized);
+
+    try std.testing.expectEqual(@as(usize, 1), normalized.len);
+    try std.testing.expectEqualDeep(ByteRange{ .offset = 0, .length = 11000 }, normalized[0]);
+}
+
+test "normalize ranges rejects overflow" {
+    const allocator = std.testing.allocator;
+
+    const input = [_]ByteRange{
+        .{ .offset = std.math.maxInt(u64), .length = 1 },
+    };
+
+    try std.testing.expectError(error.RangeOverflow, normalizeRanges(allocator, &input));
+}
