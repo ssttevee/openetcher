@@ -1,8 +1,9 @@
 const std = @import("std");
 
-const fs = @import("fs.zig");
-const layout = @import("image/layout.zig");
 const root = @import("../root.zig");
+
+pub const fs = @import("image/fs.zig");
+pub const layout = @import("image/layout.zig");
 
 const mbr = layout.mbr;
 

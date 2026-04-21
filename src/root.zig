@@ -1,9 +1,6 @@
 const std = @import("std");
 
 const flash = @import("lib/flash.zig");
-const ext4 = @import("lib/fs/ext4.zig");
-const fat = @import("lib/fs/fat.zig");
-const squashfs = @import("lib/fs/squashfs.zig");
 const image = @import("lib/image.zig");
 const range = @import("lib/range.zig");
 
@@ -28,9 +25,6 @@ pub const flashToPathFromPath = flash.flashToPathFromPath;
 test {
     _ = @import("lib/range.zig");
     _ = @import("lib/flash.zig");
-    _ = @import("lib/fs/ext4.zig");
-    _ = @import("lib/fs/fat.zig");
-    _ = @import("lib/fs/squashfs.zig");
     _ = @import("lib/device.zig");
     _ = @import("lib/image.zig");
 }

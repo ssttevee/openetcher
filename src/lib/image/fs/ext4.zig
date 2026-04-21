@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const root = @import("../../root.zig");
+const root = @import("../../../root.zig");
 
 pub const ByteRange = root.ByteRange;
 pub const ImageInfo = root.ImageInfo;
