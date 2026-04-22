@@ -86,6 +86,18 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
 
+        const target_info = openetcher.device_api.probeTarget(arena, io, args[3]) catch |err| {
+            try writeUserError(stderr, err);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        defer target_info.deinit(arena);
+
+        if (!std.mem.eql(u8, target_info.requested_path, target_info.resolved_path)) {
+            try stderr.print("normalized target: {s} -> {s}\n", .{ target_info.requested_path, target_info.resolved_path });
+            try stderr.flush();
+        }
+
         const report = openetcher.flashPlannedImage(arena, io, args[2], args[3], .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
