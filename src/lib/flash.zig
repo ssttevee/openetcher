@@ -10,6 +10,22 @@ pub const VerifyMode = enum {
     written,
 };
 
+pub const Phase = enum {
+    flash,
+    verify,
+};
+
+pub const Progress = struct {
+    phase: Phase,
+    completed_bytes: u64,
+    total_bytes: u64,
+};
+
+pub const ProgressHandler = struct {
+    context: *anyopaque,
+    callback: *const fn (context: *anyopaque, progress: Progress) anyerror!void,
+};
+
 pub const UnsupportedPolicy = enum {
     fail,
 };
@@ -18,6 +34,7 @@ pub const Options = struct {
     block_size: usize = 1024 * 1024,
     verify: VerifyMode = .written,
     unsupported: UnsupportedPolicy = .fail,
+    progress_handler: ?ProgressHandler = null,
 };
 
 pub const Report = struct {
@@ -94,6 +111,15 @@ fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, 
     const buffer = try allocator.alloc(u8, options.block_size);
     defer allocator.free(buffer);
 
+    const planned_bytes = countPlannedBytes(ranges);
+    if (planned_bytes > 0) {
+        try emitProgress(options, .{
+            .phase = .flash,
+            .completed_bytes = 0,
+            .total_bytes = planned_bytes,
+        });
+    }
+
     var bytes_written: u64 = 0;
     for (ranges) |segment| {
         var remaining = segment.length;
@@ -113,11 +139,16 @@ fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, 
             remaining -= chunk_len;
             offset += chunk_len;
             bytes_written += chunk_len;
+            try emitProgress(options, .{
+                .phase = .flash,
+                .completed_bytes = bytes_written,
+                .total_bytes = planned_bytes,
+            });
         }
     }
 
     try destination.sync(io);
-    try maybeVerifyWrittenRanges(allocator, io, source, destination.*, ranges, options, buffer, destination_device, device_block_size);
+    try maybeVerifyWrittenRanges(allocator, io, source, destination.*, ranges, options, buffer, destination_device, device_block_size, planned_bytes);
 
     return .{
         .image_size = image_size,
@@ -126,6 +157,17 @@ fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, 
         .bytes_skipped = image_size - bytes_written,
         .range_count = ranges.len,
     };
+}
+
+fn countPlannedBytes(ranges: []const ByteRange) u64 {
+    var total: u64 = 0;
+    for (ranges) |segment| total += segment.length;
+    return total;
+}
+
+fn emitProgress(options: Options, progress: Progress) !void {
+    const handler = options.progress_handler orelse return;
+    try handler.callback(handler.context, progress);
 }
 
 fn seekDevice(fd: std.posix.fd_t, offset: u64) !void {
@@ -196,11 +238,21 @@ fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: std
 }
 
 
-fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize) !void {
+fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize, total_verify_bytes: u64) !void {
     if (options.verify == .none) return;
 
     var verify_buffer = try allocator.alloc(u8, buffer.len);
     defer allocator.free(verify_buffer);
+
+    if (total_verify_bytes > 0) {
+        try emitProgress(options, .{
+            .phase = .verify,
+            .completed_bytes = 0,
+            .total_bytes = total_verify_bytes,
+        });
+    }
+
+    var bytes_verified: u64 = 0;
 
     for (ranges) |segment| {
         var remaining = segment.length;
@@ -228,6 +280,12 @@ fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: st
 
             offset += chunk_len;
             remaining -= chunk_len;
+            bytes_verified += chunk_len;
+            try emitProgress(options, .{
+                .phase = .verify,
+                .completed_bytes = bytes_verified,
+                .total_bytes = total_verify_bytes,
+            });
         }
     }
 }

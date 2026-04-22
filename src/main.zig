@@ -2,6 +2,56 @@ const std = @import("std");
 
 const openetcher = @import("openetcher");
 
+const ProgressState = struct {
+    writer: *std.Io.Writer,
+    last_phase: ?openetcher.FlashPhase = null,
+    last_line_len: usize = 0,
+
+    fn update(context: *anyopaque, progress: openetcher.FlashProgress) !void {
+        const self: *ProgressState = @ptrCast(@alignCast(context));
+        const label = switch (progress.phase) {
+            .flash => "flash",
+            .verify => "verify",
+        };
+        const percent = if (progress.total_bytes == 0)
+            100
+        else
+            @min(100, @as(u64, @intCast((progress.completed_bytes * 100) / progress.total_bytes)));
+
+        var line_buffer: [128]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buffer, "{s}: {}/{} bytes ({}%)", .{
+            label,
+            progress.completed_bytes,
+            progress.total_bytes,
+            percent,
+        });
+
+        if (self.last_phase != null and self.last_phase.? != progress.phase) {
+            try self.writer.writeByte('\n');
+            self.last_line_len = 0;
+        }
+
+        try self.writer.writeByte('\r');
+        try self.writer.writeAll(line);
+        if (line.len < self.last_line_len) {
+            var pad_len = self.last_line_len - line.len;
+            while (pad_len > 0) : (pad_len -= 1) try self.writer.writeByte(' ');
+            try self.writer.writeByte('\r');
+            try self.writer.writeAll(line);
+        }
+        try self.writer.flush();
+
+        self.last_phase = progress.phase;
+        self.last_line_len = line.len;
+    }
+
+    fn finish(self: *ProgressState) !void {
+        if (self.last_phase == null) return;
+        try self.writer.writeByte('\n');
+        try self.writer.flush();
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -98,12 +148,33 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
         }
 
-        const report = openetcher.flashPlannedImage(arena, io, args[2], args[3], .{}) catch |err| {
+        var progress = ProgressState{ .writer = stderr };
+        const start_time = std.Io.Clock.awake.now(io);
+        const report = openetcher.flashPlannedImage(arena, io, args[2], args[3], .{
+            .progress_handler = .{
+                .context = &progress,
+                .callback = ProgressState.update,
+            },
+        }) catch |err| {
+            try progress.finish();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
         };
+        try progress.finish();
+
+        const elapsed = start_time.durationTo(std.Io.Clock.awake.now(io));
+        const elapsed_ns: u64 = @intCast(@max(elapsed.nanoseconds, 1));
+        const actual_bytes_per_second = bytesPerSecond(report.bytes_written, elapsed_ns);
+        const effective_bytes_per_second = bytesPerSecond(report.image_size, elapsed_ns);
+
         try stdout.print("wrote {} bytes across {} ranges, skipped {} bytes\n", .{ report.bytes_written, report.range_count, report.bytes_skipped });
+        var actual_speed_buffer: [32]u8 = undefined;
+        var effective_speed_buffer: [32]u8 = undefined;
+        const actual_speed = try formatBytesPerSecond(&actual_speed_buffer, actual_bytes_per_second);
+        const effective_speed = try formatBytesPerSecond(&effective_speed_buffer, effective_bytes_per_second);
+        try stdout.print("actual throughput: {s}/s\n", .{actual_speed});
+        try stdout.print("effective throughput: {s}/s\n", .{effective_speed});
         try stdout.flush();
         return;
     }
@@ -284,4 +355,32 @@ fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {
             try writer.print("error: {t}\n", .{err});
         },
     }
+}
+
+fn bytesPerSecond(bytes: u64, elapsed_ns: u64) u64 {
+    return @intCast((@as(u128, bytes) * std.time.ns_per_s) / elapsed_ns);
+}
+
+fn formatBytesPerSecond(buffer: []u8, value: u64) ![]const u8 {
+    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB" };
+    var scaled = value;
+    var remainder: u64 = 0;
+    var unit_index: usize = 0;
+
+    while (scaled >= 1024 and unit_index + 1 < units.len) {
+        remainder = scaled % 1024;
+        scaled /= 1024;
+        unit_index += 1;
+    }
+
+    if (unit_index == 0 or remainder == 0) {
+        return std.fmt.bufPrint(buffer, "{} {s}", .{ scaled, units[unit_index] });
+    }
+
+    const decimal = (remainder * 10) / 1024;
+    if (decimal == 0) {
+        return std.fmt.bufPrint(buffer, "{} {s}", .{ scaled, units[unit_index] });
+    }
+
+    return std.fmt.bufPrint(buffer, "{}.{} {s}", .{ scaled, decimal, units[unit_index] });
 }
