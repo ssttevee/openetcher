@@ -44,6 +44,18 @@ pub fn openTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !d
     };
 }
 
+pub fn prepareTargetPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const info = try probeTarget(allocator, io, path);
+    defer info.deinit(allocator);
+    if (!info.capabilities.isDevice()) return;
+    try unmountDisk(allocator, io, info.resolved_path);
+}
+
+pub fn prepareTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget) !void {
+    if (!target.info.capabilities.isDevice()) return;
+    try unmountDisk(allocator, io, target.info.resolved_path);
+}
+
 fn resolveDevicePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.mem.startsWith(u8, path, "/dev/disk")) return allocator.dupe(u8, path);
     return std.fmt.allocPrint(allocator, "/dev/r{s}", .{path[5..]});
@@ -66,6 +78,34 @@ fn macosDiskSize(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?u
     }
 
     return parseDiskutilSize(result.stdout);
+}
+
+fn unmountDisk(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const whole_disk_path = canonicalDiskPath(allocator, path) catch return error.UnmountFailed;
+    defer allocator.free(whole_disk_path);
+
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "diskutil", "unmountDisk", whole_disk_path },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.UnmountFailed,
+        else => return error.UnmountFailed,
+    }
+}
+
+fn canonicalDiskPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, path, "/dev/rdisk")) {
+        return std.fmt.allocPrint(allocator, "/dev/disk{s}", .{path[10..]});
+    }
+    if (std.mem.startsWith(u8, path, "/dev/disk")) {
+        return allocator.dupe(u8, path);
+    }
+    return error.UnsupportedTargetType;
 }
 
 fn parseDiskutilSize(output: []const u8) ?u64 {

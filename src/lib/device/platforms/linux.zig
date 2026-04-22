@@ -10,3 +10,11 @@ pub fn probeTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
 pub fn openTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !device.OpenTarget {
     return regular_file.openTarget(allocator, io, path);
 }
+
+pub fn prepareTargetPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    return regular_file.prepareTargetPath(allocator, io, path);
+}
+
+pub fn prepareTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget) !void {
+    return regular_file.prepareTarget(allocator, io, target);
+}

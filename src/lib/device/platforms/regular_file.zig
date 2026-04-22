@@ -33,3 +33,7 @@ pub fn openTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !d
         .info = info,
     };
 }
+
+pub fn prepareTargetPath(_: std.mem.Allocator, _: std.Io, _: []const u8) !void {}
+
+pub fn prepareTarget(_: std.mem.Allocator, _: std.Io, _: *device.OpenTarget) !void {}

@@ -47,6 +47,7 @@ pub fn flashToPathFromPath(allocator: std.mem.Allocator, io: std.Io, image_path:
     var source = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
     defer source.close(io);
 
+    try device.prepareTargetPath(allocator, io, destination_path);
     var target = try device.openTarget(allocator, io, destination_path);
     defer target.close(allocator, io);
 

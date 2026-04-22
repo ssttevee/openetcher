@@ -56,3 +56,5 @@ const platform = switch (builtin.target.os.tag) {
 
 pub const probeTarget = platform.probeTarget;
 pub const openTarget = platform.openTarget;
+pub const prepareTargetPath = platform.prepareTargetPath;
+pub const prepareTarget = platform.prepareTarget;
