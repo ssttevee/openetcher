@@ -129,6 +129,29 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "disks")) {
+        const parsed = parseListArgs(args[2..]) catch {
+            try writeUsage(stderr);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+
+        const disks = openetcher.device_api.listCandidateDisks(arena, io, .{ .include_system = parsed.include_system }) catch |err| {
+            try writeUserError(stderr, err);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        defer disks.deinit(arena);
+
+        if (parsed.json) {
+            try writeCandidateDisksJson(stdout, disks.items);
+        } else {
+            try writeCandidateDisks(stdout, disks.items, parsed.include_system);
+        }
+        try stdout.flush();
+        return;
+    }
+
     if (std.mem.eql(u8, command, "flash")) {
         if (args.len != 4) {
             try writeUsage(stderr);
@@ -194,13 +217,36 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn writeUsage(writer: *std.Io.Writer) !void {
-    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher flash <image> <device>\n", .{});
+    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher disks [--json] [--all]\n  openetcher flash <image> <device>\n", .{});
 }
 
 fn parseJsonFlag(args: []const []const u8) !bool {
     if (args.len == 1) return false;
     if (args.len == 2 and std.mem.eql(u8, args[0], "--json")) return true;
     return error.InvalidArguments;
+}
+
+const ListArgs = struct {
+    json: bool = false,
+    include_system: bool = false,
+};
+
+fn parseListArgs(args: []const []const u8) !ListArgs {
+    var parsed: ListArgs = .{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (parsed.json) return error.InvalidArguments;
+            parsed.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--all")) {
+            if (parsed.include_system) return error.InvalidArguments;
+            parsed.include_system = true;
+            continue;
+        }
+        return error.InvalidArguments;
+    }
+    return parsed;
 }
 
 fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
@@ -350,6 +396,63 @@ fn writeFlashPlanJson(writer: *std.Io.Writer, plan: openetcher.FlashPlan) !void 
     }
 
     try writer.print("\n  ]\n}}\n", .{});
+}
+
+fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceCandidateDisk, include_system: bool) !void {
+    if (disks.len == 0) {
+        if (include_system) {
+            try writer.print("no disks found\n", .{});
+        } else {
+            try writer.print("no candidate disks found\n", .{});
+        }
+        return;
+    }
+
+    for (disks, 0..) |disk, index| {
+        try writer.print("{}: {s}\n", .{ index, disk.device_path });
+        try writer.print("   raw: {s}\n", .{disk.raw_path});
+        try writer.print("   description: {s}\n", .{disk.description});
+        try writer.print("   size: {}\n", .{disk.size});
+        try writer.print("   system: {}\n", .{disk.system});
+        try writer.print("   removable: {}\n", .{disk.removable});
+        if (disk.mount_points.len == 0) {
+            try writer.print("   mountpoints: none\n", .{});
+        } else {
+            try writer.print("   mountpoints:", .{});
+            for (disk.mount_points) |mount_point| {
+                try writer.print(" {s}", .{mount_point.path});
+            }
+            try writer.writeByte('\n');
+        }
+    }
+}
+
+fn writeCandidateDisksJson(writer: *std.Io.Writer, disks: []const openetcher.DeviceCandidateDisk) !void {
+    try writer.print("[", .{});
+    for (disks, 0..) |disk, index| {
+        if (index != 0) try writer.print(",", .{});
+        try writer.print("\n  {{\"device\": ", .{});
+        try std.json.Stringify.value(disk.device_path, .{}, writer);
+        try writer.print(", \"raw\": ", .{});
+        try std.json.Stringify.value(disk.raw_path, .{}, writer);
+        try writer.print(", \"display_name\": ", .{});
+        try std.json.Stringify.value(disk.display_name, .{}, writer);
+        try writer.print(", \"description\": ", .{});
+        try std.json.Stringify.value(disk.description, .{}, writer);
+        try writer.print(", \"size\": {}, \"system\": {}, \"removable\": {}, \"mountpoints\": [", .{
+            disk.size,
+            disk.system,
+            disk.removable,
+        });
+        for (disk.mount_points, 0..) |mount_point, mount_index| {
+            if (mount_index != 0) try writer.print(",", .{});
+            try writer.print("{{\"path\": ", .{});
+            try std.json.Stringify.value(mount_point.path, .{}, writer);
+            try writer.print("}}", .{});
+        }
+        try writer.print("]}}", .{});
+    }
+    try writer.print("\n]\n", .{});
 }
 
 fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {

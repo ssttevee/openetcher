@@ -25,6 +25,10 @@ pub const FlashPlan = flash.Plan;
 pub const flashPlannedImage = flash.flashPlannedImage;
 pub const flashImage = flash.flashImage;
 pub const flashToPathFromPath = flash.flashToPathFromPath;
+pub const DeviceMountPoint = device.MountPoint;
+pub const DeviceCandidateDisk = device.CandidateDisk;
+pub const DeviceCandidateDiskList = device.CandidateDiskList;
+pub const DeviceListOptions = device.ListOptions;
 pub const device_api = device;
 
 test {

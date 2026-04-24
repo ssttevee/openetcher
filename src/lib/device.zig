@@ -47,6 +47,43 @@ pub const OpenTarget = struct {
     }
 };
 
+pub const ListOptions = struct {
+    include_system: bool = false,
+};
+
+pub const MountPoint = struct {
+    path: []const u8,
+};
+
+pub const CandidateDisk = struct {
+    device_path: []const u8,
+    raw_path: []const u8,
+    display_name: []const u8,
+    description: []const u8,
+    size: u64,
+    system: bool,
+    removable: bool,
+    mount_points: []MountPoint,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.device_path);
+        allocator.free(self.raw_path);
+        allocator.free(self.display_name);
+        allocator.free(self.description);
+        for (self.mount_points) |mount_point| allocator.free(mount_point.path);
+        allocator.free(self.mount_points);
+    }
+};
+
+pub const CandidateDiskList = struct {
+    items: []CandidateDisk,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        for (self.items) |item| item.deinit(allocator);
+        allocator.free(self.items);
+    }
+};
+
 const platform = switch (builtin.target.os.tag) {
     .macos => @import("device/platforms/macos.zig"),
     .linux => @import("device/platforms/linux.zig"),
@@ -58,3 +95,4 @@ pub const probeTarget = platform.probeTarget;
 pub const openTarget = platform.openTarget;
 pub const prepareTargetPath = platform.prepareTargetPath;
 pub const prepareTarget = platform.prepareTarget;
+pub const listCandidateDisks = platform.listCandidateDisks;

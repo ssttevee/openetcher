@@ -37,3 +37,7 @@ pub fn openTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !d
 pub fn prepareTargetPath(_: std.mem.Allocator, _: std.Io, _: []const u8) !void {}
 
 pub fn prepareTarget(_: std.mem.Allocator, _: std.Io, _: *device.OpenTarget) !void {}
+
+pub fn listCandidateDisks(allocator: std.mem.Allocator, _: std.Io, _: device.ListOptions) !device.CandidateDiskList {
+    return .{ .items = try allocator.alloc(device.CandidateDisk, 0) };
+}

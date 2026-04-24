@@ -18,3 +18,7 @@ pub fn prepareTargetPath(allocator: std.mem.Allocator, io: std.Io, path: []const
 pub fn prepareTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget) !void {
     return regular_file.prepareTarget(allocator, io, target);
 }
+
+pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: device.ListOptions) !device.CandidateDiskList {
+    return regular_file.listCandidateDisks(allocator, io, options);
+}
