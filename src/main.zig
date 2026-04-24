@@ -148,9 +148,18 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
         }
 
+        try stderr.print("preparing target: {s}\n", .{target_info.resolved_path});
+        try stderr.flush();
+        openetcher.device_api.prepareTargetPath(arena, io, args[3]) catch |err| {
+            try writeUserError(stderr, err);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+
         var progress = ProgressState{ .writer = stderr };
         const start_time = std.Io.Clock.awake.now(io);
         const report = openetcher.flashPlannedImage(arena, io, args[2], args[3], .{
+            .prepare_target = false,
             .progress_handler = .{
                 .context = &progress,
                 .callback = ProgressState.update,
