@@ -153,13 +153,22 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "flash")) {
-        if (args.len != 4) {
+        const parsed = parseFlashArgs(args[2..]) catch {
             try writeUsage(stderr);
             try stderr.flush();
             std.process.exit(1);
-        }
+        };
 
-        const target_info = openetcher.device_api.probeTarget(arena, io, args[3]) catch |err| {
+        const target_path = switch (parsed.target) {
+            .path => |path| path,
+            .disk_id => |disk_id| openetcher.device_api.resolveDiskId(arena, io, disk_id, .{ .include_system = true }) catch |err| {
+                try writeUserError(stderr, err);
+                try stderr.flush();
+                std.process.exit(1);
+            },
+        };
+
+        const target_info = openetcher.device_api.probeTarget(arena, io, target_path) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -173,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
 
         try stderr.print("preparing target: {s}\n", .{target_info.resolved_path});
         try stderr.flush();
-        openetcher.device_api.prepareTargetPath(arena, io, args[3]) catch |err| {
+        openetcher.device_api.prepareTargetPath(arena, io, target_path) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -181,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
 
         var progress = ProgressState{ .writer = stderr };
         const start_time = std.Io.Clock.awake.now(io);
-        const report = openetcher.flashPlannedImage(arena, io, args[2], args[3], .{
+        const report = openetcher.flashPlannedImage(arena, io, parsed.image_path, target_path, .{
             .prepare_target = false,
             .progress_handler = .{
                 .context = &progress,
@@ -217,7 +226,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn writeUsage(writer: *std.Io.Writer) !void {
-    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher disks [--json] [--all]\n  openetcher flash <image> <device>\n", .{});
+    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher disks [--json] [--all]\n  openetcher flash <image> <device>\n  openetcher flash <image> --disk-id <id>\n", .{});
 }
 
 fn parseJsonFlag(args: []const []const u8) !bool {
@@ -229,6 +238,14 @@ fn parseJsonFlag(args: []const []const u8) !bool {
 const ListArgs = struct {
     json: bool = false,
     include_system: bool = false,
+};
+
+const FlashArgs = struct {
+    image_path: []const u8,
+    target: union(enum) {
+        path: []const u8,
+        disk_id: []const u8,
+    },
 };
 
 fn parseListArgs(args: []const []const u8) !ListArgs {
@@ -247,6 +264,24 @@ fn parseListArgs(args: []const []const u8) !ListArgs {
         return error.InvalidArguments;
     }
     return parsed;
+}
+
+fn parseFlashArgs(args: []const []const u8) !FlashArgs {
+    if (args.len == 2) {
+        return .{
+            .image_path = args[0],
+            .target = .{ .path = args[1] },
+        };
+    }
+
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--disk-id")) {
+        return .{
+            .image_path = args[0],
+            .target = .{ .disk_id = args[2] },
+        };
+    }
+
+    return error.InvalidArguments;
 }
 
 fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
@@ -410,6 +445,7 @@ fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceC
 
     for (disks, 0..) |disk, index| {
         try writer.print("{}: {s}\n", .{ index, disk.device_path });
+        try writer.print("   id: {s}\n", .{disk.id});
         try writer.print("   raw: {s}\n", .{disk.raw_path});
         try writer.print("   description: {s}\n", .{disk.description});
         try writer.print("   size: {}\n", .{disk.size});
@@ -431,7 +467,9 @@ fn writeCandidateDisksJson(writer: *std.Io.Writer, disks: []const openetcher.Dev
     try writer.print("[", .{});
     for (disks, 0..) |disk, index| {
         if (index != 0) try writer.print(",", .{});
-        try writer.print("\n  {{\"device\": ", .{});
+        try writer.print("\n  {{\"id\": ", .{});
+        try std.json.Stringify.value(disk.id, .{}, writer);
+        try writer.print(", \"device\": ", .{});
         try std.json.Stringify.value(disk.device_path, .{}, writer);
         try writer.print(", \"raw\": ", .{});
         try std.json.Stringify.value(disk.raw_path, .{}, writer);
@@ -462,6 +500,12 @@ fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {
         },
         error.UnsupportedPartitionFilesystem => {
             try writer.print("image contains unsupported partition filesystems; run `openetcher info <image>` for details\n", .{});
+        },
+        error.UnknownDiskId => {
+            try writer.print("unknown disk id: run `openetcher disks` to list candidate ids\n", .{});
+        },
+        error.AmbiguousDiskId => {
+            try writer.print("ambiguous disk id: run `openetcher disks --all --json` and choose a more specific target\n", .{});
         },
         else => {
             try writer.print("error: {t}\n", .{err});

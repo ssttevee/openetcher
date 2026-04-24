@@ -41,3 +41,7 @@ pub fn prepareTarget(_: std.mem.Allocator, _: std.Io, _: *device.OpenTarget) !vo
 pub fn listCandidateDisks(allocator: std.mem.Allocator, _: std.Io, _: device.ListOptions) !device.CandidateDiskList {
     return .{ .items = try allocator.alloc(device.CandidateDisk, 0) };
 }
+
+pub fn resolveDiskId(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.ResolveDiskIdOptions) ![]u8 {
+    return error.UnsupportedTargetType;
+}

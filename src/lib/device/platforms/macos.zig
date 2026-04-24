@@ -4,6 +4,7 @@ const regular_file = @import("regular_file.zig");
 const device = @import("../../device.zig");
 
 const ListDisk = struct {
+    id: []const u8,
     device_path: []const u8,
     raw_path: []const u8,
     description: []const u8,
@@ -13,6 +14,7 @@ const ListDisk = struct {
     mount_points: []device.MountPoint,
 
     fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
         allocator.free(self.device_path);
         allocator.free(self.raw_path);
         allocator.free(self.description);
@@ -114,6 +116,7 @@ pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: dev
         }
 
         try disks.append(allocator, .{
+            .id = disk.id,
             .device_path = disk.device_path,
             .raw_path = disk.raw_path,
             .display_name = try allocator.dupe(u8, disk.device_path),
@@ -126,6 +129,21 @@ pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: dev
     }
 
     return .{ .items = try disks.toOwnedSlice(allocator) };
+}
+
+pub fn resolveDiskId(allocator: std.mem.Allocator, io: std.Io, disk_id: []const u8, options: device.ResolveDiskIdOptions) ![]u8 {
+    const disks = try listCandidateDisks(allocator, io, .{ .include_system = options.include_system });
+    defer disks.deinit(allocator);
+
+    var match: ?[]const u8 = null;
+    for (disks.items) |disk| {
+        if (!std.mem.eql(u8, disk.id, disk_id)) continue;
+        if (match != null) return error.AmbiguousDiskId;
+        match = disk.device_path;
+    }
+
+    const resolved = match orelse return error.UnknownDiskId;
+    return allocator.dupe(u8, resolved);
 }
 
 fn resolveDevicePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -237,12 +255,18 @@ fn parseDiskInfo(allocator: std.mem.Allocator, fallback_device_path: []const u8,
     const location = fieldValue(output, "Device Location:") orelse "Unknown";
     const removable_media = fieldValue(output, "Removable Media:") orelse "Unknown";
     const os_installable = fieldValue(output, "OS Can Be Installed:") orelse "No";
+    const protocol = fieldValue(output, "Protocol:") orelse "Unknown";
+    const media_name = fieldValue(output, "Media Name:") orelse description;
+    const tree_path = fieldValue(output, "DeviceTreePath:") orelse fieldValue(output, "Device Tree Path:") orelse "unknown-path";
 
     var mount_points: std.ArrayList(device.MountPoint) = .empty;
     errdefer {
         for (mount_points.items) |mount_point| allocator.free(mount_point.path);
         mount_points.deinit(allocator);
     }
+
+    const disk_id = try makeDiskId(allocator, protocol, media_name, size, tree_path);
+    errdefer allocator.free(disk_id);
 
     if (fieldValue(output, "Mount Point:")) |mount_point| {
         if (!std.mem.eql(u8, mount_point, "Not applicable (no file system)") and mount_point.len != 0) {
@@ -251,6 +275,7 @@ fn parseDiskInfo(allocator: std.mem.Allocator, fallback_device_path: []const u8,
     }
 
     return .{
+        .id = disk_id,
         .device_path = device_path,
         .raw_path = raw_path,
         .description = description,
@@ -266,6 +291,22 @@ fn fieldValue(output: []const u8, label: []const u8) ?[]const u8 {
     const tail = output[marker_index + label.len ..];
     const newline_index = std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len;
     return std.mem.trim(u8, tail[0..newline_index], " \t\r");
+}
+
+fn makeDiskId(allocator: std.mem.Allocator, protocol: []const u8, media_name: []const u8, size: u64, tree_path: []const u8) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(protocol);
+    hasher.update("\n");
+    hasher.update(media_name);
+    hasher.update("\n");
+    hasher.update(tree_path);
+    hasher.update("\n");
+
+    var size_buffer: [20]u8 = undefined;
+    const size_text = try std.fmt.bufPrint(&size_buffer, "{}", .{size});
+    hasher.update(size_text);
+
+    return std.fmt.allocPrint(allocator, "macos-{x}", .{hasher.final()});
 }
 
 test "parseDiskutilSize reads byte count" {
@@ -297,6 +338,9 @@ test "parseDiskInfo marks internal disks as system" {
     const sample =
         "   Device Node:               /dev/disk0\n" ++
         "   Device / Media Name:       APPLE SSD AP1024R\n" ++
+        "   Media Name:                APPLE SSD AP1024R\n" ++
+        "   Protocol:                  Apple Fabric\n" ++
+        "   DeviceTreePath:            IODeviceTree:/internal/ssd0\n" ++
         "   OS Can Be Installed:       No\n" ++
         "   Disk Size:                 1.0 TB (1000555581440 Bytes) (exactly 1954210120 512-Byte-Units)\n" ++
         "   Device Location:           Internal\n" ++
@@ -308,6 +352,7 @@ test "parseDiskInfo marks internal disks as system" {
     try std.testing.expectEqualStrings("/dev/disk0", disk.device_path);
     try std.testing.expectEqualStrings("/dev/rdisk0", disk.raw_path);
     try std.testing.expectEqualStrings("APPLE SSD AP1024R", disk.description);
+    try std.testing.expect(std.mem.startsWith(u8, disk.id, "macos-"));
     try std.testing.expectEqual(@as(u64, 1000555581440), disk.size);
     try std.testing.expect(disk.system);
     try std.testing.expect(!disk.removable);
@@ -318,6 +363,9 @@ test "parseDiskInfo keeps external mounted disks" {
     const sample =
         "   Device Node:               /dev/disk4\n" ++
         "   Device / Media Name:       USB Flash Disk\n" ++
+        "   Media Name:                USB Flash Disk\n" ++
+        "   Protocol:                  USB\n" ++
+        "   DeviceTreePath:            IODeviceTree:/arm-io/usb/path-1\n" ++
         "   Mount Point:               /Volumes/UNTITLED\n" ++
         "   OS Can Be Installed:       No\n" ++
         "   Disk Size:                 31.9 GB (31914983424 Bytes) (exactly 62333952 512-Byte-Units)\n" ++
@@ -329,6 +377,7 @@ test "parseDiskInfo keeps external mounted disks" {
 
     try std.testing.expect(!disk.system);
     try std.testing.expect(disk.removable);
+    try std.testing.expect(std.mem.startsWith(u8, disk.id, "macos-"));
     try std.testing.expectEqual(@as(usize, 1), disk.mount_points.len);
     try std.testing.expectEqualStrings("/Volumes/UNTITLED", disk.mount_points[0].path);
 }

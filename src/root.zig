@@ -29,6 +29,7 @@ pub const DeviceMountPoint = device.MountPoint;
 pub const DeviceCandidateDisk = device.CandidateDisk;
 pub const DeviceCandidateDiskList = device.CandidateDiskList;
 pub const DeviceListOptions = device.ListOptions;
+pub const DeviceResolveDiskIdOptions = device.ResolveDiskIdOptions;
 pub const device_api = device;
 
 test {

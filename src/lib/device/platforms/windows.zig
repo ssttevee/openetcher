@@ -22,3 +22,7 @@ pub fn prepareTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.O
 pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: device.ListOptions) !device.CandidateDiskList {
     return regular_file.listCandidateDisks(allocator, io, options);
 }
+
+pub fn resolveDiskId(allocator: std.mem.Allocator, io: std.Io, disk_id: []const u8, options: device.ResolveDiskIdOptions) ![]u8 {
+    return regular_file.resolveDiskId(allocator, io, disk_id, options);
+}

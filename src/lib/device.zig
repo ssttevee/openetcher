@@ -56,6 +56,7 @@ pub const MountPoint = struct {
 };
 
 pub const CandidateDisk = struct {
+    id: []const u8,
     device_path: []const u8,
     raw_path: []const u8,
     display_name: []const u8,
@@ -66,6 +67,7 @@ pub const CandidateDisk = struct {
     mount_points: []MountPoint,
 
     pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
         allocator.free(self.device_path);
         allocator.free(self.raw_path);
         allocator.free(self.display_name);
@@ -84,6 +86,10 @@ pub const CandidateDiskList = struct {
     }
 };
 
+pub const ResolveDiskIdOptions = struct {
+    include_system: bool = true,
+};
+
 const platform = switch (builtin.target.os.tag) {
     .macos => @import("device/platforms/macos.zig"),
     .linux => @import("device/platforms/linux.zig"),
@@ -96,3 +102,4 @@ pub const openTarget = platform.openTarget;
 pub const prepareTargetPath = platform.prepareTargetPath;
 pub const prepareTarget = platform.prepareTarget;
 pub const listCandidateDisks = platform.listCandidateDisks;
+pub const resolveDiskId = platform.resolveDiskId;
