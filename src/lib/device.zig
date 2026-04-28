@@ -62,6 +62,7 @@ pub const CandidateDisk = struct {
     display_name: []const u8,
     description: []const u8,
     size: u64,
+    protected: bool,
     system: bool,
     removable: bool,
     mount_points: []MountPoint,
@@ -90,6 +91,10 @@ pub const ResolveDiskIdOptions = struct {
     include_system: bool = true,
 };
 
+pub const LookupDiskOptions = struct {
+    include_system: bool = true,
+};
+
 const platform = switch (builtin.target.os.tag) {
     .macos => @import("device/platforms/macos.zig"),
     .linux => @import("device/platforms/linux.zig"),
@@ -103,3 +108,4 @@ pub const prepareTargetPath = platform.prepareTargetPath;
 pub const prepareTarget = platform.prepareTarget;
 pub const listCandidateDisks = platform.listCandidateDisks;
 pub const resolveDiskId = platform.resolveDiskId;
+pub const lookupDiskByPath = platform.lookupDiskByPath;

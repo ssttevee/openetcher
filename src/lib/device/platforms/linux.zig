@@ -26,3 +26,7 @@ pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: dev
 pub fn resolveDiskId(allocator: std.mem.Allocator, io: std.Io, disk_id: []const u8, options: device.ResolveDiskIdOptions) ![]u8 {
     return regular_file.resolveDiskId(allocator, io, disk_id, options);
 }
+
+pub fn lookupDiskByPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: device.LookupDiskOptions) !?device.CandidateDisk {
+    return regular_file.lookupDiskByPath(allocator, io, path, options);
+}

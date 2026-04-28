@@ -168,6 +168,22 @@ pub fn main(init: std.process.Init) !void {
             },
         };
 
+        if (!parsed.force) {
+            const disk = openetcher.device_api.lookupDiskByPath(arena, io, target_path, .{ .include_system = true }) catch |err| {
+                try writeUserError(stderr, err);
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            if (disk) |candidate| {
+                defer candidate.deinit(arena);
+                if (candidate.protected) {
+                    try writeUserError(stderr, error.ProtectedTargetRequiresForce);
+                    try stderr.flush();
+                    std.process.exit(1);
+                }
+            }
+        }
+
         const target_info = openetcher.device_api.probeTarget(arena, io, target_path) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
@@ -226,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn writeUsage(writer: *std.Io.Writer) !void {
-    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher disks [--json] [--all]\n  openetcher flash <image> <device>\n  openetcher flash <image> --disk-id <id>\n", .{});
+    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher disks [--json] [--all]\n  openetcher flash [--force] <image> <device>\n  openetcher flash [--force] <image> --disk-id <id>\n", .{});
 }
 
 fn parseJsonFlag(args: []const []const u8) !bool {
@@ -242,6 +258,7 @@ const ListArgs = struct {
 
 const FlashArgs = struct {
     image_path: []const u8,
+    force: bool = false,
     target: union(enum) {
         path: []const u8,
         disk_id: []const u8,
@@ -267,17 +284,27 @@ fn parseListArgs(args: []const []const u8) !ListArgs {
 }
 
 fn parseFlashArgs(args: []const []const u8) !FlashArgs {
-    if (args.len == 2) {
+    var force = false;
+    var index: usize = 0;
+    if (args.len > 0 and std.mem.eql(u8, args[0], "--force")) {
+        force = true;
+        index = 1;
+    }
+
+    const rest = args[index..];
+    if (rest.len == 2) {
         return .{
-            .image_path = args[0],
-            .target = .{ .path = args[1] },
+            .image_path = rest[0],
+            .force = force,
+            .target = .{ .path = rest[1] },
         };
     }
 
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--disk-id")) {
+    if (rest.len == 3 and std.mem.eql(u8, rest[1], "--disk-id")) {
         return .{
-            .image_path = args[0],
-            .target = .{ .disk_id = args[2] },
+            .image_path = rest[0],
+            .force = force,
+            .target = .{ .disk_id = rest[2] },
         };
     }
 
@@ -449,6 +476,7 @@ fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceC
         try writer.print("   raw: {s}\n", .{disk.raw_path});
         try writer.print("   description: {s}\n", .{disk.description});
         try writer.print("   size: {}\n", .{disk.size});
+        try writer.print("   protected: {}\n", .{disk.protected});
         try writer.print("   system: {}\n", .{disk.system});
         try writer.print("   removable: {}\n", .{disk.removable});
         if (disk.mount_points.len == 0) {
@@ -477,8 +505,9 @@ fn writeCandidateDisksJson(writer: *std.Io.Writer, disks: []const openetcher.Dev
         try std.json.Stringify.value(disk.display_name, .{}, writer);
         try writer.print(", \"description\": ", .{});
         try std.json.Stringify.value(disk.description, .{}, writer);
-        try writer.print(", \"size\": {}, \"system\": {}, \"removable\": {}, \"mountpoints\": [", .{
+        try writer.print(", \"size\": {}, \"protected\": {}, \"system\": {}, \"removable\": {}, \"mountpoints\": [", .{
             disk.size,
+            disk.protected,
             disk.system,
             disk.removable,
         });
@@ -506,6 +535,9 @@ fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {
         },
         error.AmbiguousDiskId => {
             try writer.print("ambiguous disk id: run `openetcher disks --all --json` and choose a more specific target\n", .{});
+        },
+        error.ProtectedTargetRequiresForce => {
+            try writer.print("refusing to write a protected system disk without --force\n", .{});
         },
         else => {
             try writer.print("error: {t}\n", .{err});

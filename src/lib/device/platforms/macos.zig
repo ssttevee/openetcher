@@ -9,6 +9,7 @@ const ListDisk = struct {
     raw_path: []const u8,
     description: []const u8,
     size: u64,
+    protected: bool,
     system: bool,
     removable: bool,
     mount_points: []device.MountPoint,
@@ -122,6 +123,7 @@ pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: dev
             .display_name = try allocator.dupe(u8, disk.device_path),
             .description = disk.description,
             .size = disk.size,
+            .protected = disk.protected,
             .system = disk.system,
             .removable = disk.removable,
             .mount_points = disk.mount_points,
@@ -144,6 +146,39 @@ pub fn resolveDiskId(allocator: std.mem.Allocator, io: std.Io, disk_id: []const 
 
     const resolved = match orelse return error.UnknownDiskId;
     return allocator.dupe(u8, resolved);
+}
+
+pub fn lookupDiskByPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: device.LookupDiskOptions) !?device.CandidateDisk {
+    const disks = try listCandidateDisks(allocator, io, .{ .include_system = options.include_system });
+    defer disks.deinit(allocator);
+
+    const canonical_path = canonicalDiskPath(allocator, path) catch return null;
+    defer allocator.free(canonical_path);
+
+    const raw_path = if (std.mem.startsWith(u8, canonical_path, "/dev/disk"))
+        try std.fmt.allocPrint(allocator, "/dev/r{s}", .{canonical_path[5..]})
+    else
+        try allocator.dupe(u8, canonical_path);
+    defer allocator.free(raw_path);
+
+    for (disks.items) |disk| {
+        if (!std.mem.eql(u8, disk.device_path, canonical_path) and !std.mem.eql(u8, disk.raw_path, raw_path)) continue;
+
+        return .{
+            .id = try allocator.dupe(u8, disk.id),
+            .device_path = try allocator.dupe(u8, disk.device_path),
+            .raw_path = try allocator.dupe(u8, disk.raw_path),
+            .display_name = try allocator.dupe(u8, disk.display_name),
+            .description = try allocator.dupe(u8, disk.description),
+            .size = disk.size,
+            .protected = disk.protected,
+            .system = disk.system,
+            .removable = disk.removable,
+            .mount_points = try dupMountPoints(allocator, disk.mount_points),
+        };
+    }
+
+    return null;
 }
 
 fn resolveDevicePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -280,6 +315,7 @@ fn parseDiskInfo(allocator: std.mem.Allocator, fallback_device_path: []const u8,
         .raw_path = raw_path,
         .description = description,
         .size = size,
+        .protected = std.mem.eql(u8, location, "Internal") or std.mem.eql(u8, os_installable, "Yes"),
         .system = std.mem.eql(u8, location, "Internal") or std.mem.eql(u8, os_installable, "Yes"),
         .removable = std.mem.eql(u8, removable_media, "Removable"),
         .mount_points = try mount_points.toOwnedSlice(allocator),
@@ -307,6 +343,24 @@ fn makeDiskId(allocator: std.mem.Allocator, protocol: []const u8, media_name: []
     hasher.update(size_text);
 
     return std.fmt.allocPrint(allocator, "macos-{x}", .{hasher.final()});
+}
+
+fn dupMountPoints(allocator: std.mem.Allocator, mount_points: []const device.MountPoint) ![]device.MountPoint {
+    var duplicate = try allocator.alloc(device.MountPoint, mount_points.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (duplicate[0..initialized]) |mount_point| {
+            allocator.free(mount_point.path);
+        }
+        allocator.free(duplicate);
+    }
+
+    for (mount_points, 0..) |mount_point, index| {
+        duplicate[index] = .{ .path = try allocator.dupe(u8, mount_point.path) };
+        initialized += 1;
+    }
+
+    return duplicate;
 }
 
 test "parseDiskutilSize reads byte count" {

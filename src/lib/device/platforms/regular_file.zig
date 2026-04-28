@@ -45,3 +45,7 @@ pub fn listCandidateDisks(allocator: std.mem.Allocator, _: std.Io, _: device.Lis
 pub fn resolveDiskId(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.ResolveDiskIdOptions) ![]u8 {
     return error.UnsupportedTargetType;
 }
+
+pub fn lookupDiskByPath(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.LookupDiskOptions) !?device.CandidateDisk {
+    return null;
+}
