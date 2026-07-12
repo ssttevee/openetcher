@@ -22,6 +22,7 @@ pub const Info = struct {
 
     pub const Layout = enum {
         raw_ext4,
+        raw_iso9660,
         mbr,
     };
 
@@ -64,6 +65,10 @@ pub fn probeImage(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !
     const count = try file.readPositionalAll(io, &mbr_sector, 0);
     if (count != mbr_sector.len) return error.InvalidImage;
 
+    if (try fs.iso9660.looksLikeIso9660(io, file, image_size)) {
+        return fs.iso9660.probeIso9660Image(io, file);
+    }
+
     if (!mbr.looksLikeMbr(&mbr_sector)) {
         return fs.ext4.probeExt4Image(io, allocator, file);
     }
@@ -98,6 +103,13 @@ pub fn planImageFlash(io: std.Io, allocator: std.mem.Allocator, file: std.Io.Fil
     var mbr_sector: [sector_size]u8 = undefined;
     const count = try file.readPositionalAll(io, &mbr_sector, 0);
     if (count != mbr_sector.len) return error.InvalidImage;
+
+    if (try fs.iso9660.looksLikeIso9660(io, file, image_size)) {
+        return .{
+            .image_size = image_size,
+            .ranges = try fs.iso9660.collectIso9660Ranges(allocator, io, file),
+        };
+    }
 
     if (!mbr.looksLikeMbr(&mbr_sector)) {
         return .{
@@ -316,6 +328,36 @@ test "probeImage detects mbr partitions" {
     try std.testing.expectEqual(true, info.partitions[0].supported);
     try std.testing.expectEqual(@as(Info.Filesystem, .empty), info.partitions[1].filesystem);
     try std.testing.expectEqual(false, info.partitions[1].supported);
+}
+
+test "probeImage and planImageFlash support ISO9660 images" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(io, "image.iso", .{ .read = true });
+    defer file.close(io);
+
+    const image_size = 17 * 2048;
+    const bytes = try std.testing.allocator.alloc(u8, image_size);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    bytes[16 * 2048] = 1;
+    @memcpy(bytes[16 * 2048 + 1 ..][0..5], "CD001");
+    bytes[16 * 2048 + 6] = 1;
+    try file.writeStreamingAll(io, bytes);
+    try file.sync(io);
+
+    const info = try probeImage(io, std.testing.allocator, file);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Info.Layout.raw_iso9660, info.layout);
+    try std.testing.expectEqual(@as(?Info.Filesystem, .iso9660), info.filesystem);
+    try std.testing.expectEqual(@as(?u64, image_size), info.used_bytes);
+
+    const plan = try planImageFlash(io, std.testing.allocator, file);
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), plan.ranges.len);
+    try std.testing.expectEqualDeep(ByteRange{ .offset = 0, .length = image_size }, plan.ranges[0]);
 }
 
 test "planImageFlash rejects unsupported mbr partitions" {
