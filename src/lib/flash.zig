@@ -7,12 +7,26 @@ pub const ByteRange = root.ByteRange;
 
 pub const VerifyMode = enum {
     none,
+    digest,
+    reread_source,
     written,
 };
 
 pub const Phase = enum {
+    probe,
+    plan,
     flash,
     verify,
+};
+
+pub const Strategy = enum {
+    planned_sparse,
+    full_if_unsupported,
+    force_full_streaming,
+};
+
+pub const PrepareOptions = struct {
+    max_image_size: ?u64 = null,
 };
 
 pub const Progress = struct {
@@ -32,8 +46,11 @@ pub const UnsupportedPolicy = enum {
 
 pub const Options = struct {
     block_size: usize = 1024 * 1024,
-    verify: VerifyMode = .written,
+    verify: VerifyMode = .digest,
     unsupported: UnsupportedPolicy = .fail,
+    strategy: Strategy = .planned_sparse,
+    max_image_size: ?u64 = null,
+    observers: []root.Observer = &.{},
     progress_handler: ?ProgressHandler = null,
     prepare_target: bool = true,
 };
@@ -54,6 +71,250 @@ pub const Plan = struct {
         allocator.free(self.ranges);
     }
 };
+
+pub fn flashSource(allocator: std.mem.Allocator, io: std.Io, source: *root.ImageSource, destination_path: []const u8, options: Options) !Report {
+    switch (options.strategy) {
+        .planned_sparse => {
+            const plan = try root.planImageFlashSource(allocator, io, source, .{ .max_image_size = options.max_image_size });
+            defer plan.deinit(allocator);
+            return flashPlannedSource(allocator, io, source, destination_path, plan, options);
+        },
+        .full_if_unsupported => {
+            const plan = root.planImageFlashSource(allocator, io, source, .{ .max_image_size = options.max_image_size }) catch |err| switch (err) {
+                error.UnsupportedPartitionFilesystem, error.UnsupportedStreamingLayout => null,
+                else => return err,
+            };
+            if (plan) |planned| {
+                defer planned.deinit(allocator);
+                return flashPlannedSource(allocator, io, source, destination_path, planned, options);
+            }
+            return flashFullSource(allocator, io, source, destination_path, options);
+        },
+        .force_full_streaming => return flashFullSource(allocator, io, source, destination_path, options),
+    }
+}
+
+pub fn flashPlannedSource(allocator: std.mem.Allocator, io: std.Io, image_source: *root.ImageSource, destination_path: []const u8, plan: root.FlashPlan, options: Options) !Report {
+    try validatePlan(plan);
+    var stream = try image_source.openStream(io, allocator);
+    defer stream.deinit();
+    if (options.max_image_size) |limit| stream.max_image_size = limit;
+
+    var target = try openFlashTarget(allocator, io, destination_path, options);
+    defer target.close(allocator, io);
+    const result = try flashStream(allocator, io, &stream, &target, plan.image_size, plan.ranges, options);
+    if (options.verify == .reread_source or options.verify == .written) {
+        var verify_stream = try image_source.openStream(io, allocator);
+        defer verify_stream.deinit();
+        if (options.max_image_size) |limit| verify_stream.max_image_size = limit;
+        try verifySourceRanges(allocator, io, &verify_stream, &target, plan.image_size, plan.ranges, options);
+    }
+    return result.report;
+}
+
+const StreamFlashResult = struct {
+    report: Report,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+fn openFlashTarget(allocator: std.mem.Allocator, io: std.Io, destination_path: []const u8, options: Options) !device.OpenTarget {
+    if (options.prepare_target) try device.prepareTargetPath(allocator, io, destination_path);
+    return device.openTarget(allocator, io, destination_path);
+}
+
+fn flashFullSource(allocator: std.mem.Allocator, io: std.Io, image_source: *root.ImageSource, destination_path: []const u8, options: Options) !Report {
+    var stream = try image_source.openStream(io, allocator);
+    defer stream.deinit();
+    if (options.max_image_size) |limit| stream.max_image_size = limit;
+
+    var target = try openFlashTarget(allocator, io, destination_path, options);
+    defer target.close(allocator, io);
+    const result = try flashStream(allocator, io, &stream, &target, image_source.metadata.image_size, null, options);
+
+    if (options.verify == .reread_source or options.verify == .written) {
+        var verify_stream = try image_source.openStream(io, allocator);
+        defer verify_stream.deinit();
+        if (options.max_image_size) |limit| verify_stream.max_image_size = limit;
+        const verify_size = result.report.image_size;
+        const full_range = [_]ByteRange{.{ .offset = 0, .length = verify_size }};
+        try verifySourceRanges(allocator, io, &verify_stream, &target, verify_size, &full_range, options);
+    }
+    return result.report;
+}
+
+fn validatePlan(plan: root.FlashPlan) !void {
+    var previous_end: u64 = 0;
+    for (plan.ranges, 0..) |item, index| {
+        if (item.length == 0) return error.InvalidFlashPlan;
+        const end = std.math.add(u64, item.offset, item.length) catch return error.RangeOverflow;
+        if (end > plan.image_size) return error.RangeOutsideImage;
+        if (index != 0 and item.offset < previous_end) return error.InvalidFlashPlan;
+        previous_end = end;
+    }
+}
+
+fn countRanges(ranges: []const ByteRange) u64 {
+    var total: u64 = 0;
+    for (ranges) |item| total += item.length;
+    return total;
+}
+
+fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, target: *device.OpenTarget, expected_size: ?u64, ranges: ?[]const ByteRange, options: Options) !StreamFlashResult {
+    if (options.block_size == 0) return error.InvalidBlockSize;
+    if (expected_size) |size| {
+        if (target.info.capabilities.size < size) return error.DestinationTooSmall;
+    }
+    if (ranges) |items| {
+        const image_size = expected_size orelse return error.InvalidImageSize;
+        try validatePlan(.{ .image_size = image_size, .ranges = @constCast(items) });
+    }
+
+    const buffer = try allocator.alloc(u8, options.block_size);
+    defer allocator.free(buffer);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    const total = if (ranges) |items| countRanges(items) else expected_size orelse 0;
+    try emitProgress(options, .{ .phase = .flash, .completed_bytes = 0, .total_bytes = total });
+
+    var logical_size: u64 = 0;
+    var bytes_written: u64 = 0;
+    if (ranges) |items| {
+        for (items) |item| {
+            try stream.discardTo(item.offset);
+            var remaining = item.length;
+            var offset = item.offset;
+            while (remaining > 0) {
+                const chunk_len: usize = @intCast(@min(remaining, buffer.len));
+                const count = try stream.read(buffer[0..chunk_len]);
+                if (count == 0) return error.UnexpectedEndOfImage;
+                try writeTargetChunk(allocator, io, target, buffer[0..count], offset);
+                hasher.update(buffer[0..count]);
+                bytes_written += count;
+                offset += count;
+                logical_size = @max(logical_size, offset);
+                remaining -= count;
+                try emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+            }
+        }
+
+        if (expected_size) |size| {
+            if (stream.position < size) try stream.discardTo(size);
+            if (stream.position != size) return error.ImageSizeMismatch;
+            var tail: [1]u8 = undefined;
+            if (try stream.read(&tail) != 0) return error.ImageSizeMismatch;
+            logical_size = size;
+        }
+    } else {
+        while (true) {
+            const count = try stream.read(buffer);
+            if (count == 0) break;
+            const offset = logical_size;
+            const next = std.math.add(u64, logical_size, count) catch return error.DecompressedImageTooLarge;
+            if (target.info.capabilities.size < next) return error.DestinationTooSmall;
+            try writeTargetChunk(allocator, io, target, buffer[0..count], offset);
+            for (options.observers) |*observer| try root.deliverObserver(observer, offset, buffer[0..count]);
+            hasher.update(buffer[0..count]);
+            logical_size = next;
+            bytes_written += count;
+            try emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+        }
+        if (expected_size) |size| if (logical_size != size) return error.ImageSizeMismatch;
+        for (options.observers) |*observer| try observer.finish(logical_size);
+    }
+
+    try target.file.sync(io);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    if (options.verify == .digest) {
+        const verify_range = if (ranges) |items| items else &[_]ByteRange{.{ .offset = 0, .length = logical_size }};
+        try verifyDigestTarget(allocator, io, target, verify_range, digest, options);
+    }
+
+    return .{
+        .report = .{
+            .image_size = logical_size,
+            .bytes_read = if (ranges != null) logical_size else logical_size,
+            .bytes_written = bytes_written,
+            .bytes_skipped = logical_size - bytes_written,
+            .range_count = if (ranges) |items| items.len else if (logical_size == 0) 0 else 1,
+        },
+        .digest = digest,
+    };
+}
+
+fn writeTargetChunk(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
+    if (!target.info.capabilities.isDevice()) {
+        try target.file.writePositionalAll(io, bytes, offset);
+        return;
+    }
+
+    const alignment: usize = @intCast(target.info.capabilities.write_alignment);
+    if (alignment == 0) return error.InvalidBlockSize;
+    try seekDevice(target.file.handle, offset);
+    if (bytes.len % alignment == 0) return writeDeviceAll(target.file.handle, bytes);
+
+    const aligned_len = std.mem.alignForward(usize, bytes.len, alignment);
+    const aligned = try allocator.alloc(u8, aligned_len);
+    defer allocator.free(aligned);
+    @memcpy(aligned[0..bytes.len], bytes);
+    @memset(aligned[bytes.len..], 0);
+    try writeDeviceAll(target.file.handle, aligned);
+}
+
+fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, ranges: []const ByteRange, expected: [std.crypto.hash.sha2.Sha256.digest_length]u8, options: Options) !void {
+    var buffer = try allocator.alloc(u8, options.block_size);
+    defer allocator.free(buffer);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var completed: u64 = 0;
+    const total = countRanges(ranges);
+    try emitProgress(options, .{ .phase = .verify, .completed_bytes = 0, .total_bytes = total });
+    for (ranges) |item| {
+        var remaining = item.length;
+        var offset = item.offset;
+        while (remaining > 0) {
+            const count: usize = @intCast(@min(remaining, buffer.len));
+            const actual = if (target.info.capabilities.isDevice()) blk: {
+                try seekDevice(target.file.handle, offset);
+                const read_count = try readDeviceAll(target.file.handle, buffer[0..count]);
+                break :blk read_count;
+            } else try target.file.readPositionalAll(io, buffer[0..count], offset);
+            if (actual != count) return error.VerificationFailed;
+            hasher.update(buffer[0..count]);
+            offset += count;
+            remaining -= count;
+            completed += count;
+            try emitProgress(options, .{ .phase = .verify, .completed_bytes = completed, .total_bytes = total });
+        }
+    }
+    var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual_digest);
+    if (!std.mem.eql(u8, &expected, &actual_digest)) return error.VerificationFailed;
+}
+
+fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !void {
+    try validatePlan(.{ .image_size = image_size, .ranges = @constCast(ranges) });
+    const buffer = try allocator.alloc(u8, options.block_size);
+    defer allocator.free(buffer);
+    for (ranges) |item| {
+        try stream.discardTo(item.offset);
+        var remaining = item.length;
+        var offset = item.offset;
+        while (remaining > 0) {
+            const count: usize = @intCast(@min(remaining, buffer.len));
+            try stream.readExactly(buffer[0..count]);
+            const destination_buffer = try allocator.alloc(u8, count);
+            defer allocator.free(destination_buffer);
+            const actual = if (target.info.capabilities.isDevice()) blk: {
+                try seekDevice(target.file.handle, offset);
+                break :blk try readDeviceAll(target.file.handle, destination_buffer);
+            } else try target.file.readPositionalAll(io, destination_buffer, offset);
+            if (actual != count or !std.mem.eql(u8, buffer[0..count], destination_buffer)) return error.VerificationFailed;
+            offset += count;
+            remaining -= count;
+        }
+    }
+    if (stream.position < image_size) try stream.discardTo(image_size);
+    if (stream.position != image_size) return error.ImageSizeMismatch;
+}
 
 pub fn flashPlannedImage(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, options: Options) !Report {
     const plan = try root.planImageFlashFromPath(allocator, io, image_path);
@@ -124,6 +385,7 @@ fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, 
     }
 
     var bytes_written: u64 = 0;
+    var source_digest = std.crypto.hash.sha2.Sha256.init(.{});
     for (ranges) |segment| {
         var remaining = segment.length;
         var offset = segment.offset;
@@ -138,6 +400,7 @@ fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, 
             } else {
                 try destination.writePositionalAll(io, chunk, offset);
             }
+            source_digest.update(chunk);
 
             remaining -= chunk_len;
             offset += chunk_len;
@@ -151,7 +414,9 @@ fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, 
     }
 
     try destination.sync(io);
-    try maybeVerifyWrittenRanges(allocator, io, source, destination.*, ranges, options, buffer, destination_device, device_block_size, planned_bytes);
+    var source_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    source_digest.final(&source_digest_bytes);
+    try maybeVerifyWrittenRanges(allocator, io, source, destination.*, ranges, options, buffer, destination_device, device_block_size, planned_bytes, source_digest_bytes);
 
     return .{
         .image_size = image_size,
@@ -240,9 +505,41 @@ fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: std
     try writeDeviceAll(fd, aligned);
 }
 
-
-fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize, total_verify_bytes: u64) !void {
+fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize, total_verify_bytes: u64, expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8) !void {
     if (options.verify == .none) return;
+
+    if (options.verify == .digest) {
+        try emitProgress(options, .{ .phase = .verify, .completed_bytes = 0, .total_bytes = total_verify_bytes });
+        var destination_digest = std.crypto.hash.sha2.Sha256.init(.{});
+        var verified: u64 = 0;
+        for (ranges) |segment| {
+            var remaining = segment.length;
+            var offset = segment.offset;
+            while (remaining > 0) {
+                const chunk_len: usize = @intCast(@min(remaining, buffer.len));
+                const destination_count = if (destination_device) blk: {
+                    const aligned_len = std.mem.alignForward(usize, chunk_len, device_block_size);
+                    const aligned_verify = try allocator.alloc(u8, aligned_len);
+                    defer allocator.free(aligned_verify);
+                    try seekDevice(destination.handle, offset);
+                    const aligned_count = try readDeviceAll(destination.handle, aligned_verify);
+                    if (aligned_count < chunk_len) break :blk aligned_count;
+                    @memcpy(buffer[0..chunk_len], aligned_verify[0..chunk_len]);
+                    break :blk chunk_len;
+                } else try destination.readPositionalAll(io, buffer[0..chunk_len], offset);
+                if (destination_count != chunk_len) return error.VerificationFailed;
+                destination_digest.update(buffer[0..chunk_len]);
+                offset += chunk_len;
+                remaining -= chunk_len;
+                verified += chunk_len;
+                try emitProgress(options, .{ .phase = .verify, .completed_bytes = verified, .total_bytes = total_verify_bytes });
+            }
+        }
+        var destination_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        destination_digest.final(&destination_digest_bytes);
+        if (!std.mem.eql(u8, &expected_digest, &destination_digest_bytes)) return error.VerificationFailed;
+        return;
+    }
 
     var verify_buffer = try allocator.alloc(u8, buffer.len);
     defer allocator.free(verify_buffer);
@@ -264,20 +561,17 @@ fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: st
         while (remaining > 0) {
             const chunk_len: usize = @intCast(@min(remaining, buffer.len));
             const source_count = try source.readPositionalAll(io, buffer[0..chunk_len], offset);
-            const destination_count = if (destination_device)
-                blk: {
-                    const aligned_len = std.mem.alignForward(usize, chunk_len, device_block_size);
-                    const aligned_verify = try allocator.alloc(u8, aligned_len);
-                    defer allocator.free(aligned_verify);
+            const destination_count = if (destination_device) blk: {
+                const aligned_len = std.mem.alignForward(usize, chunk_len, device_block_size);
+                const aligned_verify = try allocator.alloc(u8, aligned_len);
+                defer allocator.free(aligned_verify);
 
-                    try seekDevice(destination.handle, offset);
-                    const aligned_count = try readDeviceAll(destination.handle, aligned_verify);
-                    if (aligned_count < chunk_len) break :blk aligned_count;
-                    @memcpy(verify_buffer[0..chunk_len], aligned_verify[0..chunk_len]);
-                    break :blk chunk_len;
-                }
-            else
-                try destination.readPositionalAll(io, verify_buffer[0..chunk_len], offset);
+                try seekDevice(destination.handle, offset);
+                const aligned_count = try readDeviceAll(destination.handle, aligned_verify);
+                if (aligned_count < chunk_len) break :blk aligned_count;
+                @memcpy(verify_buffer[0..chunk_len], aligned_verify[0..chunk_len]);
+                break :blk chunk_len;
+            } else try destination.readPositionalAll(io, verify_buffer[0..chunk_len], offset);
             if (source_count != chunk_len or destination_count != chunk_len) return error.VerificationFailed;
             if (!std.mem.eql(u8, buffer[0..chunk_len], verify_buffer[0..chunk_len])) return error.VerificationFailed;
 
@@ -343,4 +637,73 @@ test "flashToPath rejects too-small destination" {
 
     const ranges = [_]ByteRange{.{ .offset = 0, .length = 4 }};
     try std.testing.expectError(error.DestinationTooSmall, flashImage(std.testing.allocator, io, source, destination, 4, &ranges, .{}));
+}
+
+const CountedSource = struct {
+    bytes: []const u8,
+    passes: usize = 0,
+};
+
+const CountedStream = struct {
+    reader: std.Io.Reader,
+    allocator: std.mem.Allocator,
+
+    fn destroy(context: *anyopaque) void {
+        const self: *CountedStream = @ptrCast(@alignCast(context));
+        self.allocator.destroy(self);
+    }
+};
+
+fn openCountedStream(context: *anyopaque, _: std.Io, allocator: std.mem.Allocator) !root.Stream {
+    const source_context: *CountedSource = @ptrCast(@alignCast(context));
+    source_context.passes += 1;
+    const stream_context = try allocator.create(CountedStream);
+    stream_context.* = .{ .reader = std.Io.Reader.fixed(source_context.bytes), .allocator = allocator };
+    return .{ .reader = &stream_context.reader, .context = stream_context, .deinit_fn = CountedStream.destroy };
+}
+
+test "source flashing uses replay passes and digest verification" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bytes = try std.testing.allocator.alloc(u8, 17 * 2048);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    bytes[16 * 2048] = 1;
+    @memcpy(bytes[16 * 2048 + 1 ..][0..5], "CD001");
+    bytes[16 * 2048 + 6] = 1;
+
+    var destination = try tmp.dir.createFile(io, "planned.img", .{ .read = true });
+    try destination.writeStreamingAll(io, bytes);
+    try destination.sync(io);
+    destination.close(io);
+    const planned_path = try tmp.dir.realPathFileAlloc(io, "planned.img", std.testing.allocator);
+    defer std.testing.allocator.free(planned_path);
+
+    var planned_context = CountedSource{ .bytes = bytes };
+    var planned_source = root.ImageSource{
+        .context = &planned_context,
+        .metadata = .{ .compression = .gzip, .encoded_size = 10, .image_size = null },
+        .open_stream_fn = openCountedStream,
+    };
+    const planned_report = try flashSource(std.testing.allocator, io, &planned_source, planned_path, .{ .verify = .digest });
+    try std.testing.expectEqual(@as(usize, 2), planned_context.passes);
+    try std.testing.expectEqual(@as(u64, bytes.len), planned_report.bytes_written);
+
+    var force_destination = try tmp.dir.createFile(io, "force.img", .{ .read = true });
+    try force_destination.writeStreamingAll(io, bytes);
+    try force_destination.sync(io);
+    force_destination.close(io);
+    const force_path = try tmp.dir.realPathFileAlloc(io, "force.img", std.testing.allocator);
+    defer std.testing.allocator.free(force_path);
+
+    var force_context = CountedSource{ .bytes = bytes };
+    var force_source = root.ImageSource{
+        .context = &force_context,
+        .metadata = .{ .compression = .gzip, .encoded_size = 10, .image_size = null },
+        .open_stream_fn = openCountedStream,
+    };
+    _ = try flashSource(std.testing.allocator, io, &force_source, force_path, .{ .strategy = .force_full_streaming, .verify = .digest });
+    try std.testing.expectEqual(@as(usize, 1), force_context.passes);
 }

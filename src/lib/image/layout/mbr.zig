@@ -53,7 +53,14 @@ pub fn collectPartitionSpans(allocator: std.mem.Allocator, sector: *const [secto
         });
     }
 
-    return spans.toOwnedSlice(allocator);
+    const result = try spans.toOwnedSlice(allocator);
+    std.mem.sort(PartitionSpan, result, {}, lessByOffset);
+    return result;
+}
+
+fn lessByOffset(_: void, lhs: PartitionSpan, rhs: PartitionSpan) bool {
+    if (lhs.start_offset != rhs.start_offset) return lhs.start_offset < rhs.start_offset;
+    return lhs.index < rhs.index;
 }
 
 fn readU16(bytes: []const u8) u16 {
@@ -72,4 +79,21 @@ test "looksLikeMbr detects active partition table" {
     std.mem.writeInt(u16, sector[510..512], 0xAA55, .little);
 
     try std.testing.expect(looksLikeMbr(&sector));
+}
+
+test "partition spans are sorted by logical offset" {
+    var sector = [_]u8{0} ** sector_size;
+    sector[partition_entry_offset + 4] = 0x83;
+    std.mem.writeInt(u32, sector[partition_entry_offset + 8 ..][0..4], 4096, .little);
+    std.mem.writeInt(u32, sector[partition_entry_offset + 12 ..][0..4], 8, .little);
+    const second = partition_entry_offset + partition_entry_size;
+    sector[second + 4] = 0x0c;
+    std.mem.writeInt(u32, sector[second + 8 ..][0..4], 2048, .little);
+    std.mem.writeInt(u32, sector[second + 12 ..][0..4], 8, .little);
+    std.mem.writeInt(u16, sector[510..512], 0xAA55, .little);
+
+    const spans = try collectPartitionSpans(std.testing.allocator, &sector, 5000 * sector_size);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(u8, 2), spans[0].index);
+    try std.testing.expectEqual(@as(u8, 1), spans[1].index);
 }

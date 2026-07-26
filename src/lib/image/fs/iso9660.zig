@@ -1,9 +1,10 @@
 const std = @import("std");
 
-const root = @import("../../../root.zig");
+const types = @import("../types.zig");
+const range = @import("../../range.zig");
 
-const ImageInfo = root.ImageInfo;
-const ByteRange = root.ByteRange;
+const ImageInfo = types.Info;
+const ByteRange = range.ByteRange;
 
 const logical_block_size: u32 = 2048;
 const primary_volume_descriptor_offset: u64 = 16 * logical_block_size;

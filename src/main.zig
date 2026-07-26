@@ -10,6 +10,8 @@ const ProgressState = struct {
     fn update(context: *anyopaque, progress: openetcher.FlashProgress) !void {
         const self: *ProgressState = @ptrCast(@alignCast(context));
         const label = switch (progress.phase) {
+            .probe => "probe",
+            .plan => "plan",
             .flash => "flash",
             .verify => "verify",
         };
@@ -85,7 +87,13 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const image_path = args[args.len - 1];
-        var info = openetcher.probeImageFromPath(arena, io, image_path) catch |err| {
+        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{}) catch |err| {
+            try writeUserError(stderr, err);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        defer image_source.deinit(arena);
+        var info = openetcher.probeImageSource(arena, io, &image_source, .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -114,7 +122,13 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const image_path = args[args.len - 1];
-        const plan = openetcher.planImageFlashFromPath(arena, io, image_path) catch |err| {
+        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{}) catch |err| {
+            try writeUserError(stderr, err);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        defer image_source.deinit(arena);
+        const plan = openetcher.planImageFlashSource(arena, io, &image_source, .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -206,8 +220,16 @@ pub fn main(init: std.process.Init) !void {
 
         var progress = ProgressState{ .writer = stderr };
         const start_time = std.Io.Clock.awake.now(io);
-        const report = openetcher.flashPlannedImage(arena, io, parsed.image_path, target_path, .{
+        var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{}) catch |err| {
+            try progress.finish();
+            try writeUserError(stderr, err);
+            try stderr.flush();
+            std.process.exit(1);
+        };
+        defer image_source.deinit(arena);
+        const report = openetcher.flashSource(arena, io, &image_source, target_path, .{
             .prepare_target = false,
+            .strategy = if (parsed.force) .force_full_streaming else .planned_sparse,
             .progress_handler = .{
                 .context = &progress,
                 .callback = ProgressState.update,
@@ -312,7 +334,10 @@ fn parseFlashArgs(args: []const []const u8) !FlashArgs {
 }
 
 fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
-    try writer.print("image_size: {}\nlayout: {s}\n", .{ info.image_size, @tagName(info.layout) });
+    try writer.print("image_size: {}\nlayout: {s}\ncompression: {s}\n", .{ info.image_size, @tagName(info.layout), @tagName(info.compression) });
+    if (info.encoded_size) |encoded_size| {
+        try writer.print("encoded_size: {}\n", .{encoded_size});
+    }
 
     if (info.filesystem) |filesystem| {
         try writer.print("filesystem: {s}\n", .{@tagName(filesystem)});
@@ -360,7 +385,13 @@ fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
 }
 
 fn writeImageInfoJson(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
-    try writer.print("{{\n  \"image_size\": {},\n  \"layout\": ", .{info.image_size});
+    try writer.print("{{\n  \"image_size\": {},\n  \"compression\": ", .{info.image_size});
+    try std.json.Stringify.value(@tagName(info.compression), .{}, writer);
+    try writer.writeByte('\n');
+    if (info.encoded_size) |encoded_size| {
+        try writer.print("  ,\"encoded_size\": {}\n", .{encoded_size});
+    }
+    try writer.print("  ,\"layout\": ", .{});
     try std.json.Stringify.value(@tagName(info.layout), .{}, writer);
     try writer.writeByte('\n');
 

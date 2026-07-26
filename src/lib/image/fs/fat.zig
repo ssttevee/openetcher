@@ -1,10 +1,11 @@
 const std = @import("std");
 
-const root = @import("../../../root.zig");
+const range = @import("../../range.zig");
+const types = @import("../types.zig");
 
-pub const ByteRange = root.ByteRange;
-pub const PartitionInfo = root.ImageInfo.PartitionInfo;
-pub const Filesystem = root.ImageInfo.Filesystem;
+pub const ByteRange = range.ByteRange;
+pub const PartitionInfo = types.Info.PartitionInfo;
+pub const Filesystem = types.Info.Filesystem;
 
 const sector_size: u64 = 512;
 
@@ -70,13 +71,13 @@ pub fn collectFatRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: 
     defer ranges.deinit(allocator);
 
     try ranges.append(allocator, .{
-        .offset = start_offset,
+        .offset = 0,
         .length = @as(u64, boot.first_data_sector) * boot.bytes_per_sector,
     });
 
     const fat = try allocator.alloc(u8, @intCast(boot.fatLength()));
     defer allocator.free(fat);
-    const fat_count = try file.readPositionalAll(io, fat, boot.fatOffset(0));
+    const fat_count = try file.readPositionalAll(io, fat, start_offset + boot.fatOffset(0));
     if (fat_count != fat.len) return error.InvalidFatBootSector;
 
     var cluster: u32 = 2;
@@ -88,7 +89,7 @@ pub fn collectFatRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: 
         });
     }
 
-    return root.normalizeRanges(allocator, ranges.items);
+    return range.normalizeRanges(allocator, ranges.items);
 }
 
 fn readBootSector(io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !BootSector {
@@ -139,7 +140,7 @@ fn readBootSector(io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !
         .first_data_sector = first_data_sector,
         .total_clusters = total_clusters,
         .filesystem = filesystem,
-        .boot_sector_offset = start_offset,
+        .boot_sector_offset = 0,
     };
 }
 

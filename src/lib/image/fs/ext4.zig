@@ -1,10 +1,11 @@
 const std = @import("std");
 
-const root = @import("../../../root.zig");
+const range = @import("../../range.zig");
+const types = @import("../types.zig");
 
-pub const ByteRange = root.ByteRange;
-pub const ImageInfo = root.ImageInfo;
-pub const PartitionInfo = root.ImageInfo.PartitionInfo;
+pub const ByteRange = range.ByteRange;
+pub const ImageInfo = types.Info;
+pub const PartitionInfo = types.Info.PartitionInfo;
 
 const superblock_offset: u64 = 1024;
 const superblock_size: usize = 1024;
@@ -111,7 +112,7 @@ pub fn collectExt4RangesFromPath(allocator: std.mem.Allocator, io: std.Io, image
 }
 
 pub fn collectExt4RangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
-    return collectExt4RangesFromFileRegion(io, allocator, file, start_offset, size, true);
+    return collectExt4RangesFromFileRegion(io, allocator, file, start_offset, size, false);
 }
 
 fn collectExt4RangesFromFile(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ![]ByteRange {
@@ -190,7 +191,7 @@ fn collectExt4RangesFromFileRegion(io: std.Io, allocator: std.mem.Allocator, fil
         }
     }
 
-    return root.normalizeRanges(allocator, used_blocks.items);
+    return range.normalizeRanges(allocator, used_blocks.items);
 }
 
 fn readSuperblock(io: std.Io, file: std.Io.File, start_offset: u64) !Superblock {

@@ -1,9 +1,10 @@
 const std = @import("std");
 
-const root = @import("../../../root.zig");
+const range = @import("../../range.zig");
+const types = @import("../types.zig");
 
-pub const ByteRange = root.ByteRange;
-pub const PartitionInfo = root.ImageInfo.PartitionInfo;
+pub const ByteRange = range.ByteRange;
+pub const PartitionInfo = types.Info.PartitionInfo;
 
 const squashfs_magic = 0x73717368;
 const superblock_size = 96;
@@ -34,7 +35,7 @@ pub fn collectSquashfsRangesInRegion(io: std.Io, allocator: std.mem.Allocator, f
     const superblock = try readSuperblock(io, file, start_offset, size);
     const ranges = try allocator.alloc(ByteRange, 1);
     ranges[0] = .{
-        .offset = start_offset,
+        .offset = 0,
         .length = superblock.bytes_used,
     };
     return ranges;
