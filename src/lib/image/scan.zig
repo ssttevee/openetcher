@@ -467,7 +467,7 @@ fn collectSquashfsRanges(allocator: std.mem.Allocator, bytes: []const u8, region
 }
 
 fn probePartition(bytes: []const u8, allocator: std.mem.Allocator, span: mbr.PartitionSpan) !PartitionProbe {
-    if (span.partition_type == 0x0b or span.partition_type == 0x0c or span.partition_type == 0x0e) {
+    if (span.partition_type == 0x06 or span.partition_type == 0x0b or span.partition_type == 0x0c or span.partition_type == 0x0e) {
         const boot = readFatBoot(bytes, .{ .offset = span.start_offset, .length = span.size }) catch |err| return unsupportedPartition(allocator, span, .unknown, "FAT probe failed", err);
         return .{ .index = span.index, .start_offset = span.start_offset, .size = span.size, .partition_type = span.partition_type, .filesystem = boot.filesystem, .supported = true, .block_size = @intCast(@as(u64, boot.bytes_per_sector) * boot.sectors_per_cluster), .required_image_size = span.size };
     }
@@ -517,4 +517,33 @@ fn readU32(bytes: []const u8) u32 {
 
 fn readU64(bytes: []const u8) u64 {
     return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+test "probe and analyze support FAT16 MBR partition type 0x06" {
+    var bytes = [_]u8{0} ** (65 * mbr.sector_size);
+    bytes[mbr.partition_entry_offset + 4] = 0x06;
+    std.mem.writeInt(u32, bytes[mbr.partition_entry_offset + 8 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, bytes[mbr.partition_entry_offset + 12 ..][0..4], 64, .little);
+    std.mem.writeInt(u16, bytes[510..512], 0xAA55, .little);
+
+    const partition_offset = mbr.sector_size;
+    std.mem.writeInt(u16, bytes[partition_offset + 11 ..][0..2], 512, .little);
+    bytes[partition_offset + 13] = 1;
+    std.mem.writeInt(u16, bytes[partition_offset + 14 ..][0..2], 1, .little);
+    bytes[partition_offset + 16] = 2;
+    std.mem.writeInt(u16, bytes[partition_offset + 17 ..][0..2], 16, .little);
+    std.mem.writeInt(u16, bytes[partition_offset + 19 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, bytes[partition_offset + 22 ..][0..2], 1, .little);
+    std.mem.writeInt(u16, bytes[partition_offset + 510 ..][0..2], 0xAA55, .little);
+
+    var result = try probe(&bytes, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Layout.mbr, result.layout);
+    try std.testing.expectEqual(@as(usize, 1), result.partitions.len);
+    try std.testing.expectEqual(Filesystem.fat16, result.partitions[0].filesystem);
+    try std.testing.expect(result.partitions[0].supported);
+
+    var analysis = try analyze(&bytes, std.testing.allocator);
+    defer analysis.deinit(std.testing.allocator);
+    try std.testing.expect(analysis.ranges != null);
 }

@@ -251,7 +251,7 @@ fn infoFromProbe(allocator: std.mem.Allocator, probe: scan.Probe, metadata: sour
 }
 
 fn classifyPartition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, index: u8, partition_type: u8, start_offset: u64, size: u64) Info.PartitionInfo {
-    if (partition_type == 0x0b or partition_type == 0x0c or partition_type == 0x0e) {
+    if (partition_type == 0x06 or partition_type == 0x0b or partition_type == 0x0c or partition_type == 0x0e) {
         const probed = fs.fat.probeFatPartition(io, allocator, file, start_offset, size) catch |err| {
             const reason = std.fmt.allocPrint(allocator, "fat probe failed: {t}", .{err}) catch null;
             return .{
@@ -372,7 +372,7 @@ test "probeImage detects mbr partitions" {
     defer file.close(io);
 
     var bytes = [_]u8{0} ** (8192 * 512);
-    bytes[446 + 4] = 0x0c;
+    bytes[446 + 4] = 0x06;
     std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 2048, .little);
     std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);
     bytes[462 + 4] = 0x83;
