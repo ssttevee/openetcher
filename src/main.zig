@@ -4,6 +4,7 @@ const openetcher = @import("openetcher");
 
 const ProgressState = struct {
     writer: *std.Io.Writer,
+    humanize: bool = false,
     last_phase: ?openetcher.FlashPhase = null,
     last_line_len: usize = 0,
 
@@ -21,12 +22,20 @@ const ProgressState = struct {
             @min(100, @as(u64, @intCast((progress.completed_bytes * 100) / progress.total_bytes)));
 
         var line_buffer: [128]u8 = undefined;
-        const line = try std.fmt.bufPrint(&line_buffer, "{s}: {}/{} bytes ({}%)", .{
-            label,
-            progress.completed_bytes,
-            progress.total_bytes,
-            percent,
-        });
+        var completed_buffer: [32]u8 = undefined;
+        var total_buffer: [32]u8 = undefined;
+        const completed = if (self.humanize)
+            try formatBytes(&completed_buffer, progress.completed_bytes)
+        else
+            "";
+        const total = if (self.humanize)
+            try formatBytes(&total_buffer, progress.total_bytes)
+        else
+            "";
+        const line = if (self.humanize)
+            try std.fmt.bufPrint(&line_buffer, "{s}: {s}/{s} ({}%)", .{ label, completed, total, percent })
+        else
+            try std.fmt.bufPrint(&line_buffer, "{s}: {}/{} bytes ({}%)", .{ label, progress.completed_bytes, progress.total_bytes, percent });
 
         if (self.last_phase != null and self.last_phase.? != progress.phase) {
             try self.writer.writeByte('\n');
@@ -74,19 +83,13 @@ pub fn main(init: std.process.Init) !void {
 
     const command = args[1];
     if (std.mem.eql(u8, command, "info")) {
-        const json = parseJsonFlag(args[2..]) catch {
+        const parsed = parseOutputArgs(args[2..]) catch {
             try writeUsage(stderr);
             try stderr.flush();
             std.process.exit(1);
         };
-        const expected_len: usize = if (json) 4 else 3;
-        if (args.len != expected_len) {
-            try writeUsage(stderr);
-            try stderr.flush();
-            std.process.exit(1);
-        }
 
-        const image_path = args[args.len - 1];
+        const image_path = parsed.image_path;
         var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
@@ -99,29 +102,23 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         defer info.deinit(arena);
-        if (json) {
+        if (parsed.json) {
             try writeImageInfoJson(stdout, info);
         } else {
-            try writeImageInfo(stdout, info);
+            try writeImageInfo(stdout, info, parsed.humanize);
         }
         try stdout.flush();
         return;
     }
 
     if (std.mem.eql(u8, command, "plan")) {
-        const json = parseJsonFlag(args[2..]) catch {
+        const parsed = parseOutputArgs(args[2..]) catch {
             try writeUsage(stderr);
             try stderr.flush();
             std.process.exit(1);
         };
-        const expected_len: usize = if (json) 4 else 3;
-        if (args.len != expected_len) {
-            try writeUsage(stderr);
-            try stderr.flush();
-            std.process.exit(1);
-        }
 
-        const image_path = args[args.len - 1];
+        const image_path = parsed.image_path;
         var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
@@ -134,10 +131,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         defer plan.deinit(arena);
-        if (json) {
+        if (parsed.json) {
             try writeFlashPlanJson(stdout, plan);
         } else {
-            try writeFlashPlan(stdout, plan);
+            try writeFlashPlan(stdout, plan, parsed.humanize);
         }
         try stdout.flush();
         return;
@@ -160,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
         if (parsed.json) {
             try writeCandidateDisksJson(stdout, disks.items);
         } else {
-            try writeCandidateDisks(stdout, disks.items, parsed.include_system);
+            try writeCandidateDisks(stdout, disks.items, parsed.include_system, parsed.humanize);
         }
         try stdout.flush();
         return;
@@ -218,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
-        var progress = ProgressState{ .writer = stderr };
+        var progress = ProgressState{ .writer = stderr, .humanize = parsed.humanize };
         const start_time = std.Io.Clock.awake.now(io);
         var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{}) catch |err| {
             try progress.finish();
@@ -247,11 +244,17 @@ pub fn main(init: std.process.Init) !void {
         const actual_bytes_per_second = bytesPerSecond(report.bytes_written, elapsed_ns);
         const effective_bytes_per_second = bytesPerSecond(report.image_size, elapsed_ns);
 
-        try stdout.print("wrote {} bytes across {} ranges, skipped {} bytes\n", .{ report.bytes_written, report.range_count, report.bytes_skipped });
+        try stdout.print("wrote ", .{});
+        try writeByteValue(stdout, report.bytes_written, parsed.humanize);
+        if (!parsed.humanize) try stdout.print(" bytes", .{});
+        try stdout.print(" across {} ranges, skipped ", .{report.range_count});
+        try writeByteValue(stdout, report.bytes_skipped, parsed.humanize);
+        if (!parsed.humanize) try stdout.print(" bytes", .{});
+        try stdout.writeByte('\n');
         var actual_speed_buffer: [32]u8 = undefined;
         var effective_speed_buffer: [32]u8 = undefined;
-        const actual_speed = try formatBytesPerSecond(&actual_speed_buffer, actual_bytes_per_second);
-        const effective_speed = try formatBytesPerSecond(&effective_speed_buffer, effective_bytes_per_second);
+        const actual_speed = try formatBytes(&actual_speed_buffer, actual_bytes_per_second);
+        const effective_speed = try formatBytes(&effective_speed_buffer, effective_bytes_per_second);
         try stdout.print("actual throughput: {s}/s\n", .{actual_speed});
         try stdout.print("effective throughput: {s}/s\n", .{effective_speed});
         try stdout.flush();
@@ -264,22 +267,50 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn writeUsage(writer: *std.Io.Writer) !void {
-    try writer.print("usage:\n  openetcher info [--json] <image>\n  openetcher plan [--json] <image>\n  openetcher disks [--json] [--all]\n  openetcher flash [--force] <image> <device>\n  openetcher flash [--force] <image> --disk-id <id>\n", .{});
+    try writer.print("usage:\n  openetcher info [-h] [--json] <image>\n  openetcher plan [-h] [--json] <image>\n  openetcher disks [-h] [--json] [--all]\n  openetcher flash [-h] [--force] <image> <device>\n  openetcher flash [-h] [--force] <image> --disk-id <id>\n", .{});
 }
 
-fn parseJsonFlag(args: []const []const u8) !bool {
-    if (args.len == 1) return false;
-    if (args.len == 2 and std.mem.eql(u8, args[0], "--json")) return true;
-    return error.InvalidArguments;
+const OutputArgs = struct {
+    image_path: []const u8,
+    json: bool = false,
+    humanize: bool = false,
+};
+
+fn parseOutputArgs(args: []const []const u8) !OutputArgs {
+    var image_path: ?[]const u8 = null;
+    var json = false;
+    var humanize = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            if (json) return error.InvalidArguments;
+            json = true;
+        } else if (std.mem.eql(u8, arg, "-h")) {
+            if (humanize) return error.InvalidArguments;
+            humanize = true;
+        } else if (image_path == null) {
+            image_path = arg;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+
+    return .{
+        .image_path = image_path orelse return error.InvalidArguments,
+        .json = json,
+        .humanize = humanize,
+    };
 }
 
 const ListArgs = struct {
     json: bool = false,
+    humanize: bool = false,
     include_system: bool = false,
 };
 
 const FlashArgs = struct {
     image_path: []const u8,
+    humanize: bool = false,
     force: bool = false,
     target: union(enum) {
         path: []const u8,
@@ -300,56 +331,87 @@ fn parseListArgs(args: []const []const u8) !ListArgs {
             parsed.include_system = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "-h")) {
+            if (parsed.humanize) return error.InvalidArguments;
+            parsed.humanize = true;
+            continue;
+        }
         return error.InvalidArguments;
     }
     return parsed;
 }
 
 fn parseFlashArgs(args: []const []const u8) !FlashArgs {
+    var image_path: ?[]const u8 = null;
+    var device_path: ?[]const u8 = null;
+    var disk_id: ?[]const u8 = null;
+    var humanize = false;
     var force = false;
     var index: usize = 0;
-    if (args.len > 0 and std.mem.eql(u8, args[0], "--force")) {
-        force = true;
-        index = 1;
+
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "-h")) {
+            if (humanize) return error.InvalidArguments;
+            humanize = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--force")) {
+            if (force) return error.InvalidArguments;
+            force = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--disk-id")) {
+            if (disk_id != null or index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            disk_id = args[index];
+            continue;
+        }
+        if (image_path == null) {
+            image_path = arg;
+        } else if (device_path == null) {
+            device_path = arg;
+        } else {
+            return error.InvalidArguments;
+        }
     }
 
-    const rest = args[index..];
-    if (rest.len == 2) {
+    const image = image_path orelse return error.InvalidArguments;
+    if (disk_id) |id| {
+        if (device_path != null) return error.InvalidArguments;
         return .{
-            .image_path = rest[0],
+            .image_path = image,
+            .humanize = humanize,
             .force = force,
-            .target = .{ .path = rest[1] },
+            .target = .{ .disk_id = id },
         };
     }
-
-    if (rest.len == 3 and std.mem.eql(u8, rest[1], "--disk-id")) {
-        return .{
-            .image_path = rest[0],
-            .force = force,
-            .target = .{ .disk_id = rest[2] },
-        };
-    }
-
-    return error.InvalidArguments;
+    return .{
+        .image_path = image,
+        .humanize = humanize,
+        .force = force,
+        .target = .{ .path = device_path orelse return error.InvalidArguments },
+    };
 }
 
-fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
-    try writer.print("image_size: {}\nlayout: {s}\ncompression: {s}\n", .{ info.image_size, @tagName(info.layout), @tagName(info.compression) });
+fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo, humanize: bool) !void {
+    try writeByteField(writer, "image_size: ", info.image_size, humanize);
+    try writer.print("layout: {s}\ncompression: {s}\n", .{ @tagName(info.layout), @tagName(info.compression) });
     if (info.encoded_size) |encoded_size| {
-        try writer.print("encoded_size: {}\n", .{encoded_size});
+        try writeByteField(writer, "encoded_size: ", encoded_size, humanize);
     }
 
     if (info.filesystem) |filesystem| {
         try writer.print("filesystem: {s}\n", .{@tagName(filesystem)});
     }
     if (info.block_size) |block_size| {
-        try writer.print("block_size: {}\n", .{block_size});
+        try writeByteField(writer, "block_size: ", block_size, humanize);
     }
     if (info.used_bytes) |used_bytes| {
-        try writer.print("used_bytes: {}\n", .{used_bytes});
+        try writeByteField(writer, "used_bytes: ", used_bytes, humanize);
     }
     if (info.skipped_bytes) |skipped_bytes| {
-        try writer.print("skipped_bytes: {}\n", .{skipped_bytes});
+        try writeByteField(writer, "skipped_bytes: ", skipped_bytes, humanize);
     }
     if (info.range_count) |range_count| {
         try writer.print("range_count: {}\n", .{range_count});
@@ -358,30 +420,49 @@ fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
     if (info.partitions.len == 0) return;
     try writer.print("partitions:\n", .{});
     for (info.partitions) |partition| {
-        try writer.print("  {}: type=0x{x:0>2} filesystem={s} supported={} start={} size={}\n", .{
+        try writer.print("  {}: type=0x{x:0>2} filesystem={s} supported={} start=", .{
             partition.index,
             partition.partition_type,
             @tagName(partition.filesystem),
             partition.supported,
-            partition.start_offset,
-            partition.size,
         });
+        try writeByteValue(writer, partition.start_offset, humanize);
+        try writer.print(" size=", .{});
+        try writeByteValue(writer, partition.size, humanize);
+        try writer.writeByte('\n');
         if (partition.reason) |reason| {
             try writer.print("     reason={s}\n", .{reason});
         }
         if (partition.block_size) |block_size| {
-            try writer.print("     block_size={}\n", .{block_size});
+            try writeByteField(writer, "     block_size=", block_size, humanize);
         }
         if (partition.used_bytes) |used_bytes| {
-            try writer.print("     used_bytes={}\n", .{used_bytes});
+            try writeByteField(writer, "     used_bytes=", used_bytes, humanize);
         }
         if (partition.skipped_bytes) |skipped_bytes| {
-            try writer.print("     skipped_bytes={}\n", .{skipped_bytes});
+            try writeByteField(writer, "     skipped_bytes=", skipped_bytes, humanize);
         }
         if (partition.range_count) |range_count| {
             try writer.print("     range_count={}\n", .{range_count});
         }
     }
+}
+
+fn writeByteField(writer: *std.Io.Writer, prefix: []const u8, value: u64, humanize: bool) !void {
+    try writer.print("{s}", .{prefix});
+    try writeByteValue(writer, value, humanize);
+    try writer.writeByte('\n');
+}
+
+fn writeByteValue(writer: *std.Io.Writer, value: u64, humanize: bool) !void {
+    if (!humanize) {
+        try writer.print("{}", .{value});
+        return;
+    }
+
+    var buffer: [32]u8 = undefined;
+    const formatted = try formatBytes(&buffer, value);
+    try writer.print("{s}", .{formatted});
 }
 
 fn writeImageInfoJson(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
@@ -447,24 +528,23 @@ fn writeImageInfoJson(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void 
     try writer.print("\n  ]\n}}\n", .{});
 }
 
-fn writeFlashPlan(writer: *std.Io.Writer, plan: openetcher.FlashPlan) !void {
+fn writeFlashPlan(writer: *std.Io.Writer, plan: openetcher.FlashPlan, humanize: bool) !void {
     var planned_bytes: u64 = 0;
     for (plan.ranges) |segment| planned_bytes += segment.length;
 
-    try writer.print("image_size: {}\nplanned_bytes: {}\nskipped_bytes: {}\nrange_count: {}\nranges:\n", .{
-        plan.image_size,
-        planned_bytes,
-        plan.image_size - planned_bytes,
-        plan.ranges.len,
-    });
+    try writeByteField(writer, "image_size: ", plan.image_size, humanize);
+    try writeByteField(writer, "planned_bytes: ", planned_bytes, humanize);
+    try writeByteField(writer, "skipped_bytes: ", plan.image_size - planned_bytes, humanize);
+    try writer.print("range_count: {}\nranges:\n", .{plan.ranges.len});
 
     for (plan.ranges, 0..) |segment, index| {
-        try writer.print("  {}: offset={} length={} end={}\n", .{
-            index,
-            segment.offset,
-            segment.length,
-            segment.end(),
-        });
+        try writer.print("  {}: offset=", .{index});
+        try writeByteValue(writer, segment.offset, humanize);
+        try writer.print(" length=", .{});
+        try writeByteValue(writer, segment.length, humanize);
+        try writer.print(" end=", .{});
+        try writeByteValue(writer, segment.end(), humanize);
+        try writer.writeByte('\n');
     }
 }
 
@@ -491,7 +571,7 @@ fn writeFlashPlanJson(writer: *std.Io.Writer, plan: openetcher.FlashPlan) !void 
     try writer.print("\n  ]\n}}\n", .{});
 }
 
-fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceCandidateDisk, include_system: bool) !void {
+fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceCandidateDisk, include_system: bool, humanize: bool) !void {
     if (disks.len == 0) {
         if (include_system) {
             try writer.print("no disks found\n", .{});
@@ -506,7 +586,7 @@ fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceC
         try writer.print("   id: {s}\n", .{disk.id});
         try writer.print("   raw: {s}\n", .{disk.raw_path});
         try writer.print("   description: {s}\n", .{disk.description});
-        try writer.print("   size: {}\n", .{disk.size});
+        try writeByteField(writer, "   size: ", disk.size, humanize);
         try writer.print("   protected: {}\n", .{disk.protected});
         try writer.print("   system: {}\n", .{disk.system});
         try writer.print("   removable: {}\n", .{disk.removable});
@@ -580,7 +660,7 @@ fn bytesPerSecond(bytes: u64, elapsed_ns: u64) u64 {
     return @intCast((@as(u128, bytes) * std.time.ns_per_s) / elapsed_ns);
 }
 
-fn formatBytesPerSecond(buffer: []u8, value: u64) ![]const u8 {
+fn formatBytes(buffer: []u8, value: u64) ![]const u8 {
     const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB" };
     var scaled = value;
     var remainder: u64 = 0;
