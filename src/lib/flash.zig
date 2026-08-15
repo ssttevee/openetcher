@@ -272,11 +272,10 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
         var offset = item.offset;
         while (remaining > 0) {
             const count: usize = @intCast(@min(remaining, buffer.len));
-            const actual = if (target.info.capabilities.isDevice()) blk: {
-                try seekDevice(target.file.handle, offset);
-                const read_count = try readDeviceAll(target.file.handle, buffer[0..count]);
-                break :blk read_count;
-            } else try target.file.readPositionalAll(io, buffer[0..count], offset);
+            const actual = if (target.info.capabilities.isDevice())
+                try readTargetDeviceChunk(allocator, target, buffer[0..count], offset)
+            else
+                try target.file.readPositionalAll(io, buffer[0..count], offset);
             if (actual != count) return error.VerificationFailed;
             hasher.update(buffer[0..count]);
             offset += count;
@@ -303,10 +302,10 @@ fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.St
             try stream.readExactly(buffer[0..count]);
             const destination_buffer = try allocator.alloc(u8, count);
             defer allocator.free(destination_buffer);
-            const actual = if (target.info.capabilities.isDevice()) blk: {
-                try seekDevice(target.file.handle, offset);
-                break :blk try readDeviceAll(target.file.handle, destination_buffer);
-            } else try target.file.readPositionalAll(io, destination_buffer, offset);
+            const actual = if (target.info.capabilities.isDevice())
+                try readTargetDeviceChunk(allocator, target, destination_buffer, offset)
+            else
+                try target.file.readPositionalAll(io, destination_buffer, offset);
             if (actual != count or !std.mem.eql(u8, buffer[0..count], destination_buffer)) return error.VerificationFailed;
             offset += count;
             remaining -= count;
@@ -476,11 +475,49 @@ fn writeDeviceAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 fn readDeviceAll(fd: std.posix.fd_t, buffer: []u8) !usize {
     var index: usize = 0;
     while (index < buffer.len) {
-        const amt = try std.posix.read(fd, buffer[index..]);
+        const rc = std.posix.system.read(fd, buffer[index..].ptr, buffer.len - index);
+        const amt: usize = switch (std.posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .CANCELED => return error.Canceled,
+            .BADF => return error.NotOpenForReading,
+            .ACCES => return error.AccessDenied,
+            .INVAL => return error.InvalidDeviceRead,
+            .IO => return error.InputOutput,
+            else => |err| return std.posix.unexpectedErrno(err),
+        };
         if (amt == 0) break;
         index += amt;
     }
     return index;
+}
+
+fn readTargetDeviceChunk(allocator: std.mem.Allocator, target: *device.OpenTarget, buffer: []u8, offset: u64) !usize {
+    if (buffer.len == 0) return 0;
+
+    const alignment: usize = @intCast(target.info.capabilities.read_alignment);
+    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidBlockSize;
+
+    const aligned_offset = std.mem.alignBackward(u64, offset, alignment);
+    const prefix: usize = @intCast(offset - aligned_offset);
+    const requested_end = std.math.add(usize, prefix, buffer.len) catch return error.OutOfMemory;
+    const aligned_len = std.mem.alignForward(usize, requested_end, alignment);
+    const allocation_len = std.math.add(usize, aligned_len, alignment - 1) catch return error.OutOfMemory;
+    const allocation = try allocator.alloc(u8, allocation_len);
+    defer allocator.free(allocation);
+
+    const allocation_address = @intFromPtr(allocation.ptr);
+    const aligned_address = std.mem.alignForward(usize, allocation_address, alignment);
+    const start = aligned_address - allocation_address;
+    const aligned_buffer = allocation[start..][0..aligned_len];
+
+    try seekDevice(target.file.handle, aligned_offset);
+    const read_count = try readDeviceAll(target.file.handle, aligned_buffer);
+    if (read_count <= prefix) return 0;
+    const available = @min(buffer.len, read_count - prefix);
+    @memcpy(buffer[0..available], aligned_buffer[prefix..][0..available]);
+    return available;
 }
 
 fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, fd: std.posix.fd_t, chunk: []const u8, offset: u64, block_size: usize) !void {
@@ -518,14 +555,24 @@ fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: st
             while (remaining > 0) {
                 const chunk_len: usize = @intCast(@min(remaining, buffer.len));
                 const destination_count = if (destination_device) blk: {
-                    const aligned_len = std.mem.alignForward(usize, chunk_len, device_block_size);
-                    const aligned_verify = try allocator.alloc(u8, aligned_len);
-                    defer allocator.free(aligned_verify);
-                    try seekDevice(destination.handle, offset);
-                    const aligned_count = try readDeviceAll(destination.handle, aligned_verify);
-                    if (aligned_count < chunk_len) break :blk aligned_count;
-                    @memcpy(buffer[0..chunk_len], aligned_verify[0..chunk_len]);
-                    break :blk chunk_len;
+                    var target = device.OpenTarget{
+                        .file = destination,
+                        .info = .{
+                            .requested_path = "<open-file>",
+                            .resolved_path = &.{},
+                            .owns_resolved_path = false,
+                            .capabilities = .{
+                                .kind = .character_device,
+                                .size = 0,
+                                .read_alignment = @intCast(device_block_size),
+                                .write_alignment = @intCast(device_block_size),
+                                .optimal_io_size = 0,
+                                .access_pattern = .seek_and_stream,
+                                .supports_verify_reads = true,
+                            },
+                        },
+                    };
+                    break :blk try readTargetDeviceChunk(allocator, &target, buffer[0..chunk_len], offset);
                 } else try destination.readPositionalAll(io, buffer[0..chunk_len], offset);
                 if (destination_count != chunk_len) return error.VerificationFailed;
                 destination_digest.update(buffer[0..chunk_len]);
@@ -562,15 +609,24 @@ fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: st
             const chunk_len: usize = @intCast(@min(remaining, buffer.len));
             const source_count = try source.readPositionalAll(io, buffer[0..chunk_len], offset);
             const destination_count = if (destination_device) blk: {
-                const aligned_len = std.mem.alignForward(usize, chunk_len, device_block_size);
-                const aligned_verify = try allocator.alloc(u8, aligned_len);
-                defer allocator.free(aligned_verify);
-
-                try seekDevice(destination.handle, offset);
-                const aligned_count = try readDeviceAll(destination.handle, aligned_verify);
-                if (aligned_count < chunk_len) break :blk aligned_count;
-                @memcpy(verify_buffer[0..chunk_len], aligned_verify[0..chunk_len]);
-                break :blk chunk_len;
+                var target = device.OpenTarget{
+                    .file = destination,
+                    .info = .{
+                        .requested_path = "<open-file>",
+                        .resolved_path = &.{},
+                        .owns_resolved_path = false,
+                        .capabilities = .{
+                            .kind = .character_device,
+                            .size = 0,
+                            .read_alignment = @intCast(device_block_size),
+                            .write_alignment = @intCast(device_block_size),
+                            .optimal_io_size = 0,
+                            .access_pattern = .seek_and_stream,
+                            .supports_verify_reads = true,
+                        },
+                    },
+                };
+                break :blk try readTargetDeviceChunk(allocator, &target, verify_buffer[0..chunk_len], offset);
             } else try destination.readPositionalAll(io, verify_buffer[0..chunk_len], offset);
             if (source_count != chunk_len or destination_count != chunk_len) return error.VerificationFailed;
             if (!std.mem.eql(u8, buffer[0..chunk_len], verify_buffer[0..chunk_len])) return error.VerificationFailed;
@@ -585,6 +641,43 @@ fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: st
             });
         }
     }
+}
+
+test "device verification reads unaligned logical ranges through aligned buffers" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(io, "device.img", .{ .read = true });
+    defer file.close(io);
+
+    var contents: [1024]u8 = undefined;
+    for (&contents, 0..) |*byte, index| byte.* = @truncate(index);
+    try file.writeStreamingAll(io, &contents);
+    try file.sync(io);
+
+    var target = device.OpenTarget{
+        .file = file,
+        .info = .{
+            .requested_path = "<test-device>",
+            .resolved_path = &.{},
+            .owns_resolved_path = false,
+            .capabilities = .{
+                .kind = .character_device,
+                .size = contents.len,
+                .read_alignment = 512,
+                .write_alignment = 512,
+                .optimal_io_size = 512,
+                .access_pattern = .seek_and_stream,
+                .supports_verify_reads = true,
+            },
+        },
+    };
+    var actual: [513]u8 = undefined;
+    const count = try readTargetDeviceChunk(std.testing.allocator, &target, &actual, 3);
+
+    try std.testing.expectEqual(actual.len, count);
+    try std.testing.expectEqualSlices(u8, contents[3..][0..actual.len], &actual);
 }
 
 test "flashImage copies only declared ranges" {
