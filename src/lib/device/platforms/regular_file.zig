@@ -49,3 +49,7 @@ pub fn resolveDiskId(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.R
 pub fn lookupDiskByPath(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.LookupDiskOptions) !?device.CandidateDisk {
     return null;
 }
+
+const target_io_api = @import("target_io.zig");
+
+pub const target_io: device.TargetIo = target_io_api.positional_only_dispatcher;

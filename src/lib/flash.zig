@@ -81,7 +81,7 @@ pub fn flashSource(allocator: std.mem.Allocator, io: std.Io, source: *root.Image
         },
         .full_if_unsupported => {
             const plan = root.planImageFlashSource(allocator, io, source, .{ .max_image_size = options.max_image_size }) catch |err| switch (err) {
-                error.UnsupportedPartitionFilesystem, error.UnsupportedStreamingLayout => null,
+                error.UnsupportedPartitionFilesystem => null,
                 else => return err,
             };
             if (plan) |planned| {
@@ -102,7 +102,9 @@ pub fn flashPlannedSource(allocator: std.mem.Allocator, io: std.Io, image_source
 
     var target = try openFlashTarget(allocator, io, destination_path, options);
     defer target.close(allocator, io);
+
     const result = try flashStream(allocator, io, &stream, &target, plan.image_size, plan.ranges, options);
+
     if (options.verify == .reread_source or options.verify == .written) {
         var verify_stream = try image_source.openStream(io, allocator);
         defer verify_stream.deinit();
@@ -111,11 +113,6 @@ pub fn flashPlannedSource(allocator: std.mem.Allocator, io: std.Io, image_source
     }
     return result.report;
 }
-
-const StreamFlashResult = struct {
-    report: Report,
-    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-};
 
 fn openFlashTarget(allocator: std.mem.Allocator, io: std.Io, destination_path: []const u8, options: Options) !device.OpenTarget {
     if (options.prepare_target) try device.prepareTargetPath(allocator, io, destination_path);
@@ -129,6 +126,7 @@ fn flashFullSource(allocator: std.mem.Allocator, io: std.Io, image_source: *root
 
     var target = try openFlashTarget(allocator, io, destination_path, options);
     defer target.close(allocator, io);
+
     const result = try flashStream(allocator, io, &stream, &target, image_source.metadata.image_size, null, options);
 
     if (options.verify == .reread_source or options.verify == .written) {
@@ -159,6 +157,13 @@ fn countRanges(ranges: []const ByteRange) u64 {
     return total;
 }
 
+fn emitProgress(options: Options, progress: Progress) !void {
+    const handler = options.progress_handler orelse return;
+    try handler.callback(handler.context, progress);
+}
+
+/// The single write engine. `ranges` selects sparse writing; null writes the
+/// whole decoded stream sequentially.
 fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, target: *device.OpenTarget, expected_size: ?u64, ranges: ?[]const ByteRange, options: Options) !StreamFlashResult {
     if (options.block_size == 0) return error.InvalidBlockSize;
     if (expected_size) |size| {
@@ -177,6 +182,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
 
     var logical_size: u64 = 0;
     var bytes_written: u64 = 0;
+
     if (ranges) |items| {
         for (items) |item| {
             try stream.discardTo(item.offset);
@@ -186,7 +192,8 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
                 const chunk_len: usize = @intCast(@min(remaining, buffer.len));
                 const count = try stream.read(buffer[0..chunk_len]);
                 if (count == 0) return error.UnexpectedEndOfImage;
-                try writeTargetChunk(allocator, io, target, buffer[0..count], offset);
+                try device.target_io.write_at(allocator, io, target, buffer[0..count], offset);
+                for (options.observers) |*observer| try root.deliverObserver(observer, offset, buffer[0..count]);
                 hasher.update(buffer[0..count]);
                 bytes_written += count;
                 offset += count;
@@ -210,7 +217,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
             const offset = logical_size;
             const next = std.math.add(u64, logical_size, count) catch return error.DecompressedImageTooLarge;
             if (target.info.capabilities.size < next) return error.DestinationTooSmall;
-            try writeTargetChunk(allocator, io, target, buffer[0..count], offset);
+            try device.target_io.write_at(allocator, io, target, buffer[0..count], offset);
             for (options.observers) |*observer| try root.deliverObserver(observer, offset, buffer[0..count]);
             hasher.update(buffer[0..count]);
             logical_size = next;
@@ -218,10 +225,11 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
             try emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
         }
         if (expected_size) |size| if (logical_size != size) return error.ImageSizeMismatch;
-        for (options.observers) |*observer| try observer.finish(logical_size);
     }
 
-    try target.file.sync(io);
+    for (options.observers) |*observer| try observer.finish(logical_size);
+
+    try device.target_io.sync(io, target);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     if (options.verify == .digest) {
@@ -232,7 +240,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     return .{
         .report = .{
             .image_size = logical_size,
-            .bytes_read = if (ranges != null) logical_size else logical_size,
+            .bytes_read = logical_size,
             .bytes_written = bytes_written,
             .bytes_skipped = logical_size - bytes_written,
             .range_count = if (ranges) |items| items.len else if (logical_size == 0) 0 else 1,
@@ -241,24 +249,10 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     };
 }
 
-fn writeTargetChunk(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
-    if (!target.info.capabilities.isDevice()) {
-        try target.file.writePositionalAll(io, bytes, offset);
-        return;
-    }
-
-    const alignment: usize = @intCast(target.info.capabilities.write_alignment);
-    if (alignment == 0) return error.InvalidBlockSize;
-    try seekDevice(target.file.handle, offset);
-    if (bytes.len % alignment == 0) return writeDeviceAll(target.file.handle, bytes);
-
-    const aligned_len = std.mem.alignForward(usize, bytes.len, alignment);
-    const aligned = try allocator.alloc(u8, aligned_len);
-    defer allocator.free(aligned);
-    @memcpy(aligned[0..bytes.len], bytes);
-    @memset(aligned[bytes.len..], 0);
-    try writeDeviceAll(target.file.handle, aligned);
-}
+const StreamFlashResult = struct {
+    report: Report,
+    digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
 
 fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, ranges: []const ByteRange, expected: [std.crypto.hash.sha2.Sha256.digest_length]u8, options: Options) !void {
     var buffer = try allocator.alloc(u8, options.block_size);
@@ -272,10 +266,7 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
         var offset = item.offset;
         while (remaining > 0) {
             const count: usize = @intCast(@min(remaining, buffer.len));
-            const actual = if (target.info.capabilities.isDevice())
-                try readTargetDeviceChunk(allocator, target, buffer[0..count], offset)
-            else
-                try target.file.readPositionalAll(io, buffer[0..count], offset);
+            const actual = try device.target_io.read_at(allocator, io, target, buffer[0..count], offset);
             if (actual != count) return error.VerificationFailed;
             hasher.update(buffer[0..count]);
             offset += count;
@@ -302,10 +293,7 @@ fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.St
             try stream.readExactly(buffer[0..count]);
             const destination_buffer = try allocator.alloc(u8, count);
             defer allocator.free(destination_buffer);
-            const actual = if (target.info.capabilities.isDevice())
-                try readTargetDeviceChunk(allocator, target, destination_buffer, offset)
-            else
-                try target.file.readPositionalAll(io, destination_buffer, offset);
+            const actual = try device.target_io.read_at(allocator, io, target, destination_buffer, offset);
             if (actual != count or !std.mem.eql(u8, buffer[0..count], destination_buffer)) return error.VerificationFailed;
             offset += count;
             remaining -= count;
@@ -315,6 +303,9 @@ fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.St
     if (stream.position != image_size) return error.ImageSizeMismatch;
 }
 
+// Public file-handle entry points. Each wraps the open file in a seekable
+// stream and routes through the single engine.
+
 pub fn flashPlannedImage(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, options: Options) !Report {
     const plan = try root.planImageFlashFromPath(allocator, io, image_path);
     defer plan.deinit(allocator);
@@ -322,16 +313,24 @@ pub fn flashPlannedImage(allocator: std.mem.Allocator, io: std.Io, image_path: [
 }
 
 pub fn flashToPathFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, destination_path: []const u8, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
-    var source = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
-    defer source.close(io);
+    var source_file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
+    defer source_file.close(io);
 
-    if (options.prepare_target) {
-        try device.prepareTargetPath(allocator, io, destination_path);
-    }
-    var target = try device.openTarget(allocator, io, destination_path);
+    var stream = try openFileStream(io, allocator, source_file);
+    defer stream.deinit();
+    if (options.max_image_size) |limit| stream.max_image_size = limit;
+
+    var target = try openFlashTarget(allocator, io, destination_path, options);
     defer target.close(allocator, io);
 
-    return flashToTarget(allocator, io, source, &target, image_size, ranges, options);
+    const result = try flashStream(allocator, io, &stream, &target, image_size, ranges, options);
+
+    if (options.verify == .reread_source or options.verify == .written) {
+        var verify_stream = try openFileStream(io, allocator, source_file);
+        defer verify_stream.deinit();
+        try verifySourceRanges(allocator, io, &verify_stream, &target, image_size, ranges, options);
+    }
+    return result.report;
 }
 
 pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
@@ -359,291 +358,60 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File,
             },
         },
     };
-    return flashToTarget(allocator, io, source, &target, image_size, ranges, options);
+
+    var stream = try openFileStream(io, allocator, source);
+    defer stream.deinit();
+
+    const result = try flashStream(allocator, io, &stream, &target, image_size, ranges, options);
+
+    if (options.verify == .reread_source or options.verify == .written) {
+        var verify_stream = try openFileStream(io, allocator, source);
+        defer verify_stream.deinit();
+        try verifySourceRanges(allocator, io, &verify_stream, &target, image_size, ranges, options);
+    }
+    return result.report;
 }
 
-fn flashToTarget(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !Report {
-    if (options.block_size == 0) return error.InvalidBlockSize;
+/// Wraps an open seekable file as a replayable `root.Stream` with a seek
+/// fast-path so gap skipping costs one lseek instead of reads.
+const FileStreamContext = struct {
+    file_reader: std.Io.File.Reader,
+    buffer: []u8,
+    allocator: std.mem.Allocator,
 
-    const destination = &target.file;
-    const destination_device = target.info.capabilities.kind != .regular_file;
-    const device_block_size: usize = target.info.capabilities.write_alignment;
-    const dest_size = target.info.capabilities.size;
-    if (dest_size < image_size) return error.DestinationTooSmall;
-
-    const buffer = try allocator.alloc(u8, options.block_size);
-    defer allocator.free(buffer);
-
-    const planned_bytes = countPlannedBytes(ranges);
-    if (planned_bytes > 0) {
-        try emitProgress(options, .{
-            .phase = .flash,
-            .completed_bytes = 0,
-            .total_bytes = planned_bytes,
-        });
+    fn destroy(context: *anyopaque) void {
+        const self: *FileStreamContext = @ptrCast(@alignCast(context));
+        self.allocator.free(self.buffer);
+        self.allocator.destroy(self);
     }
 
-    var bytes_written: u64 = 0;
-    var source_digest = std.crypto.hash.sha2.Sha256.init(.{});
-    for (ranges) |segment| {
-        var remaining = segment.length;
-        var offset = segment.offset;
-        while (remaining > 0) {
-            const chunk_len: usize = @intCast(@min(remaining, buffer.len));
-            const chunk = buffer[0..chunk_len];
-            const read_count = try source.readPositionalAll(io, chunk, offset);
-            if (read_count != chunk_len) return error.UnexpectedEndOfImage;
-            if (destination_device) {
-                try seekDevice(destination.handle, offset);
-                try writeAlignedDeviceChunk(allocator, io, source, destination.handle, chunk, offset, device_block_size);
-            } else {
-                try destination.writePositionalAll(io, chunk, offset);
-            }
-            source_digest.update(chunk);
-
-            remaining -= chunk_len;
-            offset += chunk_len;
-            bytes_written += chunk_len;
-            try emitProgress(options, .{
-                .phase = .flash,
-                .completed_bytes = bytes_written,
-                .total_bytes = planned_bytes,
-            });
-        }
+    fn seekTo(context: *anyopaque, position: u64) anyerror!void {
+        const self: *FileStreamContext = @ptrCast(@alignCast(context));
+        try self.file_reader.seekTo(position);
     }
+};
 
-    try destination.sync(io);
-    var source_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    source_digest.final(&source_digest_bytes);
-    try maybeVerifyWrittenRanges(allocator, io, source, destination.*, ranges, options, buffer, destination_device, device_block_size, planned_bytes, source_digest_bytes);
+fn openFileStream(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !root.Stream {
+    const context = try allocator.create(FileStreamContext);
+    errdefer allocator.destroy(context);
+    const buffer = try allocator.alloc(u8, 64 * 1024);
+    errdefer allocator.free(buffer);
+
+    context.* = .{
+        .file_reader = std.Io.File.Reader.init(file, io, buffer),
+        .buffer = buffer,
+        .allocator = allocator,
+    };
 
     return .{
-        .image_size = image_size,
-        .bytes_read = bytes_written,
-        .bytes_written = bytes_written,
-        .bytes_skipped = image_size - bytes_written,
-        .range_count = ranges.len,
+        .reader = &context.file_reader.interface,
+        .context = context,
+        .deinit_fn = FileStreamContext.destroy,
+        .seek_to_fn = FileStreamContext.seekTo,
     };
 }
 
-fn countPlannedBytes(ranges: []const ByteRange) u64 {
-    var total: u64 = 0;
-    for (ranges) |segment| total += segment.length;
-    return total;
-}
-
-fn emitProgress(options: Options, progress: Progress) !void {
-    const handler = options.progress_handler orelse return;
-    try handler.callback(handler.context, progress);
-}
-
-fn seekDevice(fd: std.posix.fd_t, offset: u64) !void {
-    const result = std.posix.system.lseek(fd, @bitCast(@as(i64, @intCast(offset))), std.posix.SEEK.SET);
-    switch (std.posix.errno(result)) {
-        .SUCCESS => return,
-        .INVAL => return error.Unseekable,
-        .ACCES => return error.AccessDenied,
-        .BADF => return error.NotOpenForWriting,
-        else => |err| return std.posix.unexpectedErrno(err),
-    }
-}
-
-fn writeDeviceAll(fd: std.posix.fd_t, bytes: []const u8) !void {
-    var index: usize = 0;
-    while (index < bytes.len) {
-        const rc = std.posix.system.write(fd, bytes[index..].ptr, bytes.len - index);
-        const written: usize = switch (std.posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .CANCELED => return error.Canceled,
-            .BADF => return error.NotOpenForWriting,
-            .ACCES => return error.AccessDenied,
-            .PERM => return error.PermissionDenied,
-            .NOSPC => return error.NoSpaceLeft,
-            .IO => return error.InputOutput,
-            .BUSY => return error.DeviceBusy,
-            .FBIG => return error.FileTooBig,
-            .DQUOT => return error.DiskQuota,
-            else => |err| return std.posix.unexpectedErrno(err),
-        };
-        if (written == 0) return error.ShortWrite;
-        index += written;
-    }
-}
-
-fn readDeviceAll(fd: std.posix.fd_t, buffer: []u8) !usize {
-    var index: usize = 0;
-    while (index < buffer.len) {
-        const rc = std.posix.system.read(fd, buffer[index..].ptr, buffer.len - index);
-        const amt: usize = switch (std.posix.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            .INTR => continue,
-            .AGAIN => return error.WouldBlock,
-            .CANCELED => return error.Canceled,
-            .BADF => return error.NotOpenForReading,
-            .ACCES => return error.AccessDenied,
-            .INVAL => return error.InvalidDeviceRead,
-            .IO => return error.InputOutput,
-            else => |err| return std.posix.unexpectedErrno(err),
-        };
-        if (amt == 0) break;
-        index += amt;
-    }
-    return index;
-}
-
-fn readTargetDeviceChunk(allocator: std.mem.Allocator, target: *device.OpenTarget, buffer: []u8, offset: u64) !usize {
-    if (buffer.len == 0) return 0;
-
-    const alignment: usize = @intCast(target.info.capabilities.read_alignment);
-    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidBlockSize;
-
-    const aligned_offset = std.mem.alignBackward(u64, offset, alignment);
-    const prefix: usize = @intCast(offset - aligned_offset);
-    const requested_end = std.math.add(usize, prefix, buffer.len) catch return error.OutOfMemory;
-    const aligned_len = std.mem.alignForward(usize, requested_end, alignment);
-    const allocation_len = std.math.add(usize, aligned_len, alignment - 1) catch return error.OutOfMemory;
-    const allocation = try allocator.alloc(u8, allocation_len);
-    defer allocator.free(allocation);
-
-    const allocation_address = @intFromPtr(allocation.ptr);
-    const aligned_address = std.mem.alignForward(usize, allocation_address, alignment);
-    const start = aligned_address - allocation_address;
-    const aligned_buffer = allocation[start..][0..aligned_len];
-
-    try seekDevice(target.file.handle, aligned_offset);
-    const read_count = try readDeviceAll(target.file.handle, aligned_buffer);
-    if (read_count <= prefix) return 0;
-    const available = @min(buffer.len, read_count - prefix);
-    @memcpy(buffer[0..available], aligned_buffer[prefix..][0..available]);
-    return available;
-}
-
-fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, fd: std.posix.fd_t, chunk: []const u8, offset: u64, block_size: usize) !void {
-    if (chunk.len % block_size == 0) {
-        return writeDeviceAll(fd, chunk);
-    }
-
-    const aligned_len = std.mem.alignForward(usize, chunk.len, block_size);
-    const aligned = try allocator.alloc(u8, aligned_len);
-    defer allocator.free(aligned);
-
-    @memcpy(aligned[0..chunk.len], chunk);
-    @memset(aligned[chunk.len..], 0);
-
-    const tail_offset = offset + chunk.len;
-    const tail_len = aligned_len - chunk.len;
-    const tail_count = try source.readPositionalAll(io, aligned[chunk.len..], tail_offset);
-    if (tail_count < tail_len) {
-        @memset(aligned[chunk.len + tail_count ..], 0);
-    }
-
-    try writeDeviceAll(fd, aligned);
-}
-
-fn maybeVerifyWrittenRanges(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File, destination: std.Io.File, ranges: []const ByteRange, options: Options, buffer: []u8, destination_device: bool, device_block_size: usize, total_verify_bytes: u64, expected_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8) !void {
-    if (options.verify == .none) return;
-
-    if (options.verify == .digest) {
-        try emitProgress(options, .{ .phase = .verify, .completed_bytes = 0, .total_bytes = total_verify_bytes });
-        var destination_digest = std.crypto.hash.sha2.Sha256.init(.{});
-        var verified: u64 = 0;
-        for (ranges) |segment| {
-            var remaining = segment.length;
-            var offset = segment.offset;
-            while (remaining > 0) {
-                const chunk_len: usize = @intCast(@min(remaining, buffer.len));
-                const destination_count = if (destination_device) blk: {
-                    var target = device.OpenTarget{
-                        .file = destination,
-                        .info = .{
-                            .requested_path = "<open-file>",
-                            .resolved_path = &.{},
-                            .owns_resolved_path = false,
-                            .capabilities = .{
-                                .kind = .character_device,
-                                .size = 0,
-                                .read_alignment = @intCast(device_block_size),
-                                .write_alignment = @intCast(device_block_size),
-                                .optimal_io_size = 0,
-                                .access_pattern = .seek_and_stream,
-                                .supports_verify_reads = true,
-                            },
-                        },
-                    };
-                    break :blk try readTargetDeviceChunk(allocator, &target, buffer[0..chunk_len], offset);
-                } else try destination.readPositionalAll(io, buffer[0..chunk_len], offset);
-                if (destination_count != chunk_len) return error.VerificationFailed;
-                destination_digest.update(buffer[0..chunk_len]);
-                offset += chunk_len;
-                remaining -= chunk_len;
-                verified += chunk_len;
-                try emitProgress(options, .{ .phase = .verify, .completed_bytes = verified, .total_bytes = total_verify_bytes });
-            }
-        }
-        var destination_digest_bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        destination_digest.final(&destination_digest_bytes);
-        if (!std.mem.eql(u8, &expected_digest, &destination_digest_bytes)) return error.VerificationFailed;
-        return;
-    }
-
-    var verify_buffer = try allocator.alloc(u8, buffer.len);
-    defer allocator.free(verify_buffer);
-
-    if (total_verify_bytes > 0) {
-        try emitProgress(options, .{
-            .phase = .verify,
-            .completed_bytes = 0,
-            .total_bytes = total_verify_bytes,
-        });
-    }
-
-    var bytes_verified: u64 = 0;
-
-    for (ranges) |segment| {
-        var remaining = segment.length;
-        var offset = segment.offset;
-
-        while (remaining > 0) {
-            const chunk_len: usize = @intCast(@min(remaining, buffer.len));
-            const source_count = try source.readPositionalAll(io, buffer[0..chunk_len], offset);
-            const destination_count = if (destination_device) blk: {
-                var target = device.OpenTarget{
-                    .file = destination,
-                    .info = .{
-                        .requested_path = "<open-file>",
-                        .resolved_path = &.{},
-                        .owns_resolved_path = false,
-                        .capabilities = .{
-                            .kind = .character_device,
-                            .size = 0,
-                            .read_alignment = @intCast(device_block_size),
-                            .write_alignment = @intCast(device_block_size),
-                            .optimal_io_size = 0,
-                            .access_pattern = .seek_and_stream,
-                            .supports_verify_reads = true,
-                        },
-                    },
-                };
-                break :blk try readTargetDeviceChunk(allocator, &target, verify_buffer[0..chunk_len], offset);
-            } else try destination.readPositionalAll(io, verify_buffer[0..chunk_len], offset);
-            if (source_count != chunk_len or destination_count != chunk_len) return error.VerificationFailed;
-            if (!std.mem.eql(u8, buffer[0..chunk_len], verify_buffer[0..chunk_len])) return error.VerificationFailed;
-
-            offset += chunk_len;
-            remaining -= chunk_len;
-            bytes_verified += chunk_len;
-            try emitProgress(options, .{
-                .phase = .verify,
-                .completed_bytes = bytes_verified,
-                .total_bytes = total_verify_bytes,
-            });
-        }
-    }
-}
-
-test "device verification reads unaligned logical ranges through aligned buffers" {
+test "aligned device chunk reads go through the platform dispatcher" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -674,7 +442,7 @@ test "device verification reads unaligned logical ranges through aligned buffers
         },
     };
     var actual: [513]u8 = undefined;
-    const count = try readTargetDeviceChunk(std.testing.allocator, &target, &actual, 3);
+    const count = try device.target_io.read_at(std.testing.allocator, io, &target, &actual, 3);
 
     try std.testing.expectEqual(actual.len, count);
     try std.testing.expectEqualSlices(u8, contents[3..][0..actual.len], &actual);
@@ -730,6 +498,40 @@ test "flashToPath rejects too-small destination" {
 
     const ranges = [_]ByteRange{.{ .offset = 0, .length = 4 }};
     try std.testing.expectError(error.DestinationTooSmall, flashImage(std.testing.allocator, io, source, destination, 4, &ranges, .{}));
+}
+
+test "flashToPathFromPath writes and verifies planned ranges" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_bytes = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe } ++ [_]u8{0} ** 10;
+    try tmp.dir.writeFile(io, .{ .sub_path = "src.img", .data = &source_bytes });
+
+    const dest_bytes = [_]u8{0} ** source_bytes.len;
+    try tmp.dir.writeFile(io, .{ .sub_path = "dst.img", .data = &dest_bytes });
+
+    const src_path = try tmp.dir.realPathFileAlloc(io, "src.img", std.testing.allocator);
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try tmp.dir.realPathFileAlloc(io, "dst.img", std.testing.allocator);
+    defer std.testing.allocator.free(dst_path);
+
+    const ranges = [_]ByteRange{
+        .{ .offset = 0, .length = 4 },
+        .{ .offset = 10, .length = 6 },
+    };
+
+    const report = try flashToPathFromPath(std.testing.allocator, io, src_path, dst_path, source_bytes.len, &ranges, .{ .block_size = 8, .verify = .written });
+    try std.testing.expectEqual(@as(u64, 10), report.bytes_written);
+    try std.testing.expectEqual(@as(u64, 6), report.bytes_skipped);
+
+    var written_back: [source_bytes.len]u8 = undefined;
+    var dst = try tmp.dir.openFile(io, "dst.img", .{ .mode = .read_only });
+    defer dst.close(io);
+    _ = try dst.readPositionalAll(io, &written_back, 0);
+    try std.testing.expectEqualSlices(u8, source_bytes[0..4], written_back[0..4]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 6, written_back[4..10]);
+    try std.testing.expectEqualSlices(u8, source_bytes[10..16], written_back[10..16]);
 }
 
 const CountedSource = struct {

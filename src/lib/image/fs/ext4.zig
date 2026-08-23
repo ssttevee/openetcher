@@ -1,11 +1,14 @@
 const std = @import("std");
 
 const range = @import("../../range.zig");
+const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
+const driver_api = @import("driver.zig");
 
 pub const ByteRange = range.ByteRange;
 pub const ImageInfo = types.Info;
 pub const PartitionInfo = types.Info.PartitionInfo;
+pub const Reader = reader_mod.Reader;
 
 const superblock_offset: u64 = 1024;
 const superblock_size: usize = 1024;
@@ -57,7 +60,12 @@ const Superblock = struct {
         return @as(u32, 1024) << @intCast(self.log_block_size);
     }
 
+    fn filesystemSize(self: Superblock) !u64 {
+        return std.math.mul(u64, self.blocks_count, try self.blockSize());
+    }
+
     fn groupCount(self: Superblock) !u64 {
+        if (self.blocks_count < self.first_data_block) return error.InvalidExt4Superblock;
         if (self.blocks_per_group == 0) return error.InvalidExt4Superblock;
         return std.math.divCeil(u64, self.blocks_count - self.first_data_block, self.blocks_per_group);
     }
@@ -71,13 +79,103 @@ const GroupDescriptor = struct {
     flags: u16,
 };
 
+/// Reader-core API. All offsets and ranges use reader coordinates.
+pub fn detect(io: std.Io, r: *const Reader) bool {
+    const magic_offset = superblock_offset + 56;
+    if (r.size < magic_offset + 2) return false;
+    const magic = r.readU16LeAt(io, magic_offset) catch return false;
+    return magic == ext4_magic;
+}
+
+/// Reads the block size from the superblock without a full probe.
+pub fn superblockBlockSize(io: std.Io, r: *const Reader) !u32 {
+    const superblock = try readSuperblock(io, r);
+    try validateSuperblock(superblock, r.size);
+    return superblock.blockSize();
+}
+
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) anyerror!PartitionInfo {
+    const superblock = try readSuperblock(io, r);
+    try validateSuperblock(superblock, r.size);
+
+    const ranges = try collectRanges(allocator, io, r);
+    defer allocator.free(ranges);
+
+    var used_bytes: u64 = 0;
+    for (ranges) |segment| used_bytes += segment.length;
+
+    return .{
+        .index = 0,
+        .start_offset = 0,
+        .size = r.size,
+        .partition_type = 0,
+        .filesystem = .ext4,
+        .supported = true,
+        .block_size = try superblock.blockSize(),
+        .used_bytes = used_bytes,
+        .skipped_bytes = r.size - used_bytes,
+        .range_count = ranges.len,
+    };
+}
+
+pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) ![]ByteRange {
+    const superblock = try readSuperblock(io, r);
+    try validateSuperblock(superblock, r.size);
+
+    const block_size = try superblock.blockSize();
+    const blocks_count = superblock.blocks_count;
+    const groups_count = try superblock.groupCount();
+    const desc_size = descriptorSize(superblock);
+    const descriptor_table_blocks = try std.math.divCeil(u64, try std.math.mul(u64, groups_count, desc_size), block_size);
+    const descriptor_table_block: u64 = if (block_size == 1024) 2 else 1;
+    const inode_size = inodeSize(superblock);
+    const inode_table_blocks = try std.math.divCeil(u64, try std.math.mul(u64, inode_size, superblock.inodes_per_group), block_size);
+
+    const descriptors = try allocator.alloc(GroupDescriptor, @intCast(groups_count));
+    defer allocator.free(descriptors);
+    try readGroupDescriptors(io, allocator, r, descriptors, descriptor_table_block, desc_size, block_size);
+
+    const bitmap_buffer = try allocator.alloc(u8, block_size);
+    defer allocator.free(bitmap_buffer);
+
+    var used_blocks: std.ArrayList(ByteRange) = .empty;
+    defer used_blocks.deinit(allocator);
+
+    var group_index: u64 = 0;
+    while (group_index < groups_count) : (group_index += 1) {
+        const descriptor = descriptors[@intCast(group_index)];
+        const group_first_block = superblock.first_data_block + (group_index * superblock.blocks_per_group);
+        const remaining_blocks = blocks_count - group_first_block;
+        const blocks_in_group = @min(@as(u64, superblock.blocks_per_group), remaining_blocks);
+
+        try appendMetadataRanges(allocator, &used_blocks, block_size, group_index, group_first_block, descriptor_table_block, descriptor_table_blocks, descriptor, inode_table_blocks);
+        try readBlock(io, r, descriptor.block_bitmap, block_size, bitmap_buffer);
+
+        var block_in_group: u64 = 0;
+        while (block_in_group < blocks_in_group) : (block_in_group += 1) {
+            if (!bitmapBitIsSet(bitmap_buffer, block_in_group)) continue;
+
+            const block_number = group_first_block + block_in_group;
+            try used_blocks.append(allocator, .{
+                .offset = block_number * block_size,
+                .length = block_size,
+            });
+        }
+    }
+
+    return range.normalizeRanges(allocator, used_blocks.items);
+}
+
+// File-handle wrappers kept for library callers.
+
 pub fn probeExt4Image(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !ImageInfo {
     const ranges = try collectExt4Ranges(io, allocator, file);
     defer allocator.free(ranges);
 
     const image_size = try file.length(io);
-    const superblock = try readSuperblock(io, file, 0);
-    const block_size = try superblock.blockSize();
+    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
+    const r = region.reader();
+    const block_size = try superblockBlockSize(io, &r);
 
     var used_bytes: u64 = 0;
     for (ranges) |segment| used_bytes += segment.length;
@@ -101,7 +199,12 @@ pub fn probeExt4ImageFromPath(allocator: std.mem.Allocator, io: std.Io, image_pa
 }
 
 pub fn collectExt4Ranges(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ![]ByteRange {
-    return collectExt4RangesFromFile(io, allocator, file);
+    const image_size = try file.length(io);
+    try rejectUnsupportedImageLayout(io, file, image_size);
+
+    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
+    const r = region.reader();
+    return collectRanges(allocator, io, &r);
 }
 
 pub fn collectExt4RangesFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) ![]ByteRange {
@@ -112,92 +215,23 @@ pub fn collectExt4RangesFromPath(allocator: std.mem.Allocator, io: std.Io, image
 }
 
 pub fn collectExt4RangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
-    return collectExt4RangesFromFileRegion(io, allocator, file, start_offset, size, false);
-}
-
-fn collectExt4RangesFromFile(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ![]ByteRange {
-    const image_size = try file.length(io);
-    try rejectUnsupportedImageLayout(io, file, image_size);
-    return collectExt4RangesFromFileRegion(io, allocator, file, 0, image_size, false);
+    var region = reader_mod.FileRegion.init(io, file, start_offset, size);
+    const r = region.reader();
+    return collectRanges(allocator, io, &r);
 }
 
 pub fn probeExt4Partition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
-    const superblock = try readSuperblock(io, file, start_offset);
-    try validateSuperblock(superblock, size);
-
-    const ranges = try collectExt4RangesFromFileRegion(io, allocator, file, start_offset, size, true);
-    defer allocator.free(ranges);
-
-    var used_bytes: u64 = 0;
-    for (ranges) |segment| used_bytes += segment.length;
-
-    return .{
-        .index = 0,
-        .start_offset = start_offset,
-        .size = size,
-        .partition_type = 0x83,
-        .filesystem = .ext4,
-        .supported = true,
-        .block_size = try superblock.blockSize(),
-        .used_bytes = used_bytes,
-        .skipped_bytes = size - used_bytes,
-        .range_count = ranges.len,
-    };
+    var region = reader_mod.FileRegion.init(io, file, start_offset, size);
+    const r = region.reader();
+    var partition = try probeRegion(allocator, io, &r);
+    partition.start_offset = start_offset;
+    partition.partition_type = 0x83;
+    return partition;
 }
 
-fn collectExt4RangesFromFileRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64, offset_ranges: bool) ![]ByteRange {
-    const superblock = try readSuperblock(io, file, start_offset);
-    try validateSuperblock(superblock, size);
-
-    const block_size = try superblock.blockSize();
-    const blocks_count = superblock.blocks_count;
-    const groups_count = try superblock.groupCount();
-    const desc_size = descriptorSize(superblock);
-    const descriptors_per_block = @max(@as(u64, 1), block_size / desc_size);
-    const descriptor_table_blocks = try std.math.divCeil(u64, groups_count * desc_size, block_size);
-    const descriptor_table_block: u64 = if (block_size == 1024) 2 else 1;
-    const inode_size = inodeSize(superblock);
-    const inode_table_blocks = try std.math.divCeil(u64, @as(u64, inode_size) * superblock.inodes_per_group, block_size);
-
-    const descriptors = try allocator.alloc(GroupDescriptor, groups_count);
-    defer allocator.free(descriptors);
-    try readGroupDescriptors(io, allocator, file, superblock, descriptors, descriptor_table_block, desc_size, block_size, start_offset);
-
-    const bitmap_buffer = try allocator.alloc(u8, block_size);
-    defer allocator.free(bitmap_buffer);
-
-    var used_blocks: std.ArrayList(ByteRange) = .empty;
-    defer used_blocks.deinit(allocator);
-
-    var group_index: u64 = 0;
-    while (group_index < groups_count) : (group_index += 1) {
-        const descriptor = descriptors[group_index];
-        const group_first_block = superblock.first_data_block + (group_index * superblock.blocks_per_group);
-        const remaining_blocks = blocks_count - group_first_block;
-        const blocks_in_group = @min(@as(u64, superblock.blocks_per_group), remaining_blocks);
-
-        try appendMetadataRanges(allocator, &used_blocks, block_size, group_index, group_first_block, descriptor_table_block, descriptor_table_blocks, descriptors_per_block, descriptor, inode_table_blocks, start_offset, offset_ranges);
-        try readBlock(io, file, descriptor.block_bitmap, block_size, bitmap_buffer, start_offset);
-
-        var block_in_group: u64 = 0;
-        while (block_in_group < blocks_in_group) : (block_in_group += 1) {
-            if (!bitmapBitIsSet(bitmap_buffer, block_in_group)) continue;
-
-            const block_number = group_first_block + block_in_group;
-            try used_blocks.append(allocator, .{
-                .offset = addImageOffset(block_number * block_size, start_offset, offset_ranges),
-                .length = block_size,
-            });
-        }
-    }
-
-    return range.normalizeRanges(allocator, used_blocks.items);
-}
-
-fn readSuperblock(io: std.Io, file: std.Io.File, start_offset: u64) !Superblock {
+fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
     var buffer: [superblock_size]u8 = undefined;
-    const count = try file.readPositionalAll(io, &buffer, start_offset + superblock_offset);
-    if (count != buffer.len) return error.InvalidExt4Superblock;
+    try r.readExactlyAt(io, &buffer, superblock_offset);
 
     const magic = readU16(buffer[56..58]);
     if (magic != ext4_magic) return error.InvalidExt4Superblock;
@@ -265,8 +299,7 @@ fn validateSuperblock(superblock: Superblock, image_size: u64) !void {
     if (superblock.blocks_per_group == 0) return error.InvalidExt4Superblock;
     if (superblock.inodes_per_group == 0) return error.InvalidExt4Superblock;
 
-    const block_size = try superblock.blockSize();
-    const filesystem_size = superblock.blocks_count * block_size;
+    const filesystem_size = try superblock.filesystemSize();
     if (filesystem_size > image_size) return error.InvalidExt4Superblock;
 
     if ((superblock.feature_compat & ~supported_compat) != 0) return error.UnsupportedExt4CompatFeature;
@@ -285,15 +318,14 @@ fn inodeSize(superblock: Superblock) u16 {
     return if (superblock.inode_size >= 128) superblock.inode_size else 128;
 }
 
-fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, superblock: Superblock, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32, start_offset: u64) !void {
+fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, r: *const Reader, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32) !void {
     var descriptor_buffer = try allocator.alloc(u8, @intCast(desc_size));
     defer allocator.free(descriptor_buffer);
 
-    const table_offset = start_offset + (descriptor_table_block * block_size);
+    const table_offset = descriptor_table_block * block_size;
     for (descriptors, 0..) |*descriptor, index| {
         const offset = table_offset + (index * desc_size);
-        const count = try file.readPositionalAll(io, descriptor_buffer, offset);
-        if (count != descriptor_buffer.len) return error.InvalidExt4Superblock;
+        try r.readExactlyAt(io, descriptor_buffer, offset);
 
         const block_bitmap_lo = readU32(descriptor_buffer[0..4]);
         const inode_bitmap_lo = readU32(descriptor_buffer[4..8]);
@@ -312,34 +344,26 @@ fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, file: std.Io.F
             .free_blocks_count = (@as(u32, free_blocks_hi) << 16) | free_blocks_lo,
             .flags = flags,
         };
-        _ = superblock;
     }
 }
 
-fn appendMetadataRanges(allocator: std.mem.Allocator, list: *std.ArrayList(ByteRange), block_size: u32, group_index: u64, group_first_block: u64, descriptor_table_block: u64, descriptor_table_blocks: u64, descriptors_per_block: u64, descriptor: GroupDescriptor, inode_table_blocks: u64, start_offset: u64, offset_ranges: bool) !void {
-    _ = descriptors_per_block;
-
+fn appendMetadataRanges(allocator: std.mem.Allocator, list: *std.ArrayList(ByteRange), block_size: u32, group_index: u64, group_first_block: u64, descriptor_table_block: u64, descriptor_table_blocks: u64, descriptor: GroupDescriptor, inode_table_blocks: u64) !void {
     if (groupIndexHasSuperblock(group_index)) {
         const superblock_block: u64 = if (group_index == 0 and block_size == 1024) 1 else group_first_block;
-        try list.append(allocator, .{ .offset = addImageOffset(superblock_block * block_size, start_offset, offset_ranges), .length = block_size });
+        try list.append(allocator, .{ .offset = superblock_block * block_size, .length = block_size });
 
         const descriptor_block = if (group_index == 0) descriptor_table_block else superblock_block + 1;
-        try list.append(allocator, .{ .offset = addImageOffset(descriptor_block * block_size, start_offset, offset_ranges), .length = descriptor_table_blocks * block_size });
+        try list.append(allocator, .{ .offset = descriptor_block * block_size, .length = descriptor_table_blocks * block_size });
     }
 
-    try list.append(allocator, .{ .offset = addImageOffset(descriptor.block_bitmap * block_size, start_offset, offset_ranges), .length = block_size });
-    try list.append(allocator, .{ .offset = addImageOffset(descriptor.inode_bitmap * block_size, start_offset, offset_ranges), .length = block_size });
-    try list.append(allocator, .{ .offset = addImageOffset(descriptor.inode_table * block_size, start_offset, offset_ranges), .length = inode_table_blocks * block_size });
+    try list.append(allocator, .{ .offset = descriptor.block_bitmap * block_size, .length = block_size });
+    try list.append(allocator, .{ .offset = descriptor.inode_bitmap * block_size, .length = block_size });
+    try list.append(allocator, .{ .offset = descriptor.inode_table * block_size, .length = inode_table_blocks * block_size });
 }
 
-fn readBlock(io: std.Io, file: std.Io.File, block_number: u64, block_size: u32, buffer: []u8, start_offset: u64) !void {
+fn readBlock(io: std.Io, r: *const Reader, block_number: u64, block_size: u32, buffer: []u8) !void {
     if (buffer.len < block_size) return error.InternalBufferTooSmall;
-    const count = try file.readPositionalAll(io, buffer[0..block_size], start_offset + (block_number * block_size));
-    if (count != block_size) return error.InvalidExt4Superblock;
-}
-
-fn addImageOffset(offset: u64, start_offset: u64, offset_ranges: bool) u64 {
-    return if (offset_ranges) start_offset + offset else offset;
+    try r.readExactlyAt(io, buffer[0..block_size], block_number * block_size);
 }
 
 fn bitmapBitIsSet(buffer: []const u8, index: u64) bool {
@@ -368,6 +392,19 @@ fn readU32(bytes: []const u8) u32 {
     return std.mem.readInt(u32, bytes[0..4], .little);
 }
 
+pub const driver: driver_api.Driver = .{
+    .detect = detectImpl,
+    .probe_region = probeRegion,
+    .collect_ranges = collectRanges,
+    .raw_layout = .raw_ext4,
+    .filesystem_tag = .ext4,
+    .block_size_fn = superblockBlockSize,
+};
+
+fn detectImpl(io: std.Io, r: *const Reader) bool {
+    return detect(io, r);
+}
+
 test "group index sparse super selection" {
     try std.testing.expect(groupIndexHasSuperblock(0));
     try std.testing.expect(groupIndexHasSuperblock(1));
@@ -379,37 +416,21 @@ test "group index sparse super selection" {
     try std.testing.expect(!groupIndexHasSuperblock(11));
 }
 
-test "probeExt4Image rejects invalid magic" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var file = try tmp.dir.createFile(io, "invalid.img", .{ .read = true });
-    defer file.close(io);
-
+test "detect accepts valid magic through buffer reader" {
     var bytes = [_]u8{0} ** 4096;
-    try file.writeStreamingAll(io, &bytes);
-    try file.sync(io);
+    std.mem.writeInt(u16, bytes[1024 + 56 ..][0..2], ext4_magic, .little);
+    // Minimal plausible geometry so validate passes during probe paths.
+    std.mem.writeInt(u32, bytes[1024 + 4 ..][0..4], 512, .little); // blocks_count
+    std.mem.writeInt(u32, bytes[1024 + 24 ..][0..4], 0, .little); // log_block_size
+    std.mem.writeInt(u32, bytes[1024 + 32 ..][0..4], 8, .little); // blocks_per_group
+    std.mem.writeInt(u32, bytes[1024 + 40 ..][0..4], 16, .little); // inodes_per_group
 
-    try std.testing.expectError(error.InvalidExt4Superblock, collectExt4RangesFromFile(io, std.testing.allocator, file));
-}
+    var source = reader_mod.Buffer.init(&bytes);
+    const r = source.reader();
+    try std.testing.expect(detect(std.testing.io, &r));
 
-test "collectExt4Ranges rejects mbr disk images" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var file = try tmp.dir.createFile(io, "disk.img", .{ .read = true });
-    defer file.close(io);
-
-    var bytes = [_]u8{0} ** 4096;
-    bytes[446 + 4] = 0x83;
-    std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 2048, .little);
-    std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);
-    std.mem.writeInt(u16, bytes[510..512], 0xAA55, .little);
-
-    try file.writeStreamingAll(io, &bytes);
-    try file.sync(io);
-
-    try std.testing.expectError(error.UnsupportedImageLayout, collectExt4RangesFromFile(io, std.testing.allocator, file));
+    bytes[1024 + 56] ^= 0xff;
+    var bad = reader_mod.Buffer.init(&bytes);
+    const br = bad.reader();
+    try std.testing.expect(!detect(std.testing.io, &br));
 }

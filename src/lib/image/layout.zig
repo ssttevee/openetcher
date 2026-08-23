@@ -1,39 +1,15 @@
 const std = @import("std");
-const range = @import("../range.zig");
-const fs = @import("fs.zig");
 
-pub const ByteRange = range.ByteRange;
-pub const mbr = @import("layout/mbr.zig");
+const types = @import("types.zig");
+const mbr_mod = @import("layout/mbr.zig");
 
-pub const Layout = enum {
-    raw_ext4,
-    raw_iso9660,
-    mbr,
-};
+/// Canonical layout enum. All other copies were merged into this one.
+pub const Layout = types.Info.Layout;
 
-pub const Confidence = enum {
-    none,
-    possible,
-    likely,
-    exact,
-};
+pub const driver = @import("layout/driver.zig");
+pub const mbr = mbr_mod;
 
-pub const PartitionProbe = struct {
-    index: u8,
-    offset: u64,
-    length: u64,
-    partition_type: u8,
-    filesystem: ?fs.Filesystem = null,
-};
-
-pub const ProbeResult = struct {
-    layout: Layout,
-    filesystem: ?fs.Filesystem,
-    confidence: Confidence,
-    required_image_size: ?u64,
-    partitions: []PartitionProbe,
-
-    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        if (self.partitions.len != 0) allocator.free(self.partitions);
-    }
-};
+comptime {
+    _ = &driver;
+    _ = &mbr;
+}

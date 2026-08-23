@@ -1,12 +1,8 @@
 const std = @import("std");
 
-pub const Compression = enum {
-    none,
-    gzip,
-    xz,
-    zstd,
-    bzip2,
-};
+const codec_api = @import("compression/codec.zig");
+
+pub const Compression = codec_api.Compression;
 
 pub const Metadata = struct {
     compression: Compression,
@@ -14,14 +10,7 @@ pub const Metadata = struct {
     image_size: ?u64,
 };
 
-pub const SourcePolicy = enum {
-    streaming,
-    materialize_if_needed,
-    materialize,
-};
-
 pub const SourceOptions = struct {
-    policy: SourcePolicy = .streaming,
     max_image_size: ?u64 = null,
 };
 
@@ -48,6 +37,9 @@ pub const Stream = struct {
     context: ?*anyopaque = null,
     deinit_fn: ?*const fn (context: *anyopaque) void = null,
     translate_errors: bool = false,
+    /// Optional forward jump for random-access sources. When present,
+    /// `discardTo` seeks instead of reading through the skipped bytes.
+    seek_to_fn: ?*const fn (context: *anyopaque, position: u64) anyerror!void = null,
 
     pub fn read(self: *@This(), buffer: []u8) !usize {
         if (buffer.len == 0) return 0;
@@ -86,6 +78,12 @@ pub const Stream = struct {
 
     pub fn discardTo(self: *@This(), offset: u64) !void {
         if (offset < self.position) return error.BackwardStreamRequest;
+        if (self.seek_to_fn) |seek_fn| {
+            const context = self.context orelse return error.BackwardStreamRequest;
+            try seek_fn(context, offset);
+            self.position = offset;
+            return;
+        }
         var scratch: [16 * 1024]u8 = undefined;
         while (self.position < offset) {
             const remaining = offset - self.position;
@@ -147,66 +145,38 @@ const RawStreamContext = struct {
     }
 };
 
-const EagerStreamContext = struct {
-    decoded: []u8,
-    reader: std.Io.Reader,
-    allocator: std.mem.Allocator,
-
-    fn destroy(context: *anyopaque) void {
-        const self: *EagerStreamContext = @ptrCast(@alignCast(context));
-        self.allocator.free(self.decoded);
-        self.allocator.destroy(self);
-    }
-};
-
-const Decoder = union(Compression) {
-    none: void,
-    gzip: std.compress.flate.Decompress,
-    xz: std.compress.xz.Decompress,
-    zstd: std.compress.zstd.Decompress,
-    bzip2: void,
-};
-
+/// Hosts the encoded-byte pipeline plus one registry-provided decoder.
 const DecodedStreamContext = struct {
     file: std.Io.File,
     file_reader: std.Io.File.Reader,
     input_buffer: []u8,
-    decoder_buffer: []u8,
-    decoder: Decoder,
     reader: *std.Io.Reader,
+    translate_errors: bool,
+    codec_context: ?*anyopaque,
+    codec_deinit_fn: ?*const fn (std.mem.Allocator, *anyopaque) void,
     allocator: std.mem.Allocator,
     io: std.Io,
-    compression: Compression,
 
     fn destroy(context: *anyopaque) void {
         const self: *DecodedStreamContext = @ptrCast(@alignCast(context));
-        switch (self.compression) {
-            .xz => self.decoder.xz.deinit(),
-            else => {},
+        if (self.codec_context) |codec_context| {
+            if (self.codec_deinit_fn) |codec_deinit_fn| codec_deinit_fn(self.allocator, codec_context);
         }
         self.file.close(self.io);
         self.allocator.free(self.input_buffer);
-        self.allocator.free(self.decoder_buffer);
         self.allocator.destroy(self);
     }
 };
 
 pub fn detectCompression(magic: []const u8) Compression {
-    const gzip_magic = &.{ 0x1f, 0x8b };
-    const xz_magic = &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 };
-    const zstd_magic = &.{ 0x28, 0xb5, 0x2f, 0xfd };
-    const bzip2_magic = "BZh";
-    if (hasMagicPrefix(magic, gzip_magic)) return .gzip;
-    if (hasMagicPrefix(magic, xz_magic)) return .xz;
-    if (hasMagicPrefix(magic, zstd_magic)) return .zstd;
-    if (hasMagicPrefix(magic, bzip2_magic)) return .bzip2;
-    return .none;
+    return codec_api.detect(magic);
 }
 
-fn hasMagicPrefix(bytes: []const u8, magic: []const u8) bool {
-    if (bytes.len == 0) return false;
-    if (bytes.len < magic.len) return std.mem.eql(u8, bytes, magic[0..bytes.len]);
-    return std.mem.eql(u8, bytes[0..magic.len], magic);
+fn codecFor(compression: Compression) ?*const codec_api.Codec {
+    for (&codec_api.codecs) |*candidate| {
+        if (candidate.id == compression) return candidate;
+    }
+    return null;
 }
 
 pub fn openImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: SourceOptions) !ImageSource {
@@ -258,8 +228,7 @@ fn openPathStream(context: *anyopaque, io: std.Io, allocator: std.mem.Allocator)
     const source: *PathContext = @ptrCast(@alignCast(context));
     return switch (source.compression) {
         .none => openRawStream(source, io, allocator),
-        .bzip2 => openBzip2Stream(source, io, allocator),
-        .gzip, .xz, .zstd => openDecodedStream(source, io, allocator),
+        else => openDecodedStream(source, io, allocator),
     };
 }
 
@@ -289,6 +258,8 @@ fn openRawStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator)
 }
 
 fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator) !Stream {
+    const codec = codecFor(source.compression) orelse return error.UnsupportedCompression;
+
     var file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
     errdefer file.close(io);
 
@@ -297,91 +268,47 @@ fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Alloca
 
     const input_buffer = try allocator.alloc(u8, 64 * 1024);
     errdefer allocator.free(input_buffer);
-    var decoder_buffer: []u8 = &.{};
-    errdefer if (decoder_buffer.len != 0) allocator.free(decoder_buffer);
 
-    context.* = undefined;
-    context.file = file;
-    context.file_reader = std.Io.File.Reader.initStreaming(file, io, input_buffer);
-    context.input_buffer = input_buffer;
-    context.decoder_buffer = decoder_buffer;
-    context.allocator = allocator;
-    context.io = io;
-    context.compression = source.compression;
+    context.* = .{
+        .file = file,
+        .file_reader = std.Io.File.Reader.initStreaming(file, io, input_buffer),
+        .input_buffer = input_buffer,
+        .reader = undefined,
+        .translate_errors = false,
+        .codec_context = null,
+        .codec_deinit_fn = null,
+        .allocator = allocator,
+        .io = io,
+    };
 
-    switch (source.compression) {
-        .gzip => {
-            decoder_buffer = try allocator.alloc(u8, std.compress.flate.max_window_len);
-            context.decoder_buffer = decoder_buffer;
-            context.decoder = .{ .gzip = std.compress.flate.Decompress.init(&context.file_reader.interface, .gzip, decoder_buffer) };
-            context.reader = &context.decoder.gzip.reader;
-        },
-        .xz => {
-            context.decoder = .{ .xz = std.compress.xz.Decompress.init(&context.file_reader.interface, allocator, &.{}) catch return error.InvalidCompressedImage };
-            context.reader = &context.decoder.xz.reader;
-        },
-        .zstd => {
-            decoder_buffer = try allocator.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
-            context.decoder_buffer = decoder_buffer;
-            context.decoder = .{ .zstd = std.compress.zstd.Decompress.init(&context.file_reader.interface, decoder_buffer, .{}) };
-            context.reader = &context.decoder.zstd.reader;
-        },
-        else => return error.UnsupportedCompression,
-    }
+    const opened = codec.open(.{
+        .allocator = allocator,
+        .encoded_reader = &context.file_reader.interface,
+        .io = io,
+        .path = source.path,
+        .max_image_size = source.max_image_size,
+    }) catch |err| {
+        // The context owns the file and input buffer; free them before bubbling.
+        allocator.free(input_buffer);
+        allocator.destroy(context);
+        file.close(io);
+        return err;
+    };
+    errdefer if (opened.deinit_fn) |deinit_fn| {
+        if (opened.context) |codec_context| deinit_fn(allocator, codec_context);
+    };
+
+    context.reader = opened.reader;
+    context.translate_errors = opened.translate_errors;
+    context.codec_context = opened.context;
+    context.codec_deinit_fn = opened.deinit_fn;
 
     return .{
-        .reader = context.reader,
+        .reader = opened.reader,
         .max_image_size = source.max_image_size,
         .context = context,
         .deinit_fn = DecodedStreamContext.destroy,
-        .translate_errors = true,
-    };
-}
-
-fn openBzip2Stream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator) !Stream {
-    const stdout_limit: std.Io.Limit = if (source.max_image_size) |limit| blk: {
-        const limit_plus_one = std.math.add(u64, limit, 1) catch return error.DecompressedImageTooLarge;
-        break :blk if (std.math.cast(usize, limit_plus_one)) |value| .limited(value) else .unlimited;
-    } else .unlimited;
-    const result = std.process.run(allocator, io, .{
-        .argv = &.{ "bzip2", "-dc", source.path },
-        .stdout_limit = stdout_limit,
-        .stderr_limit = .limited(16 * 1024),
-    }) catch |err| switch (err) {
-        error.StreamTooLong => return error.DecompressedImageTooLarge,
-        else => return error.InvalidCompressedImage,
-    };
-    defer allocator.free(result.stderr);
-    if (source.max_image_size) |limit| {
-        if (result.stdout.len > limit) {
-            allocator.free(result.stdout);
-            return error.DecompressedImageTooLarge;
-        }
-    }
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(result.stdout);
-            return error.InvalidCompressedImage;
-        },
-        else => {
-            allocator.free(result.stdout);
-            return error.InvalidCompressedImage;
-        },
-    }
-
-    const context = try allocator.create(EagerStreamContext);
-    errdefer allocator.destroy(context);
-    context.* = .{
-        .decoded = result.stdout,
-        .reader = std.Io.Reader.fixed(result.stdout),
-        .allocator = allocator,
-    };
-    return .{
-        .reader = &context.reader,
-        .max_image_size = source.max_image_size,
-        .context = context,
-        .deinit_fn = EagerStreamContext.destroy,
+        .translate_errors = opened.translate_errors,
     };
 }
 

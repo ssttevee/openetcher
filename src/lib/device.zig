@@ -47,6 +47,14 @@ pub const OpenTarget = struct {
     }
 };
 
+/// Platform-provided target operations. The flash engine calls only these;
+/// alignment, padding, and syscall strategy live in each platform backend.
+pub const TargetIo = struct {
+    write_at: *const fn (allocator: std.mem.Allocator, io: std.Io, target: *OpenTarget, bytes: []const u8, offset: u64) anyerror!void,
+    read_at: *const fn (allocator: std.mem.Allocator, io: std.Io, target: *OpenTarget, buffer: []u8, offset: u64) anyerror!usize,
+    sync: *const fn (io: std.Io, target: *OpenTarget) anyerror!void,
+};
+
 pub const ListOptions = struct {
     include_system: bool = false,
 };
@@ -109,3 +117,4 @@ pub const prepareTarget = platform.prepareTarget;
 pub const listCandidateDisks = platform.listCandidateDisks;
 pub const resolveDiskId = platform.resolveDiskId;
 pub const lookupDiskByPath = platform.lookupDiskByPath;
+pub const target_io = platform.target_io;

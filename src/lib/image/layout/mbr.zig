@@ -1,5 +1,8 @@
 const std = @import("std");
 
+const reader_mod = @import("../reader.zig");
+const driver_api = @import("driver.zig");
+
 pub const sector_size: usize = 512;
 pub const partition_entry_offset: usize = 446;
 pub const partition_entry_size: usize = 16;
@@ -58,6 +61,26 @@ pub fn collectPartitionSpans(allocator: std.mem.Allocator, sector: *const [secto
     return result;
 }
 
+fn detect(io: std.Io, r: *const reader_mod.Reader) bool {
+    if (r.size < sector_size) return false;
+
+    var buffer: [sector_size]u8 = undefined;
+    r.readExactlyAt(io, &buffer, 0) catch return false;
+    return looksLikeMbr(&buffer);
+}
+
+fn collectSpans(allocator: std.mem.Allocator, io: std.Io, r: *const reader_mod.Reader) ![]driver_api.Span {
+    var buffer: [sector_size]u8 = undefined;
+    try r.readExactlyAt(io, &buffer, 0);
+    return collectPartitionSpans(allocator, &buffer, r.size);
+}
+
+pub const driver: driver_api.Driver = .{
+    .id = .mbr,
+    .detect = detect,
+    .collect_spans = collectSpans,
+};
+
 fn lessByOffset(_: void, lhs: PartitionSpan, rhs: PartitionSpan) bool {
     if (lhs.start_offset != rhs.start_offset) return lhs.start_offset < rhs.start_offset;
     return lhs.index < rhs.index;
@@ -96,4 +119,23 @@ test "partition spans are sorted by logical offset" {
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(u8, 2), spans[0].index);
     try std.testing.expectEqual(@as(u8, 1), spans[1].index);
+}
+
+test "layout driver detects an mbr image through a buffer reader" {
+    var bytes = [_]u8{0} ** (2048 * 512);
+    bytes[446 + 4] = 0x06;
+    std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 1, .little);
+    std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);
+    std.mem.writeInt(u16, bytes[510..512], 0xAA55, .little);
+
+    var source = reader_mod.Buffer.init(&bytes);
+    const r = source.reader();
+    const io = std.testing.io;
+
+    try std.testing.expect(driver.detect(io, &r));
+
+    const spans = try driver.collect_spans(std.testing.allocator, io, &r);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+    try std.testing.expectEqual(@as(u64, 512), spans[0].start_offset);
 }

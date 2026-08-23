@@ -435,3 +435,7 @@ test "parseDiskInfo keeps external mounted disks" {
     try std.testing.expectEqual(@as(usize, 1), disk.mount_points.len);
     try std.testing.expectEqualStrings("/Volumes/UNTITLED", disk.mount_points[0].path);
 }
+
+const target_io_api = @import("target_io.zig");
+
+pub const target_io: device.TargetIo = target_io_api.posix_dispatcher;
