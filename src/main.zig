@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const image_path = parsed.image_path;
-        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{}) catch |err| {
+        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map) }) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const image_path = parsed.image_path;
-        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{}) catch |err| {
+        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map) }) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -217,7 +217,7 @@ pub fn main(init: std.process.Init) !void {
 
         var progress = ProgressState{ .writer = stderr, .humanize = parsed.humanize };
         const start_time = std.Io.Clock.awake.now(io);
-        var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{}) catch |err| {
+        var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map) }) catch |err| {
             try progress.finish();
             try writeUserError(stderr, err);
             try stderr.flush();
@@ -267,22 +267,39 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn writeUsage(writer: *std.Io.Writer) !void {
-    try writer.print("usage:\n  openetcher info [-h] [--json] <image>\n  openetcher plan [-h] [--json] <image>\n  openetcher disks [-h] [--json] [--all]\n  openetcher flash [-h] [--force] <image> <device>\n  openetcher flash [-h] [--force] <image> --disk-id <id>\n", .{});
+    try writer.print("usage:\n  openetcher info [-h] [--json] [--spool-dir <dir>] <image>\n  openetcher plan [-h] [--json] [--spool-dir <dir>] <image>\n  openetcher disks [-h] [--json] [--all]\n  openetcher flash [-h] [--force] [--spool-dir <dir>] <image> <device>\n  openetcher flash [-h] [--force] [--spool-dir <dir>] <image> --disk-id <id>\n\ncompressed images are decoded once into --spool-dir (default: $TMPDIR)\n", .{});
+}
+
+/// Directory for decoded copies of compressed images, from the usual
+/// temporary-directory variables. Null falls back to the library default.
+fn defaultSpoolDir(environ: *const std.process.Environ.Map) ?[]const u8 {
+    for ([_][]const u8{ "TMPDIR", "TMP", "TEMP" }) |name| {
+        if (environ.get(name)) |value| if (value.len != 0) return value;
+    }
+    return null;
 }
 
 const OutputArgs = struct {
     image_path: []const u8,
     json: bool = false,
     humanize: bool = false,
+    spool_dir: ?[]const u8 = null,
 };
 
 fn parseOutputArgs(args: []const []const u8) !OutputArgs {
     var image_path: ?[]const u8 = null;
     var json = false;
     var humanize = false;
+    var spool_dir: ?[]const u8 = null;
+    var index: usize = 0;
 
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--spool-dir")) {
+            if (spool_dir != null or index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            spool_dir = args[index];
+        } else if (std.mem.eql(u8, arg, "--json")) {
             if (json) return error.InvalidArguments;
             json = true;
         } else if (std.mem.eql(u8, arg, "-h")) {
@@ -299,6 +316,7 @@ fn parseOutputArgs(args: []const []const u8) !OutputArgs {
         .image_path = image_path orelse return error.InvalidArguments,
         .json = json,
         .humanize = humanize,
+        .spool_dir = spool_dir,
     };
 }
 
@@ -312,6 +330,7 @@ const FlashArgs = struct {
     image_path: []const u8,
     humanize: bool = false,
     force: bool = false,
+    spool_dir: ?[]const u8 = null,
     target: union(enum) {
         path: []const u8,
         disk_id: []const u8,
@@ -347,6 +366,7 @@ fn parseFlashArgs(args: []const []const u8) !FlashArgs {
     var disk_id: ?[]const u8 = null;
     var humanize = false;
     var force = false;
+    var spool_dir: ?[]const u8 = null;
     var index: usize = 0;
 
     while (index < args.len) : (index += 1) {
@@ -359,6 +379,12 @@ fn parseFlashArgs(args: []const []const u8) !FlashArgs {
         if (std.mem.eql(u8, arg, "--force")) {
             if (force) return error.InvalidArguments;
             force = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--spool-dir")) {
+            if (spool_dir != null or index + 1 >= args.len) return error.InvalidArguments;
+            index += 1;
+            spool_dir = args[index];
             continue;
         }
         if (std.mem.eql(u8, arg, "--disk-id")) {
@@ -383,6 +409,7 @@ fn parseFlashArgs(args: []const []const u8) !FlashArgs {
             .image_path = image,
             .humanize = humanize,
             .force = force,
+            .spool_dir = spool_dir,
             .target = .{ .disk_id = id },
         };
     }
@@ -390,6 +417,7 @@ fn parseFlashArgs(args: []const []const u8) !FlashArgs {
         .image_path = image,
         .humanize = humanize,
         .force = force,
+        .spool_dir = spool_dir,
         .target = .{ .path = device_path orelse return error.InvalidArguments },
     };
 }
@@ -646,6 +674,12 @@ fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {
         },
         error.AmbiguousDiskId => {
             try writer.print("ambiguous disk id: run `openetcher disks --all --json` and choose a more specific target\n", .{});
+        },
+        error.SpoolDirectoryFull => {
+            try writer.print("not enough space to decompress the image into the spool directory; pass --spool-dir <dir> on a larger volume, or flash with --force to stream without planning\n", .{});
+        },
+        error.SpoolDirectoryUnavailable => {
+            try writer.print("cannot create the decompressed image in the spool directory; pass --spool-dir <dir> with a writable directory\n", .{});
         },
         error.ProtectedTargetRequiresForce => {
             try writer.print("refusing to write a protected system disk without --force\n", .{});

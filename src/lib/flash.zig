@@ -602,3 +602,43 @@ test "source flashing uses replay passes and digest verification" {
     _ = try flashSource(std.testing.allocator, io, &force_source, force_path, .{ .strategy = .force_full_streaming, .verify = .digest });
     try std.testing.expectEqual(@as(usize, 1), force_context.passes);
 }
+
+test "compressed sources decode once for plan, flash, and source verification" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_testing = @import("image/source.zig").testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const spool_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(spool_dir);
+
+    const bytes = try source_testing.sparseImage(allocator);
+    defer allocator.free(bytes);
+    bytes[16 * 2048] = 1;
+    @memcpy(bytes[16 * 2048 + 1 ..][0..5], "CD001");
+    bytes[16 * 2048 + 6] = 1;
+    const path = try source_testing.writeGzip(allocator, io, tmp.dir, "image.iso.gz", bytes);
+    defer allocator.free(path);
+
+    {
+        var destination = try tmp.dir.createFile(io, "target.img", .{ .read = true });
+        defer destination.close(io);
+        try destination.setLength(io, bytes.len);
+    }
+    const target_path = try tmp.dir.realPathFileAlloc(io, "target.img", allocator);
+    defer allocator.free(target_path);
+
+    var image_source = try root.openImageSourceFromPath(allocator, io, path, .{ .spool_dir = spool_dir });
+    defer image_source.deinit(allocator);
+    const plan = try root.planImageFlashSource(allocator, io, &image_source, .{});
+    defer plan.deinit(allocator);
+
+    // Every later pass must replay the spool; decoding again would fail.
+    try tmp.dir.deleteFile(io, "image.iso.gz");
+    const report = try flashPlannedSource(allocator, io, &image_source, target_path, plan, .{ .verify = .reread_source, .prepare_target = false });
+    try std.testing.expectEqual(@as(u64, bytes.len), report.bytes_written);
+
+    const written = try tmp.dir.readFileAlloc(io, "target.img", allocator, .unlimited);
+    defer allocator.free(written);
+    try std.testing.expectEqualSlices(u8, bytes, written);
+}

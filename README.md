@@ -66,12 +66,14 @@ zig build -Doptimize=ReleaseFast
 ## Command-Line Interface
 
 ```text
-openetcher info [--json] <image>
-openetcher plan [--json] <image>
+openetcher info [--json] [--spool-dir <dir>] <image>
+openetcher plan [--json] [--spool-dir <dir>] <image>
 openetcher disks [--json] [--all]
-openetcher flash [--force] <image> <device>
-openetcher flash [--force] <image> --disk-id <id>
+openetcher flash [--force] [--spool-dir <dir>] <image> <device>
+openetcher flash [--force] [--spool-dir <dir>] <image> --disk-id <id>
 ```
+
+`--spool-dir` sets where compressed images are decoded; see [Compressed images](#compressed-images).
 
 ### `info`
 
@@ -260,6 +262,14 @@ The flash implementation operates in these stages:
 5. Write each planned range in chunks.
 6. Sync the target.
 7. Verify each planned range against the source image, unless verification is disabled through the library API.
+
+### Compressed images
+
+Planning needs random access to the decoded image, so a compressed image is decoded once into a sparse temporary file (the spool) in `--spool-dir`, which defaults to `$TMPDIR`, `$TMP`, or `$TEMP`. All-zero chunks are left as holes, so the spool usually occupies about as much disk as the data that will be written. Planning, writing, and source verification all read the spool, so the image is decompressed only once.
+
+On macOS and Linux the spool is unlinked as soon as it is created, so an interrupted run leaves nothing behind. If the spool directory is full, `flash` fails before writing anything; pass a larger `--spool-dir`, or use `--force` to stream straight from the decoder without a plan.
+
+Uncompressed images are analyzed in place and need no spool.
 
 Default chunk size is 1 MiB. Device writes use the backend's alignment requirement. The macOS backend uses 512-byte device alignment and pads a non-aligned final chunk as needed for raw device I/O.
 

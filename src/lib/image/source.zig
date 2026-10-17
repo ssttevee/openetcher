@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const codec_api = @import("compression/codec.zig");
 const reader_mod = @import("reader.zig");
@@ -13,7 +14,13 @@ pub const Metadata = struct {
 
 pub const SourceOptions = struct {
     max_image_size: ?u64 = null,
+    /// Directory for the decoded copy of a compressed image. Defaults to
+    /// `/tmp`, or the working directory on Windows.
+    spool_dir: ?[]const u8 = null,
 };
+
+const default_spool_dir = if (builtin.os.tag == .windows) "." else "/tmp";
+const spool_chunk_size = 1024 * 1024;
 
 /// A random-access view over decoded image bytes, backed by an open file.
 ///
@@ -133,24 +140,48 @@ const PathContext = struct {
     compression: Compression,
     encoded_size: u64,
     max_image_size: ?u64,
+    spool_dir: ?[]u8,
+    /// Decoded copy of a compressed image, created on first random access.
+    spool: ?Spool = null,
 };
 
-const RawStreamContext = struct {
+/// Decoded copy of a compressed image on disk. Analysis, flashing, and
+/// verification all read it, so the codec runs once per source.
+const Spool = struct {
     file: std.Io.File,
+    io: std.Io,
+    size: u64,
+    /// Directory entry still to remove on close; null once unlinked.
+    path: ?[]u8,
+
+    fn close(self: *Spool, allocator: std.mem.Allocator) void {
+        self.file.close(self.io);
+        if (self.path) |path| {
+            std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+            allocator.free(path);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Streams a file positionally, so `discardTo` seeks instead of reading.
+const FileStreamContext = struct {
+    file: std.Io.File,
+    owns_file: bool,
     file_reader: std.Io.File.Reader,
     buffer: []u8,
     allocator: std.mem.Allocator,
     io: std.Io,
 
     fn destroy(context: *anyopaque) void {
-        const self: *RawStreamContext = @ptrCast(@alignCast(context));
-        self.file.close(self.io);
+        const self: *FileStreamContext = @ptrCast(@alignCast(context));
+        if (self.owns_file) self.file.close(self.io);
         self.allocator.free(self.buffer);
         self.allocator.destroy(self);
     }
 
     fn seekTo(context: *anyopaque, position: u64) anyerror!void {
-        const self: *RawStreamContext = @ptrCast(@alignCast(context));
+        const self: *FileStreamContext = @ptrCast(@alignCast(context));
         try self.file_reader.seekTo(position);
     }
 };
@@ -208,8 +239,10 @@ pub fn openImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, path: [
         .compression = compression,
         .encoded_size = stat.size,
         .max_image_size = options.max_image_size,
+        .spool_dir = null,
     };
     errdefer allocator.free(context.path);
+    if (options.spool_dir) |spool_dir| context.spool_dir = try allocator.dupe(u8, spool_dir);
 
     return .{
         .context = context,
@@ -230,29 +263,35 @@ pub fn openImageSource(allocator: std.mem.Allocator, io: std.Io, path: []const u
 
 fn destroyPathContext(context: *anyopaque, allocator: std.mem.Allocator) void {
     const self: *PathContext = @ptrCast(@alignCast(context));
+    if (self.spool) |*spool| spool.close(allocator);
+    if (self.spool_dir) |spool_dir| allocator.free(spool_dir);
     allocator.free(self.path);
     allocator.destroy(self);
 }
 
 fn openPathStream(context: *anyopaque, io: std.Io, allocator: std.mem.Allocator) !Stream {
     const source: *PathContext = @ptrCast(@alignCast(context));
-    return switch (source.compression) {
-        .none => openRawStream(source, io, allocator),
-        else => openDecodedStream(source, io, allocator),
-    };
+    if (source.spool) |spool| return openFileStream(source, io, allocator, spool.file, false);
+    switch (source.compression) {
+        .none => {
+            const file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
+            errdefer file.close(io);
+            return openFileStream(source, io, allocator, file, true);
+        },
+        else => return openDecodedStream(source, io, allocator),
+    }
 }
 
-fn openRawStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator) !Stream {
-    var file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
-    errdefer file.close(io);
-
-    const stream_context = try allocator.create(RawStreamContext);
+/// On success the stream takes `file` when `owns_file` is set.
+fn openFileStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, owns_file: bool) !Stream {
+    const stream_context = try allocator.create(FileStreamContext);
     errdefer allocator.destroy(stream_context);
     const buffer = try allocator.alloc(u8, 64 * 1024);
     errdefer allocator.free(buffer);
 
     stream_context.* = .{
         .file = file,
+        .owns_file = owns_file,
         .file_reader = std.Io.File.Reader.init(file, io, buffer),
         .buffer = buffer,
         .allocator = allocator,
@@ -263,8 +302,8 @@ fn openRawStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator)
         .reader = &stream_context.file_reader.interface,
         .max_image_size = source.max_image_size,
         .context = stream_context,
-        .deinit_fn = RawStreamContext.destroy,
-        .seek_to_fn = RawStreamContext.seekTo,
+        .deinit_fn = FileStreamContext.destroy,
+        .seek_to_fn = FileStreamContext.seekTo,
     };
 }
 
@@ -292,19 +331,13 @@ fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Alloca
         .io = io,
     };
 
-    const opened = codec.open(.{
+    const opened = try codec.open(.{
         .allocator = allocator,
         .encoded_reader = &context.file_reader.interface,
         .io = io,
         .path = source.path,
         .max_image_size = source.max_image_size,
-    }) catch |err| {
-        // The context owns the file and input buffer; free them before bubbling.
-        allocator.free(input_buffer);
-        allocator.destroy(context);
-        file.close(io);
-        return err;
-    };
+    });
     errdefer if (opened.deinit_fn) |deinit_fn| {
         if (opened.context) |codec_context| deinit_fn(allocator, codec_context);
     };
@@ -325,7 +358,10 @@ fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Alloca
 
 fn openPathReader(context: *anyopaque, io: std.Io, max_image_size: ?u64) !?OpenedReader {
     const source: *PathContext = @ptrCast(@alignCast(context));
-    if (source.compression != .none) return null;
+    if (source.compression != .none) {
+        const spool = try ensureSpool(source, io, max_image_size);
+        return .{ .region = .init(io, spool.file, 0, spool.size), .owns_file = false };
+    }
 
     const file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
     errdefer file.close(io);
@@ -338,6 +374,119 @@ fn openPathReader(context: *anyopaque, io: std.Io, max_image_size: ?u64) !?Opene
 
 fn checkSizeLimit(size: u64, limit: ?u64) !void {
     if (limit) |max| if (size > max) return error.DecompressedImageTooLarge;
+}
+
+fn tighterLimit(a: ?u64, b: ?u64) ?u64 {
+    const left = a orelse return b;
+    const right = b orelse return left;
+    return @min(left, right);
+}
+
+fn ensureSpool(source: *PathContext, io: std.Io, max_image_size: ?u64) !*const Spool {
+    if (source.spool) |*spool| {
+        try checkSizeLimit(spool.size, max_image_size);
+        return spool;
+    }
+    source.spool = try createSpool(source, io, tighterLimit(source.max_image_size, max_image_size));
+    return &source.spool.?;
+}
+
+/// Decodes the whole image once into a sparse file: all-zero chunks are
+/// skipped rather than written, leaving holes the filesystem reads as zero.
+fn createSpool(source: *PathContext, io: std.Io, limit: ?u64) !Spool {
+    const allocator = source.allocator;
+    var stream = try openDecodedStream(source, io, allocator);
+    defer stream.deinit();
+    stream.max_image_size = limit;
+
+    var spool = try createSpoolFile(allocator, io, source.spool_dir orelse default_spool_dir);
+    errdefer spool.close(allocator);
+
+    const buffer = try allocator.alloc(u8, spool_chunk_size);
+    defer allocator.free(buffer);
+
+    var size: u64 = 0;
+    while (true) {
+        const count = try stream.read(buffer);
+        if (count == 0) break;
+        const chunk = buffer[0..count];
+        if (!std.mem.allEqual(u8, chunk, 0)) spool.file.writePositionalAll(io, chunk, size) catch |err| return spoolWriteError(err);
+        size += count;
+    }
+    spool.file.setLength(io, size) catch |err| return spoolWriteError(err);
+    spool.size = size;
+    return spool;
+}
+
+fn spoolWriteError(err: anyerror) anyerror {
+    return switch (err) {
+        error.NoSpaceLeft, error.DiskQuota, error.FileTooBig => error.SpoolDirectoryFull,
+        else => err,
+    };
+}
+
+fn createSpoolFile(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !Spool {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var id: [8]u8 = undefined;
+        io.random(&id);
+        const path = try std.fmt.allocPrint(allocator, "{s}{c}openetcher-{x:0>16}.spool", .{ dir, std.fs.path.sep, std.mem.readInt(u64, &id, .little) });
+        const file = std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true }) catch |err| {
+            allocator.free(path);
+            switch (err) {
+                error.PathAlreadyExists => if (attempt < 8) continue else return err,
+                error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => return error.SpoolDirectoryUnavailable,
+                else => return err,
+            }
+        };
+
+        // POSIX keeps an unlinked file alive through its open handle, so
+        // removing the name now means an interrupted run cannot leak it.
+        if (builtin.os.tag != .windows) {
+            if (std.Io.Dir.cwd().deleteFile(io, path)) |_| {
+                allocator.free(path);
+                return .{ .file = file, .io = io, .size = 0, .path = null };
+            } else |_| {}
+        }
+        return .{ .file = file, .io = io, .size = 0, .path = path };
+    }
+}
+
+/// Test fixtures shared with other modules' tests.
+pub const testing = if (builtin.is_test) struct {
+    /// Writes `bytes` gzip-compressed to `sub_path` and returns its real path.
+    pub fn writeGzip(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8) ![:0]u8 {
+        var output: std.Io.Writer.Allocating = try .initCapacity(allocator, 64 * 1024);
+        defer output.deinit();
+        const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer allocator.free(window);
+
+        var compress = try std.compress.flate.Compress.init(&output.writer, window, .gzip, .default);
+        try compress.writer.writeAll(bytes);
+        try compress.finish();
+
+        var file = try dir.createFile(io, sub_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, output.written());
+        return dir.realPathFileAlloc(io, sub_path, allocator);
+    }
+
+    /// A mostly-zero image with marker bytes, so spooling exercises holes.
+    pub fn sparseImage(allocator: std.mem.Allocator) ![]u8 {
+        const bytes = try allocator.alloc(u8, 3 * spool_chunk_size + 512);
+        @memset(bytes, 0);
+        @memcpy(bytes[100..][0..4], "head");
+        @memcpy(bytes[2 * spool_chunk_size + 7 ..][0..3], "mid");
+        @memcpy(bytes[bytes.len - 4 ..], "tail");
+        return bytes;
+    }
+} else struct {};
+
+fn countEntries(io: std.Io, dir: std.Io.Dir) !usize {
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
 }
 
 test "compression detection uses magic bytes" {
@@ -417,4 +566,95 @@ test "stream enforces decoded size limit" {
     var bytes: [4]u8 = undefined;
     try stream.readExactly(&bytes);
     try std.testing.expectError(error.DecompressedImageTooLarge, stream.read(&bytes));
+}
+
+test "compressed sources spool once and replay from the spool" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "spool", .default_dir);
+    var spool_dir = try tmp.dir.openDir(io, "spool", .{ .iterate = true });
+    defer spool_dir.close(io);
+    const spool_path = try tmp.dir.realPathFileAlloc(io, "spool", allocator);
+    defer allocator.free(spool_path);
+
+    const bytes = try testing.sparseImage(allocator);
+    defer allocator.free(bytes);
+    const path = try testing.writeGzip(allocator, io, tmp.dir, "image.img.gz", bytes);
+    defer allocator.free(path);
+
+    var image_source = try openImageSourceFromPath(allocator, io, path, .{ .spool_dir = spool_path });
+    defer image_source.deinit(allocator);
+
+    var opened = (try image_source.openReader(io, null)).?;
+    defer opened.close(io);
+    const r = opened.reader();
+    try std.testing.expectEqual(@as(u64, bytes.len), r.size);
+    var mid: [3]u8 = undefined;
+    try r.readExactlyAt(io, &mid, 2 * spool_chunk_size + 7);
+    try std.testing.expectEqualStrings("mid", &mid);
+
+    // The spool is unlinked on POSIX, so nothing is left behind on a crash.
+    if (builtin.os.tag != .windows) try std.testing.expectEqual(@as(usize, 0), try countEntries(io, spool_dir));
+
+    // With the encoded file gone, streams can only come from the spool.
+    try tmp.dir.deleteFile(io, "image.img.gz");
+    var stream = try image_source.openStream(io, allocator);
+    defer stream.deinit();
+    try std.testing.expect(stream.seek_to_fn != null);
+    const replayed = try allocator.alloc(u8, bytes.len);
+    defer allocator.free(replayed);
+    try stream.readExactly(replayed);
+    try std.testing.expectEqualSlices(u8, bytes, replayed);
+
+    var again = (try image_source.openReader(io, null)).?;
+    again.close(io);
+    try std.testing.expectError(error.DecompressedImageTooLarge, image_source.openReader(io, bytes.len - 1));
+}
+
+test "spooling enforces the decoded size limit and cleans up" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "spool", .default_dir);
+    var spool_dir = try tmp.dir.openDir(io, "spool", .{ .iterate = true });
+    defer spool_dir.close(io);
+    const spool_path = try tmp.dir.realPathFileAlloc(io, "spool", allocator);
+    defer allocator.free(spool_path);
+
+    const bytes = try testing.sparseImage(allocator);
+    defer allocator.free(bytes);
+    const path = try testing.writeGzip(allocator, io, tmp.dir, "image.img.gz", bytes);
+    defer allocator.free(path);
+
+    var image_source = try openImageSourceFromPath(allocator, io, path, .{ .spool_dir = spool_path, .max_image_size = spool_chunk_size });
+    defer image_source.deinit(allocator);
+    try std.testing.expectError(error.DecompressedImageTooLarge, image_source.openReader(io, null));
+    try std.testing.expectEqual(@as(usize, 0), try countEntries(io, spool_dir));
+}
+
+test "spooling releases everything on allocation failure" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const spool_path = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(spool_path);
+
+    const bytes = try testing.sparseImage(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const path = try testing.writeGzip(std.testing.allocator, io, tmp.dir, "image.img.gz", bytes);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, spoolAndRead, .{ io, path, spool_path });
+}
+
+fn spoolAndRead(allocator: std.mem.Allocator, io: std.Io, path: []const u8, spool_path: []const u8) !void {
+    var image_source = try openImageSourceFromPath(allocator, io, path, .{ .spool_dir = spool_path });
+    defer image_source.deinit(allocator);
+    var opened = (try image_source.openReader(io, null)).?;
+    defer opened.close(io);
+    var stream = try image_source.openStream(io, allocator);
+    defer stream.deinit();
 }
