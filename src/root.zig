@@ -59,6 +59,37 @@ pub const DeviceResolveDiskIdOptions = device.ResolveDiskIdOptions;
 pub const device_api = device;
 
 test {
+    // Zig only analyzes what something references, so public API that no
+    // test calls would otherwise go uncompiled. Referencing every public
+    // declaration makes it compile on each target `scripts/test-targets.sh`
+    // runs.
+    inline for (.{
+        @This(),
+        @import("lib/contract.zig"),
+        @import("lib/range.zig"),
+        @import("lib/scan.zig"),
+        @import("lib/flash.zig"),
+        @import("lib/device.zig"),
+        @import("lib/image.zig"),
+        @import("lib/image/source.zig"),
+        @import("lib/image/reader.zig"),
+        @import("lib/image/region.zig"),
+        @import("lib/image/observer.zig"),
+        @import("lib/image/ondisk.zig"),
+        @import("lib/image/fs.zig"),
+        @import("lib/image/fs/driver.zig"),
+        @import("lib/image/fs/ext4.zig"),
+        @import("lib/image/fs/fat.zig"),
+        @import("lib/image/fs/iso9660.zig"),
+        @import("lib/image/fs/squashfs.zig"),
+        @import("lib/image/layout.zig"),
+        @import("lib/image/layout/driver.zig"),
+        @import("lib/image/layout/mbr.zig"),
+        @import("lib/image/compression.zig"),
+        @import("lib/image/compression/codec.zig"),
+        @import("lib/device.zig").target_io,
+    }) |T| std.testing.refAllDecls(T);
+
     _ = @import("lib/range.zig");
     _ = @import("lib/scan.zig");
     _ = @import("lib/flash.zig");

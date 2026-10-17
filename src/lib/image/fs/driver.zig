@@ -1,10 +1,12 @@
 const std = @import("std");
 
+const contract = @import("../../contract.zig");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
 
 const Reader = reader_mod.Reader;
+const expectFn = contract.expectFn;
 const PartitionInfo = types.Info.PartitionInfo;
 
 /// Filesystem drivers, in content-sniffing precedence.
@@ -49,9 +51,7 @@ pub fn claimsMbrType(comptime D: type, partition_type: u8) bool {
 /// Checks `D` against the driver contract. Generic callers invoke it first
 /// so a broken driver reports the contract, not a downstream type error.
 pub fn validate(comptime D: type) void {
-    for ([_][]const u8{ "name", "unrecognized", "detect", "probeRegion", "collectRanges" }) |decl| {
-        if (!@hasDecl(D, decl)) @compileError(@typeName(D) ++ ": filesystem driver is missing `pub " ++ decl ++ "`");
-    }
+    contract.expectDecls(D, "filesystem driver", &.{ "name", "unrecognized", "detect", "probeRegion", "collectRanges" });
     _ = @as([]const u8, D.name);
     _ = @as(types.Info.Filesystem, D.unrecognized);
     expectFn(D, "detect", &.{ std.Io, *const Reader }, bool);
@@ -63,27 +63,6 @@ pub fn validate(comptime D: type) void {
         _ = @as(types.Info.Filesystem, D.filesystem);
         expectFn(D, "blockSize", &.{ std.Io, *const Reader }, u32);
     }
-}
-
-/// Requires `D.decl` to take exactly `params` and return `payload`, either
-/// directly or inside an error union.
-fn expectFn(comptime D: type, comptime decl: []const u8, comptime params: []const type, comptime payload: type) void {
-    const where = @typeName(D) ++ "." ++ decl;
-    if (!@hasDecl(D, decl)) @compileError(where ++ " is required");
-    const info = switch (@typeInfo(@TypeOf(@field(D, decl)))) {
-        .@"fn" => |info| info,
-        else => @compileError(where ++ " must be a function"),
-    };
-    if (info.param_types.len != params.len) @compileError(where ++ " has the wrong number of parameters");
-    for (info.param_types, params) |param, expected| {
-        if (param != expected) @compileError(where ++ " expects a parameter of type " ++ @typeName(expected));
-    }
-    const returned = info.return_type.?;
-    const actual = switch (@typeInfo(returned)) {
-        .error_union => |error_union| error_union.payload,
-        else => returned,
-    };
-    if (actual != payload) @compileError(where ++ " must return " ++ @typeName(payload));
 }
 
 fn checkMbrTypesAreUnique() void {

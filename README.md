@@ -50,6 +50,15 @@ zig build test --fuzz=100K
 
 A failing input is saved under `.zig-cache/f/`, and the test prints the analysis that broke an invariant.
 
+Zig only compiles code reachable on the target being built, so `zig build test` on one machine never compiles the other platforms' device backends or the big-endian decoding paths. Run the suite once per target, each as its own `zig build test`:
+
+```sh
+scripts/test-targets.sh                     # every default target
+scripts/test-targets.sh s390x-linux-musl    # one target (s390x is big-endian)
+```
+
+macOS targets run on the host, x86_64 through Rosetta. Linux and Windows targets need Zig's qemu and Wine integration, which only works on a Linux host, so on macOS the script runs them in a Docker container built from `scripts/linux-test.Dockerfile`. Set `ZIG` to pick the host compiler.
+
 Run the executable through the build system:
 
 ```sh

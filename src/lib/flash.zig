@@ -504,6 +504,7 @@ fn openFileStream(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !
 }
 
 test "aligned device chunk reads go through the platform dispatcher" {
+    if (!device.target_io.supports_devices) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -739,6 +740,7 @@ test "compressed sources decode once for plan, flash, and source verification" {
 /// Opens `file` as if it were a raw device with 512-byte alignment, so tests
 /// exercise the aligned device paths without real hardware.
 fn testDeviceTarget(io: std.Io, file: std.Io.File) !device.OpenTarget {
+    if (!device.target_io.supports_devices) return error.SkipZigTest;
     return .{
         .file = file,
         .info = .{

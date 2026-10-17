@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const contract = @import("contract.zig");
+
 pub const TargetKind = enum {
     regular_file,
     block_device,
@@ -119,8 +121,35 @@ const platform = switch (builtin.target.os.tag) {
     .macos => @import("device/platforms/macos.zig"),
     .linux => @import("device/platforms/linux.zig"),
     .windows => @import("device/platforms/windows.zig"),
-    else => @import("device/platforms/linux.zig"),
+    else => |os| @compileError("openetcher has no device backend for " ++ @tagName(os)),
 };
+
+comptime {
+    validatePlatform(platform);
+}
+
+/// Checks a platform backend against the contract every backend implements.
+/// Only the selected backend is compiled, so this is what keeps the others
+/// honest when `scripts/test-targets.sh` builds for their targets.
+fn validatePlatform(comptime P: type) void {
+    const Allocator = std.mem.Allocator;
+    const Io = std.Io;
+    contract.expectFn(P, "probeTarget", &.{ Allocator, Io, []const u8 }, TargetInfo);
+    contract.expectFn(P, "openTarget", &.{ Allocator, Io, []const u8 }, OpenTarget);
+    contract.expectFn(P, "prepareTargetPath", &.{ Allocator, Io, []const u8 }, void);
+    contract.expectFn(P, "prepareTarget", &.{ Allocator, Io, *OpenTarget }, void);
+    contract.expectFn(P, "listCandidateDisks", &.{ Allocator, Io, ListOptions }, CandidateDiskList);
+    contract.expectFn(P, "resolveDiskId", &.{ Allocator, Io, []const u8, ResolveDiskIdOptions }, []u8);
+    contract.expectFn(P, "lookupDiskByPath", &.{ Allocator, Io, []const u8, LookupDiskOptions }, ?CandidateDisk);
+
+    contract.expectDecls(P, "device backend", &.{"target_io"});
+    const T = P.target_io;
+    contract.expectDecls(T, "target I/O backend", &.{"supports_devices"});
+    _ = @as(bool, T.supports_devices);
+    contract.expectFn(T, "writeAt", &.{ Io, *OpenTarget, []u8, usize, u64 }, void);
+    contract.expectFn(T, "readAt", &.{ Io, *OpenTarget, []u8, u64, []u8 }, usize);
+    contract.expectFn(T, "sync", &.{ Io, *OpenTarget }, void);
+}
 
 pub const probeTarget = platform.probeTarget;
 pub const openTarget = platform.openTarget;

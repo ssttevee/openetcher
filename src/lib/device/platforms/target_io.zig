@@ -107,6 +107,8 @@ fn readDeviceAll(fd: std.posix.fd_t, buffer: []u8) !usize {
 /// Backend used by macOS and Linux: positional I/O for files,
 /// alignment-aware raw I/O for devices.
 pub const posix = struct {
+    pub const supports_devices = true;
+
     /// Writes `buffer[0..len]` at `offset`; see `writeAlignedDeviceChunk`
     /// for how devices use the rest of `buffer`.
     pub fn writeAt(io: std.Io, target: *device.OpenTarget, buffer: []u8, len: usize, offset: u64) !void {
@@ -126,6 +128,8 @@ pub const posix = struct {
 
 /// Backend used by platforms without raw-device support yet.
 pub const positional_only = struct {
+    pub const supports_devices = false;
+
     pub fn writeAt(io: std.Io, target: *device.OpenTarget, buffer: []u8, len: usize, offset: u64) !void {
         if (target.info.capabilities.isDevice()) return error.UnsupportedTargetType;
         return target.file.writePositionalAll(io, buffer[0..len], offset);

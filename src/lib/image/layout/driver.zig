@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const contract = @import("../../contract.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
 const mbr_mod = @import("mbr.zig");
@@ -39,17 +40,10 @@ comptime {
 /// Checks `L` against the layout contract. Generic callers invoke it first
 /// so a broken driver reports the contract, not a downstream type error.
 pub fn validate(comptime L: type) void {
-    for ([_][]const u8{ "layout", "detect", "collectSpans" }) |decl| {
-        if (!@hasDecl(L, decl)) @compileError(@typeName(L) ++ ": layout driver is missing `pub " ++ decl ++ "`");
-    }
+    contract.expectDecls(L, "layout driver", &.{ "layout", "detect", "collectSpans" });
     _ = @as(types.Info.Layout, L.layout);
-    _ = @as(fn (std.Io, *const Reader) bool, L.detect);
-    const collect = @typeInfo(@TypeOf(L.collectSpans)).@"fn";
-    if (collect.param_types.len != 3 or collect.param_types[0] != std.mem.Allocator or collect.param_types[1] != std.Io or collect.param_types[2] != *const Reader or
-        @typeInfo(collect.return_type.?).error_union.payload != []Span)
-    {
-        @compileError(@typeName(L) ++ ".collectSpans must be fn (Allocator, std.Io, *const Reader) ![]Span");
-    }
+    contract.expectFn(L, "detect", &.{ std.Io, *const Reader }, bool);
+    contract.expectFn(L, "collectSpans", &.{ std.mem.Allocator, std.Io, *const Reader }, []Span);
 }
 
 test "layout registry exposes the mbr driver" {
