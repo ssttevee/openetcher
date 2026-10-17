@@ -147,6 +147,7 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
         const remaining_blocks = blocks_count - group_first_block;
         const blocks_in_group = @min(@as(u64, superblock.blocks_per_group), remaining_blocks);
 
+        try checkDescriptor(descriptor, blocks_count, inode_table_blocks);
         try appendMetadataRanges(allocator, &used_blocks, block_size, group_index, group_first_block, descriptor_table_block, descriptor_table_blocks, descriptor, inode_table_blocks);
         try readBlock(io, r, descriptor.block_bitmap, block_size, bitmap_buffer);
 
@@ -162,7 +163,7 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
         }
     }
 
-    return range.normalizeRanges(allocator, used_blocks.items);
+    return range.normalizeWithin(allocator, used_blocks.items, r.size);
 }
 
 // File-handle wrappers kept for library callers.
@@ -300,10 +301,22 @@ fn validateSuperblock(superblock: Superblock, image_size: u64) !void {
 
     const filesystem_size = try superblock.filesystemSize();
     if (filesystem_size > image_size) return error.InvalidExt4Superblock;
+    // Each group's block bitmap is one block, so it describes at most
+    // block_size * 8 blocks.
+    if (superblock.blocks_per_group > @as(u64, try superblock.blockSize()) * 8) return error.InvalidExt4Superblock;
 
     if ((superblock.feature_compat & ~supported_compat) != 0) return error.UnsupportedExt4CompatFeature;
     if ((superblock.feature_incompat & ~supported_incompat) != 0) return error.UnsupportedExt4IncompatFeature;
     if ((superblock.feature_ro_compat & ~supported_ro_compat) != 0) return error.UnsupportedExt4ReadOnlyFeature;
+}
+
+/// Descriptor block numbers are untrusted. Keeping them inside the
+/// filesystem also bounds every later `block * block_size` by the image size.
+fn checkDescriptor(descriptor: GroupDescriptor, blocks_count: u64, inode_table_blocks: u64) !void {
+    if (descriptor.block_bitmap >= blocks_count) return error.InvalidExt4GroupDescriptor;
+    if (descriptor.inode_bitmap >= blocks_count) return error.InvalidExt4GroupDescriptor;
+    const inode_table_end = std.math.add(u64, descriptor.inode_table, inode_table_blocks) catch return error.InvalidExt4GroupDescriptor;
+    if (inode_table_end > blocks_count) return error.InvalidExt4GroupDescriptor;
 }
 
 fn descriptorSize(superblock: Superblock) u64 {
@@ -429,4 +442,50 @@ test "detect accepts valid magic through buffer reader" {
     var bad = reader_mod.Buffer.init(&bytes);
     const br = bad.reader();
     try std.testing.expect(!detect(std.testing.io, &br));
+}
+
+/// Writes a one-group ext4 with 1 KiB blocks into `bytes` for hostile-input
+/// tests: superblock in block 1, descriptors in block 2, bitmaps in 3 and 4.
+fn writeTestExt4(bytes: []u8, blocks_per_group: u32) void {
+    @memset(bytes, 0);
+    const superblock = bytes[1024..][0..1024];
+    std.mem.writeInt(u32, superblock[4..8], @intCast(bytes.len / 1024), .little);
+    std.mem.writeInt(u32, superblock[20..24], 1, .little);
+    std.mem.writeInt(u32, superblock[32..36], blocks_per_group, .little);
+    std.mem.writeInt(u32, superblock[40..44], 32, .little);
+    std.mem.writeInt(u16, superblock[56..58], ext4_magic, .little);
+    std.mem.writeInt(u32, superblock[76..80], 1, .little);
+    std.mem.writeInt(u16, superblock[88..90], 128, .little);
+
+    const descriptor = bytes[2048..][0..64];
+    std.mem.writeInt(u32, descriptor[0..4], 3, .little);
+    std.mem.writeInt(u32, descriptor[4..8], 4, .little);
+    std.mem.writeInt(u32, descriptor[8..12], 5, .little);
+}
+
+test "blocks per group beyond one bitmap block is rejected" {
+    const bytes = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(bytes);
+    // A 1 KiB bitmap describes 8192 blocks; claiming more would read past it.
+    writeTestExt4(bytes, 65536);
+
+    var source = reader_mod.Buffer.init(bytes);
+    const r = source.reader();
+    try std.testing.expectError(error.InvalidExt4Superblock, collectRanges(std.testing.allocator, std.testing.io, &r));
+}
+
+test "64-bit block numbers that overflow byte offsets are rejected" {
+    var bytes: [256 * 1024]u8 = undefined;
+    writeTestExt4(&bytes, 8192);
+    const superblock = bytes[1024..][0..1024];
+    std.mem.writeInt(u32, superblock[96..100], incompat_sixtyfourbit, .little);
+    std.mem.writeInt(u16, superblock[254..256], 64, .little);
+    std.mem.writeInt(u32, bytes[2048 + 32 ..][0..4], 0xffff_ffff, .little); // block bitmap, high half
+
+    var source = reader_mod.Buffer.init(&bytes);
+    const r = source.reader();
+    if (collectRanges(std.testing.allocator, std.testing.io, &r)) |ranges| {
+        std.testing.allocator.free(ranges);
+        return error.TestExpectedError;
+    } else |_| {}
 }

@@ -89,8 +89,11 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
     defer allocator.free(fat);
     try r.readExactlyAt(io, fat, boot.fatOffset(0));
 
+    // Clusters past the end of the FAT have no entry, so stop there.
+    const entry_size: u64 = if (boot.filesystem == .fat32) 4 else 2;
+    const last_cluster = @min(@as(u64, boot.total_clusters) + 2, fat.len / entry_size);
     var cluster: u32 = 2;
-    while (cluster < boot.total_clusters + 2) : (cluster += 1) {
+    while (cluster < last_cluster) : (cluster += 1) {
         if (!clusterAllocated(boot.filesystem, fat, cluster)) continue;
         try ranges.append(allocator, .{
             .offset = boot.clusterFirstSector(cluster),
@@ -98,7 +101,7 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
         });
     }
 
-    return range.normalizeRanges(allocator, ranges.items);
+    return range.normalizeWithin(allocator, ranges.items, r.size);
 }
 
 // File-handle wrappers kept for library callers.
@@ -142,8 +145,12 @@ fn readBootSector(io: std.Io, r: *const Reader, size: u64) !BootSector {
     if (total_sectors == 0 or fat_size_sectors == 0) return error.InvalidFatBootSector;
 
     const root_dir_sectors = ((@as(u32, root_entry_count) * 32) + (@as(u32, bytes_per_sector) - 1)) / bytes_per_sector;
-    const first_data_sector = reserved_sector_count + (@as(u32, num_fats) * fat_size_sectors) + root_dir_sectors;
-    if (first_data_sector >= total_sectors) return error.InvalidFatBootSector;
+    // Header fields are untrusted; widen before combining them. Requiring the
+    // FATs and root directory to fit inside the volume also bounds the FAT
+    // buffer `collectRanges` allocates.
+    const metadata_sectors = @as(u64, reserved_sector_count) + @as(u64, num_fats) * fat_size_sectors + root_dir_sectors;
+    if (metadata_sectors >= total_sectors) return error.InvalidFatBootSector;
+    const first_data_sector: u32 = @intCast(metadata_sectors);
 
     const data_sectors = total_sectors - first_data_sector;
     const total_clusters = data_sectors / sectors_per_cluster;
@@ -171,13 +178,13 @@ fn readBootSector(io: std.Io, r: *const Reader, size: u64) !BootSector {
 fn clusterAllocated(filesystem: Filesystem, fat: []const u8, cluster: u32) bool {
     return switch (filesystem) {
         .fat16 => blk: {
-            const offset = cluster * 2;
+            const offset = @as(usize, cluster) * 2;
             if (offset + 2 > fat.len) break :blk false;
             const value = readU16(fat[offset .. offset + 2]);
             break :blk value != 0;
         },
         .fat32 => blk: {
-            const offset = cluster * 4;
+            const offset = @as(usize, cluster) * 4;
             if (offset + 4 > fat.len) break :blk false;
             const value = readU32(fat[offset .. offset + 4]) & 0x0fffffff;
             break :blk value != 0;
@@ -216,4 +223,19 @@ test "readBootSector detects fat16" {
     try std.testing.expectEqual(Filesystem.fat16, boot.filesystem);
 
     try std.testing.expect(detect(std.testing.io, &r));
+}
+
+test "hostile FAT geometry fails instead of overflowing" {
+    var bytes: [4096]u8 = @splat(0);
+    std.mem.writeInt(u16, bytes[11..13], 512, .little);
+    bytes[13] = 1;
+    std.mem.writeInt(u16, bytes[14..16], 1, .little);
+    bytes[16] = 2;
+    std.mem.writeInt(u16, bytes[19..21], 8, .little);
+    std.mem.writeInt(u32, bytes[36..40], 0x8000_0000, .little); // FAT32 size
+    std.mem.writeInt(u16, bytes[510..512], 0xAA55, .little);
+
+    var source = reader_mod.Buffer.init(&bytes);
+    const r = source.reader();
+    try std.testing.expectError(error.InvalidFatBootSector, collectRanges(std.testing.allocator, std.testing.io, &r));
 }

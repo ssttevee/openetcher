@@ -15,6 +15,7 @@ pub const region = @import("image/region.zig");
 pub const observer = @import("image/observer.zig");
 pub const reader = reader_mod;
 
+const range_api = @import("range.zig");
 const fs_drivers = fs_api.driver;
 const layout_drivers = layout_api.driver;
 
@@ -231,6 +232,8 @@ fn analyzeRawFilesystem(comptime D: type, io: std.Io, allocator: std.mem.Allocat
     comptime fs_drivers.validate(D);
     const ranges = try D.collectRanges(allocator, io, r);
     errdefer allocator.free(ranges);
+    // Drivers parse untrusted metadata; never let their output leave the image.
+    try range_api.checkWithin(ranges, r.size);
 
     var used_bytes: u64 = 0;
     for (ranges) |segment| used_bytes += segment.length;
@@ -431,6 +434,10 @@ fn appendGapRanges(allocator: std.mem.Allocator, ranges: *std.ArrayList(ByteRang
     if (cursor < image_size) {
         try ranges.append(allocator, .{ .offset = cursor, .length = image_size - cursor });
     }
+}
+
+test {
+    _ = @import("image/fuzz.zig");
 }
 
 test "analyzeReader detects mbr partitions through a file region" {

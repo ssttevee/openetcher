@@ -45,6 +45,24 @@ pub fn normalizeRanges(allocator: std.mem.Allocator, input: []const ByteRange) !
     return merged.toOwnedSlice(allocator);
 }
 
+/// Normalizes `input` and requires every range to lie within `[0, size)`.
+/// Filesystem parsers use this so a corrupt on-disk pointer becomes an
+/// error instead of a plan that writes past the region.
+pub fn normalizeWithin(allocator: std.mem.Allocator, input: []const ByteRange, size: u64) ![]ByteRange {
+    const normalized = try normalizeRanges(allocator, input);
+    errdefer allocator.free(normalized);
+    try checkWithin(normalized, size);
+    return normalized;
+}
+
+/// Fails unless every range ends at or before `size`.
+pub fn checkWithin(ranges: []const ByteRange, size: u64) error{ RangeOverflow, RangeOutsideRegion }!void {
+    for (ranges) |item| {
+        const end = std.math.add(u64, item.offset, item.length) catch return error.RangeOverflow;
+        if (end > size) return error.RangeOutsideRegion;
+    }
+}
+
 fn lessThan(_: void, lhs: ByteRange, rhs: ByteRange) bool {
     if (lhs.offset != rhs.offset) return lhs.offset < rhs.offset;
     return lhs.length < rhs.length;
@@ -66,6 +84,19 @@ test "normalize ranges merges overlaps and adjacency" {
 
     try std.testing.expectEqual(@as(usize, 1), normalized.len);
     try std.testing.expectEqualDeep(ByteRange{ .offset = 0, .length = 11000 }, normalized[0]);
+}
+
+test "normalizeWithin rejects ranges past the region" {
+    const allocator = std.testing.allocator;
+    const input = [_]ByteRange{
+        .{ .offset = 0, .length = 512 },
+        .{ .offset = 4096, .length = 1024 },
+    };
+
+    const inside = try normalizeWithin(allocator, &input, 5120);
+    defer allocator.free(inside);
+    try std.testing.expectEqual(@as(usize, 2), inside.len);
+    try std.testing.expectError(error.RangeOutsideRegion, normalizeWithin(allocator, &input, 5119));
 }
 
 test "normalize ranges rejects overflow" {

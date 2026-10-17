@@ -42,6 +42,14 @@ Run the test suite:
 zig build test
 ```
 
+Image parsers read untrusted bytes, so `src/lib/image/fuzz.zig` fuzzes the whole analyzer. It starts from a small valid image per format, patches header bytes, and fails on any panic, leak, or plan that writes outside the image. `zig build test` replays only the seed images; to search, run the fuzzer with an iteration limit:
+
+```sh
+zig build test --fuzz=100K
+```
+
+A failing input is saved under `.zig-cache/f/`, and the test prints the analysis that broke an invariant.
+
 Run the executable through the build system:
 
 ```sh
