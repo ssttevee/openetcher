@@ -35,9 +35,11 @@ pub const Progress = struct {
     total_bytes: u64,
 };
 
+/// Receives progress from the flash loop. The callback cannot fail: a
+/// broken progress display must not abort a half-written disk.
 pub const ProgressHandler = struct {
     context: *anyopaque,
-    callback: *const fn (context: *anyopaque, progress: Progress) anyerror!void,
+    callback: *const fn (context: *anyopaque, progress: Progress) void,
 };
 
 pub const UnsupportedPolicy = enum {
@@ -157,9 +159,9 @@ fn countRanges(ranges: []const ByteRange) u64 {
     return total;
 }
 
-fn emitProgress(options: Options, progress: Progress) !void {
+fn emitProgress(options: Options, progress: Progress) void {
     const handler = options.progress_handler orelse return;
-    try handler.callback(handler.context, progress);
+    handler.callback(handler.context, progress);
 }
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -259,7 +261,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     defer pipeline.deinit(allocator, io);
 
     const total = if (ranges) |items| countRanges(items) else expected_size orelse 0;
-    try emitProgress(options, .{ .phase = .flash, .completed_bytes = 0, .total_bytes = total });
+    emitProgress(options, .{ .phase = .flash, .completed_bytes = 0, .total_bytes = total });
 
     var logical_size: u64 = 0;
     var bytes_written: u64 = 0;
@@ -276,7 +278,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
                 for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk[0..count]);
                 try pipeline.submit(io, count, offset);
                 // `submit` waited for every earlier chunk, so those are written.
-                try emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+                emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
                 bytes_written += count;
                 offset += count;
                 logical_size = @max(logical_size, offset);
@@ -301,7 +303,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
             if (target.info.capabilities.size < next) return error.DestinationTooSmall;
             for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk[0..count]);
             try pipeline.submit(io, count, offset);
-            try emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+            emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
             logical_size = next;
             bytes_written += count;
         }
@@ -309,7 +311,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     }
 
     try pipeline.wait(io);
-    try emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+    emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
     for (options.observers) |*observer| try observer.finish(logical_size);
 
     try device.target_io.sync(io, target);
@@ -348,7 +350,7 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
 
     var completed: u64 = 0;
     const total = countRanges(ranges);
-    try emitProgress(options, .{ .phase = .verify, .completed_bytes = 0, .total_bytes = total });
+    emitProgress(options, .{ .phase = .verify, .completed_bytes = 0, .total_bytes = total });
     for (ranges) |item| {
         var remaining = item.length;
         var offset = item.offset;
@@ -360,7 +362,7 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
             offset += count;
             remaining -= count;
             completed += count;
-            try emitProgress(options, .{ .phase = .verify, .completed_bytes = completed, .total_bytes = total });
+            emitProgress(options, .{ .phase = .verify, .completed_bytes = completed, .total_bytes = total });
         }
     }
     try pipeline.wait(io);
@@ -464,43 +466,9 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File,
     return result.report;
 }
 
-/// Wraps an open seekable file as a replayable `root.Stream` with a seek
-/// fast-path so gap skipping costs one lseek instead of reads.
-const FileStreamContext = struct {
-    file_reader: std.Io.File.Reader,
-    buffer: []u8,
-    allocator: std.mem.Allocator,
-
-    fn destroy(context: *anyopaque) void {
-        const self: *FileStreamContext = @ptrCast(@alignCast(context));
-        self.allocator.free(self.buffer);
-        self.allocator.destroy(self);
-    }
-
-    fn seekTo(context: *anyopaque, position: u64) std.Io.File.Reader.SeekError!void {
-        const self: *FileStreamContext = @ptrCast(@alignCast(context));
-        try self.file_reader.seekTo(position);
-    }
-};
-
+/// Streams an open file the caller keeps ownership of, seeking over gaps.
 fn openFileStream(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !root.Stream {
-    const context = try allocator.create(FileStreamContext);
-    errdefer allocator.destroy(context);
-    const buffer = try allocator.alloc(u8, 64 * 1024);
-    errdefer allocator.free(buffer);
-
-    context.* = .{
-        .file_reader = std.Io.File.Reader.init(file, io, buffer),
-        .buffer = buffer,
-        .allocator = allocator,
-    };
-
-    return .{
-        .reader = &context.file_reader.interface,
-        .context = context,
-        .deinit_fn = FileStreamContext.destroy,
-        .seek_to_fn = FileStreamContext.seekTo,
-    };
+    return root.Stream.openFile(allocator, io, file, false);
 }
 
 test "aligned device chunk reads go through the platform dispatcher" {
@@ -628,73 +596,79 @@ test "flashToPathFromPath writes and verifies planned ranges" {
     try std.testing.expectEqualSlices(u8, source_bytes[10..16], written_back[10..16]);
 }
 
-const CountedSource = struct {
-    bytes: []const u8,
-    passes: usize = 0,
-};
-
-const CountedStream = struct {
-    reader: std.Io.Reader,
-    allocator: std.mem.Allocator,
-
-    fn destroy(context: *anyopaque) void {
-        const self: *CountedStream = @ptrCast(@alignCast(context));
-        self.allocator.destroy(self);
-    }
-};
-
-fn openCountedStream(context: *anyopaque, _: std.Io, allocator: std.mem.Allocator) !root.Stream {
-    const source_context: *CountedSource = @ptrCast(@alignCast(context));
-    source_context.passes += 1;
-    const stream_context = try allocator.create(CountedStream);
-    stream_context.* = .{ .reader = std.Io.Reader.fixed(source_context.bytes), .allocator = allocator };
-    return .{ .reader = &stream_context.reader, .context = stream_context, .deinit_fn = CountedStream.destroy };
-}
-
-test "source flashing uses replay passes and digest verification" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const bytes = try std.testing.allocator.alloc(u8, 17 * 2048);
-    defer std.testing.allocator.free(bytes);
+/// An ISO9660 image: the analyzer plans it as one range over the whole image.
+fn testIsoImage(allocator: std.mem.Allocator) ![]u8 {
+    const bytes = try allocator.alloc(u8, 17 * 2048);
     @memset(bytes, 0);
     bytes[16 * 2048] = 1;
     @memcpy(bytes[16 * 2048 + 1 ..][0..5], "CD001");
     bytes[16 * 2048 + 6] = 1;
+    return bytes;
+}
 
-    var destination = try tmp.dir.createFile(io, "planned.img", .{ .read = true });
-    try destination.writeStreamingAll(io, bytes);
-    try destination.sync(io);
-    destination.close(io);
-    const planned_path = try tmp.dir.realPathFileAlloc(io, "planned.img", std.testing.allocator);
-    defer std.testing.allocator.free(planned_path);
+test "planned and full source flashes verify by digest" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    var planned_context = CountedSource{ .bytes = bytes };
-    var planned_source = root.ImageSource{
-        .context = &planned_context,
-        .metadata = .{ .compression = .gzip, .encoded_size = 10, .image_size = null },
-        .open_stream_fn = openCountedStream,
-    };
-    const planned_report = try flashSource(std.testing.allocator, io, &planned_source, planned_path, .{ .verify = .digest });
-    try std.testing.expectEqual(@as(usize, 2), planned_context.passes);
-    try std.testing.expectEqual(@as(u64, bytes.len), planned_report.bytes_written);
+    const bytes = try testIsoImage(allocator);
+    defer allocator.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "image.iso", .data = bytes });
+    const image_path = try tmp.dir.realPathFileAlloc(io, "image.iso", allocator);
+    defer allocator.free(image_path);
 
-    var force_destination = try tmp.dir.createFile(io, "force.img", .{ .read = true });
-    try force_destination.writeStreamingAll(io, bytes);
-    try force_destination.sync(io);
-    force_destination.close(io);
-    const force_path = try tmp.dir.realPathFileAlloc(io, "force.img", std.testing.allocator);
-    defer std.testing.allocator.free(force_path);
+    for ([_]Strategy{ .planned_sparse, .force_full_streaming }) |strategy| {
+        const zeros = try allocator.alloc(u8, bytes.len);
+        defer allocator.free(zeros);
+        @memset(zeros, 0);
+        try tmp.dir.writeFile(io, .{ .sub_path = "target.img", .data = zeros });
+        const target_path = try tmp.dir.realPathFileAlloc(io, "target.img", allocator);
+        defer allocator.free(target_path);
 
-    var force_context = CountedSource{ .bytes = bytes };
-    var force_source = root.ImageSource{
-        .context = &force_context,
-        .metadata = .{ .compression = .gzip, .encoded_size = 10, .image_size = null },
-        .open_stream_fn = openCountedStream,
-    };
-    _ = try flashSource(std.testing.allocator, io, &force_source, force_path, .{ .strategy = .force_full_streaming, .verify = .digest });
-    try std.testing.expectEqual(@as(usize, 1), force_context.passes);
+        var image_source = try root.openImageSourceFromPath(allocator, io, image_path, .{});
+        defer image_source.deinit();
+        const report = try flashSource(allocator, io, &image_source, target_path, .{ .strategy = strategy, .verify = .digest, .prepare_target = false });
+        try std.testing.expectEqual(@as(u64, bytes.len), report.bytes_written);
+
+        const written = try tmp.dir.readFileAlloc(io, "target.img", allocator, .unlimited);
+        defer allocator.free(written);
+        try std.testing.expectEqualSlices(u8, bytes, written);
+    }
+}
+
+test "full streaming decodes compressed sources without spooling" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const source_testing = @import("image/source.zig").testing;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bytes = try testIsoImage(allocator);
+    defer allocator.free(bytes);
+    const path = try source_testing.writeGzip(allocator, io, tmp.dir, "image.iso.gz", bytes);
+    defer allocator.free(path);
+    {
+        var destination = try tmp.dir.createFile(io, "target.img", .{});
+        defer destination.close(io);
+        try destination.setLength(io, bytes.len);
+    }
+    const target_path = try tmp.dir.realPathFileAlloc(io, "target.img", allocator);
+    defer allocator.free(target_path);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+    const missing_spool_dir = try std.fs.path.join(allocator, &.{ tmp_path, "missing" });
+    defer allocator.free(missing_spool_dir);
+
+    // Planning needs random access and so a spool, which cannot be created.
+    var planned_source = try root.openImageSourceFromPath(allocator, io, path, .{ .spool_dir = missing_spool_dir });
+    defer planned_source.deinit();
+    try std.testing.expectError(error.SpoolDirectoryUnavailable, flashSource(allocator, io, &planned_source, target_path, .{ .prepare_target = false }));
+
+    var streamed_source = try root.openImageSourceFromPath(allocator, io, path, .{ .spool_dir = missing_spool_dir });
+    defer streamed_source.deinit();
+    const report = try flashSource(allocator, io, &streamed_source, target_path, .{ .strategy = .force_full_streaming, .verify = .digest, .prepare_target = false });
+    try std.testing.expectEqual(@as(u64, bytes.len), report.bytes_written);
 }
 
 test "compressed sources decode once for plan, flash, and source verification" {
@@ -723,7 +697,7 @@ test "compressed sources decode once for plan, flash, and source verification" {
     defer allocator.free(target_path);
 
     var image_source = try root.openImageSourceFromPath(allocator, io, path, .{ .spool_dir = spool_dir });
-    defer image_source.deinit(allocator);
+    defer image_source.deinit();
     const plan = try root.planImageFlashSource(allocator, io, &image_source, .{});
     defer plan.deinit(allocator);
 

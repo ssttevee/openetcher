@@ -11,17 +11,17 @@ const codec_api = @import("codec.zig");
 /// A failing `bzip2` simply stops writing, which on its own would look like
 /// a shorter valid image. End of stream therefore waits for the process and
 /// turns a non-zero exit into a read failure.
-const ChildStream = struct {
+pub const State = struct {
     io: std.Io,
     child: std.process.Child,
     pipe: std.Io.File.Reader,
-    buffer: []u8,
+    buffer: [64 * 1024]u8,
     /// Set once the process has been waited for, with its outcome.
-    exited: ?bool = null,
+    exited: ?bool,
     interface: std.Io.Reader,
 
     fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *ChildStream = @fieldParentPtr("interface", r);
+        const self: *State = @fieldParentPtr("interface", r);
         if (self.exited) |succeeded| return if (succeeded) error.EndOfStream else error.ReadFailed;
         return self.pipe.interface.stream(w, limit) catch |err| switch (err) {
             error.EndOfStream => {
@@ -35,23 +35,12 @@ const ChildStream = struct {
             else => |other| other,
         };
     }
-
-    fn deinit(allocator: std.mem.Allocator, context: *anyopaque) void {
-        const self: *ChildStream = @ptrCast(@alignCast(context));
-        // Stopped early, by an error or the size limit: end the process.
-        if (self.exited == null) self.child.kill(self.io);
-        allocator.free(self.buffer);
-        allocator.destroy(self);
-    }
 };
 
-pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
-    const self = try args.allocator.create(ChildStream);
-    errdefer args.allocator.destroy(self);
-    self.buffer = try args.allocator.alloc(u8, 64 * 1024);
-    errdefer args.allocator.free(self.buffer);
-
-    self.child = std.process.spawn(args.io, .{
+pub fn init(state: *State, args: codec_api.InitArgs) !void {
+    state.io = args.io;
+    state.exited = null;
+    state.child = std.process.spawn(args.io, .{
         .argv = &.{ "bzip2", "-dc", args.path },
         .stdin = .ignore,
         .stdout = .pipe,
@@ -62,22 +51,22 @@ pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
         error.FileNotFound => return error.Bzip2Unavailable,
         else => |other| return other,
     };
-    self.io = args.io;
-    self.exited = null;
-    self.pipe = std.Io.File.Reader.initStreaming(self.child.stdout.?, args.io, self.buffer);
-    self.interface = .{
-        .vtable = &.{ .stream = ChildStream.stream },
+    state.pipe = .initStreaming(state.child.stdout.?, args.io, &state.buffer);
+    state.interface = .{
+        .vtable = &.{ .stream = State.stream },
         .buffer = &.{},
         .seek = 0,
         .end = 0,
     };
+}
 
-    return .{
-        .reader = &self.interface,
-        .translate_errors = true,
-        .context = self,
-        .deinit_fn = ChildStream.deinit,
-    };
+pub fn reader(state: *State) *std.Io.Reader {
+    return &state.interface;
+}
+
+pub fn deinit(state: *State) void {
+    // Stopped early, by an error or the size limit: end the process.
+    if (state.exited == null) state.child.kill(state.io);
 }
 
 // Codec contract; see codec.zig.
@@ -130,7 +119,7 @@ test "bzip2 sources stream without buffering the image" {
     const allocator = fixed.allocator();
 
     var image_source = try source.openImageSourceFromPath(allocator, io, path, .{});
-    defer image_source.deinit(allocator);
+    defer image_source.deinit();
     try std.testing.expectEqual(codec_api.Compression.bzip2, image_source.metadata.compression);
 
     var stream = try image_source.openStream(io, allocator);
@@ -163,7 +152,7 @@ test "truncated bzip2 input fails instead of yielding a short image" {
     }
 
     var image_source = try source.openImageSourceFromPath(std.testing.allocator, io, path, .{});
-    defer image_source.deinit(std.testing.allocator);
+    defer image_source.deinit();
     var stream = try image_source.openStream(io, std.testing.allocator);
     defer stream.deinit();
     var chunk: [64 * 1024]u8 = undefined;
@@ -186,7 +175,7 @@ test "closing a bzip2 stream early ends the process" {
     defer std.testing.allocator.free(path);
 
     var image_source = try source.openImageSourceFromPath(std.testing.allocator, io, path, .{ .max_image_size = 1024 * 1024 });
-    defer image_source.deinit(std.testing.allocator);
+    defer image_source.deinit();
     var stream = try image_source.openStream(io, std.testing.allocator);
     defer stream.deinit();
     var chunk: [64 * 1024]u8 = undefined;

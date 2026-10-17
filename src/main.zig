@@ -8,8 +8,14 @@ const ProgressState = struct {
     last_phase: ?openetcher.FlashPhase = null,
     last_line_len: usize = 0,
 
-    fn update(context: *anyopaque, progress: openetcher.FlashProgress) !void {
+    fn update(context: *anyopaque, progress: openetcher.FlashProgress) void {
         const self: *ProgressState = @ptrCast(@alignCast(context));
+        // A broken terminal must not abort the flash; the final report
+        // surfaces any lasting write failure.
+        self.render(progress) catch {};
+    }
+
+    fn render(self: *ProgressState, progress: openetcher.FlashProgress) !void {
         const label = switch (progress.phase) {
             .probe => "probe",
             .plan => "plan",
@@ -95,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        defer image_source.deinit(arena);
+        defer image_source.deinit();
         var info = openetcher.probeImageSource(arena, io, &image_source, .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
@@ -124,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        defer image_source.deinit(arena);
+        defer image_source.deinit();
         const plan = openetcher.planImageFlashSource(arena, io, &image_source, .{}) catch |err| {
             try writeUserError(stderr, err);
             try stderr.flush();
@@ -223,7 +229,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        defer image_source.deinit(arena);
+        defer image_source.deinit();
         const report = openetcher.flashSource(arena, io, &image_source, target_path, .{
             .prepare_target = false,
             .strategy = if (parsed.force) .force_full_streaming else .planned_sparse,

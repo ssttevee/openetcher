@@ -2,38 +2,31 @@ const std = @import("std");
 
 const codec_api = @import("codec.zig");
 
-const Decompress = std.compress.zstd.Decompress;
+const zstd = std.compress.zstd;
 
-const ZstdContext = struct {
+pub const State = struct {
+    allocator: std.mem.Allocator,
+    /// Allocated rather than inline: at over 8 MiB it would size every
+    /// variant of `codec.Decoder`, whichever codec is in use.
     window: []u8,
-    decoder: *Decompress,
-
-    fn deinit(allocator: std.mem.Allocator, context: *anyopaque) void {
-        const self: *ZstdContext = @ptrCast(@alignCast(context));
-        allocator.destroy(self.decoder);
-        allocator.free(self.window);
-        allocator.destroy(self);
-    }
+    decompress: zstd.Decompress,
 };
 
-pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
-    const context = try args.allocator.create(ZstdContext);
-    errdefer args.allocator.destroy(context);
-
-    context.window = try args.allocator.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
-    errdefer args.allocator.free(context.window);
-
-    const decoder = try args.allocator.create(Decompress);
-    errdefer args.allocator.destroy(decoder);
-    decoder.* = Decompress.init(args.encoded_reader, context.window, .{});
-    context.decoder = decoder;
-
-    return .{
-        .reader = &decoder.reader,
-        .translate_errors = true,
-        .context = context,
-        .deinit_fn = ZstdContext.deinit,
+pub fn init(state: *State, args: codec_api.InitArgs) error{OutOfMemory}!void {
+    const window = try args.allocator.alloc(u8, zstd.default_window_len + zstd.block_size_max);
+    state.* = .{
+        .allocator = args.allocator,
+        .window = window,
+        .decompress = .init(args.encoded_reader, window, .{}),
     };
+}
+
+pub fn reader(state: *State) *std.Io.Reader {
+    return &state.decompress.reader;
+}
+
+pub fn deinit(state: *State) void {
+    state.allocator.free(state.window);
 }
 
 // Codec contract; see codec.zig.

@@ -140,13 +140,13 @@ pub fn probeImageSource(allocator: std.mem.Allocator, io: std.Io, image_source: 
 
 pub fn probeImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, options: ProbeOptions) !Info {
     var image_source = try source.openImageSourceFromPath(allocator, io, image_path, .{ .max_image_size = options.max_image_size });
-    defer image_source.deinit(allocator);
+    defer image_source.deinit();
     return probeImageSource(allocator, io, &image_source, options);
 }
 
 pub fn planImageFlashSourceFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, options: PlanOptions) !FlashPlan {
     var image_source = try source.openImageSourceFromPath(allocator, io, image_path, .{ .max_image_size = options.max_image_size });
-    defer image_source.deinit(allocator);
+    defer image_source.deinit();
     return planImageFlashSource(allocator, io, &image_source, options);
 }
 
@@ -161,25 +161,16 @@ pub fn planImageFlashSource(allocator: std.mem.Allocator, io: std.Io, image_sour
     };
 }
 
-/// Analyzes a source through random access when it offers one, so memory
-/// stays proportional to filesystem metadata rather than image size. Sources
-/// that can only stream fall back to decoding into memory.
+/// Analyzes a source through random access, so memory stays proportional
+/// to filesystem metadata rather than image size. Compressed sources are
+/// decoded into a spool on the first call.
 fn analyzeSource(allocator: std.mem.Allocator, io: std.Io, image_source: *source.ImageSource, max_image_size: ?u64) !Analysis {
-    if (try image_source.openReader(io, max_image_size)) |opened| {
-        var file_reader = opened;
-        defer file_reader.close(io);
-        const r = file_reader.reader();
+    var file_reader = try image_source.openReader(io, max_image_size);
+    defer file_reader.close(io);
+    const r = file_reader.reader();
 
-        const analysis = try analyzeReader(io, allocator, &r);
-        image_source.metadata.image_size = r.size;
-        return analysis;
-    }
-
-    const bytes = try readSourcePass(allocator, io, image_source, max_image_size);
-    defer allocator.free(bytes);
-
-    const analysis = try analyzeBytes(io, allocator, bytes);
-    image_source.metadata.image_size = bytes.len;
+    const analysis = try analyzeReader(io, allocator, &r);
+    image_source.metadata.image_size = r.size;
     return analysis;
 }
 
@@ -189,22 +180,6 @@ pub fn analyzeBytes(io: std.Io, allocator: std.mem.Allocator, bytes: []const u8)
     var buffer_reader = reader.Buffer.init(bytes);
     const r = buffer_reader.reader();
     return analyzeReader(io, allocator, &r);
-}
-
-fn readSourcePass(allocator: std.mem.Allocator, io: std.Io, image_source: *source.ImageSource, max_image_size: ?u64) ![]u8 {
-    var decoded_stream = try image_source.openStream(io, allocator);
-    defer decoded_stream.deinit();
-    if (max_image_size) |limit| decoded_stream.max_image_size = limit;
-
-    var bytes: std.ArrayList(u8) = .empty;
-    errdefer bytes.deinit(allocator);
-    var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const count = try decoded_stream.read(&buffer);
-        if (count == 0) break;
-        try bytes.appendSlice(allocator, buffer[0..count]);
-    }
-    return bytes.toOwnedSlice(allocator);
 }
 
 // Core analyzer shared by every entry point.
@@ -527,7 +502,7 @@ test "raw sources are analyzed without buffering the image" {
     const allocator = fixed.allocator();
 
     var image_source = try source.openImageSourceFromPath(allocator, io, path, .{});
-    defer image_source.deinit(allocator);
+    defer image_source.deinit();
 
     const plan = try planImageFlashSource(allocator, io, &image_source, .{});
     defer plan.deinit(allocator);

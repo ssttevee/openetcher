@@ -2,38 +2,23 @@ const std = @import("std");
 
 const codec_api = @import("codec.zig");
 
-const Decompress = std.compress.flate.Decompress;
+const flate = std.compress.flate;
 
-const GzipContext = struct {
-    window: []u8,
-    decoder: *Decompress,
-
-    fn deinit(allocator: std.mem.Allocator, context: *anyopaque) void {
-        const self: *GzipContext = @ptrCast(@alignCast(context));
-        allocator.destroy(self.decoder);
-        allocator.free(self.window);
-        allocator.destroy(self);
-    }
+pub const State = struct {
+    window: [flate.max_window_len]u8,
+    decompress: flate.Decompress,
 };
 
-pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
-    const context = try args.allocator.create(GzipContext);
-    errdefer args.allocator.destroy(context);
+pub fn init(state: *State, args: codec_api.InitArgs) error{}!void {
+    state.decompress = .init(args.encoded_reader, .gzip, &state.window);
+}
 
-    context.window = try args.allocator.alloc(u8, std.compress.flate.max_window_len);
-    errdefer args.allocator.free(context.window);
+pub fn reader(state: *State) *std.Io.Reader {
+    return &state.decompress.reader;
+}
 
-    const decoder = try args.allocator.create(Decompress);
-    errdefer args.allocator.destroy(decoder);
-    decoder.* = Decompress.init(args.encoded_reader, .gzip, context.window);
-    context.decoder = decoder;
-
-    return .{
-        .reader = &decoder.reader,
-        .translate_errors = true,
-        .context = context,
-        .deinit_fn = GzipContext.deinit,
-    };
+pub fn deinit(state: *State) void {
+    _ = state;
 }
 
 // Codec contract; see codec.zig.

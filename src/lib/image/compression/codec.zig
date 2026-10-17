@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const contract = @import("../../contract.zig");
+
 /// Compressed-container identifiers, ordered by nothing; the registry below
 /// defines detection precedence.
 pub const Compression = enum {
@@ -10,25 +12,15 @@ pub const Compression = enum {
     bzip2,
 };
 
-/// What one codec's `open` receives. Streaming codecs use `encoded_reader`;
+/// What one codec's `init` receives. Streaming codecs use `encoded_reader`;
 /// process-based decoders (bzip2 today) use `io` and `path` instead. Callers
 /// enforce the decoded size limit while reading, so codecs need not.
-pub const OpenArgs = struct {
+pub const InitArgs = struct {
     allocator: std.mem.Allocator,
     /// Streaming view of the encoded bytes; valid for the decoder's lifetime.
     encoded_reader: *std.Io.Reader,
     io: std.Io,
     path: []const u8,
-};
-
-/// What one codec's `open` returns. The codec owns every allocation behind
-/// `context`; the caller runs `deinit_fn` before tearing down the encoded
-/// reader.
-pub const Opened = struct {
-    reader: *std.Io.Reader,
-    translate_errors: bool = false,
-    context: ?*anyopaque = null,
-    deinit_fn: ?*const fn (allocator: std.mem.Allocator, context: *anyopaque) void = null,
 };
 
 /// Codecs, in detection precedence.
@@ -40,7 +32,12 @@ pub const Opened = struct {
 /// Required declarations:
 ///   `pub const id: Compression`
 ///   `pub const magic: []const u8` - prefix identifying the container
-///   `pub fn open(OpenArgs) !Opened`
+///   `pub const State: type` - decoder state, initialized in place; it
+///       lives inside the stream and never moves, so it may point into
+///       itself
+///   `pub fn init(*State, InitArgs) !void`
+///   `pub fn reader(*State) *std.Io.Reader` - the decoded bytes
+///   `pub fn deinit(*State) void` - releases what `init` acquired
 pub const codecs = .{
     @import("gzip.zig"),
     @import("xz.zig"),
@@ -48,12 +45,28 @@ pub const codecs = .{
     @import("bzip2.zig"),
 };
 
+/// One decoder of any registered codec, generated from `codecs` with one
+/// field per codec named after its `id`, so dispatch is a `switch` rather
+/// than a function pointer and the state needs no allocation of its own.
+pub const Decoder = Decoder: {
+    var names: [codecs.len][]const u8 = undefined;
+    var types: [codecs.len]type = undefined;
+    for (codecs, &names, &types) |C, *name, *T| {
+        name.* = @tagName(C.id);
+        T.* = C.State;
+    }
+    // Tags follow registry order, so a tag's value indexes `codecs`.
+    const Tag = @Enum(u8, .exhaustive, &names, &std.simd.iota(u8, codecs.len));
+    break :Decoder @Union(.auto, Tag, &names, &types, &@splat(.{}));
+};
+
 comptime {
     var seen: std.EnumSet(Compression) = .initOne(.none);
     for (codecs, 0..) |C, index| {
-        for ([_][]const u8{ "id", "magic", "open" }) |decl| {
-            if (!@hasDecl(C, decl)) @compileError(@typeName(C) ++ ": codec is missing `pub " ++ decl ++ "`");
-        }
+        contract.expectDecls(C, "codec", &.{ "id", "magic", "State", "init", "reader", "deinit" });
+        contract.expectFn(C, "init", &.{ *C.State, InitArgs }, void);
+        contract.expectFn(C, "reader", &.{*C.State}, *std.Io.Reader);
+        contract.expectFn(C, "deinit", &.{*C.State}, void);
         if (seen.contains(C.id)) @compileError("compression ." ++ @tagName(C.id) ++ " is registered twice or is reserved");
         seen.insert(C.id);
         if (C.magic.len == 0) @compileError(@typeName(C) ++ ": magic must not be empty");
@@ -81,12 +94,28 @@ pub fn detect(magic: []const u8) Compression {
     return .none;
 }
 
-/// Opens the decoder registered for `compression`.
-pub fn open(compression: Compression, args: OpenArgs) !Opened {
+/// Initializes `decoder` in place as the codec registered for `compression`.
+pub fn initDecoder(decoder: *Decoder, compression: Compression, args: InitArgs) !void {
     inline for (codecs) |C| {
-        if (C.id == compression) return C.open(args);
+        if (C.id == compression) {
+            decoder.* = @unionInit(Decoder, @tagName(C.id), undefined);
+            return C.init(&@field(decoder, @tagName(C.id)), args);
+        }
     }
     return error.UnsupportedCompression;
+}
+
+pub fn decodedReader(decoder: *Decoder) *std.Io.Reader {
+    return switch (decoder.*) {
+        inline else => |*state, tag| codecs[@backingInt(tag)].reader(state),
+    };
+}
+
+pub fn deinitDecoder(decoder: *Decoder) void {
+    switch (decoder.*) {
+        inline else => |*state, tag| codecs[@backingInt(tag)].deinit(state),
+    }
+    decoder.* = undefined;
 }
 
 pub fn hasMagicPrefix(bytes: []const u8, magic: []const u8) bool {

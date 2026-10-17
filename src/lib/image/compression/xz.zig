@@ -4,26 +4,22 @@ const codec_api = @import("codec.zig");
 
 const Decompress = std.compress.xz.Decompress;
 
-pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
-    const decoder = try args.allocator.create(Decompress);
-    errdefer args.allocator.destroy(decoder);
+/// XZ sizes its dictionary per block, so the decoder allocates it itself.
+pub const State = struct {
+    decompress: Decompress,
+};
 
-    decoder.* = Decompress.init(args.encoded_reader, args.allocator, &.{}) catch {
-        return error.InvalidCompressedImage;
-    };
-
-    return .{
-        .reader = &decoder.reader,
-        .translate_errors = true,
-        .context = decoder,
-        .deinit_fn = deinit,
-    };
+pub fn init(state: *State, args: codec_api.InitArgs) error{InvalidCompressedImage}!void {
+    // `init` reads the stream header, so a bad header fails here.
+    state.decompress = Decompress.init(args.encoded_reader, args.allocator, &.{}) catch return error.InvalidCompressedImage;
 }
 
-fn deinit(allocator: std.mem.Allocator, context: *anyopaque) void {
-    const decoder: *Decompress = @ptrCast(@alignCast(context));
-    decoder.deinit();
-    allocator.destroy(decoder);
+pub fn reader(state: *State) *std.Io.Reader {
+    return &state.decompress.reader;
+}
+
+pub fn deinit(state: *State) void {
+    state.decompress.deinit();
 }
 
 // Codec contract; see codec.zig.
