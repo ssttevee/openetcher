@@ -11,15 +11,14 @@ pub const Compression = enum {
 };
 
 /// What one codec's `open` receives. Streaming codecs use `encoded_reader`;
-/// process-based fallbacks (bzip2 today) additionally use `io`, `path`, and
-/// `max_image_size`.
+/// process-based decoders (bzip2 today) use `io` and `path` instead. Callers
+/// enforce the decoded size limit while reading, so codecs need not.
 pub const OpenArgs = struct {
     allocator: std.mem.Allocator,
     /// Streaming view of the encoded bytes; valid for the decoder's lifetime.
     encoded_reader: *std.Io.Reader,
     io: std.Io,
     path: []const u8,
-    max_image_size: ?u64,
 };
 
 /// What one codec's `open` returns. The codec owns every allocation behind

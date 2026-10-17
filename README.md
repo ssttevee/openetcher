@@ -281,6 +281,8 @@ All-zero chunks are detected with SIMD vector compares, so the check runs at mem
 
 Uncompressed images are analyzed in place and need no spool.
 
+gzip, xz, and zstd use Zig's built-in decoders. bzip2 is decoded by the system `bzip2` command, streamed through a pipe like the built-in decoders, so it must be on `PATH`; a `bzip2` that exits with an error, for example on a truncated file, fails the read rather than producing a short image.
+
 Writing is pipelined with `std.Io`: while one chunk is hashed and written to the target on an `io.async` task, the next is read and decompressed from the source. Digest verification overlaps reading the target with hashing in the same way. Every buffer is allocated before the first chunk, so the per-chunk path never allocates.
 
 Default chunk size is 1 MiB. Device writes use the backend's alignment requirement. The macOS backend uses 512-byte device alignment and pads a non-aligned final chunk as needed for raw device I/O.
@@ -476,7 +478,7 @@ src/
     image/compression/gzip.zig   gzip streaming decoder adapter
     image/compression/xz.zig     xz streaming decoder adapter
     image/compression/zstd.zig   zstd streaming decoder adapter
-    image/compression/bzip2.zig  bzip2 process-based fallback decoder
+    image/compression/bzip2.zig  bzip2 decoder streaming from the system `bzip2` command
 ```
 
 ### Design Rules

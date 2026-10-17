@@ -328,7 +328,6 @@ fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Alloca
         .encoded_reader = &context.file_reader.interface,
         .io = io,
         .path = source.path,
-        .max_image_size = source.max_image_size,
     });
     errdefer if (opened.deinit_fn) |deinit_fn| {
         if (opened.context) |codec_context| deinit_fn(allocator, codec_context);

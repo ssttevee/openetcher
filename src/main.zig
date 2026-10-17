@@ -675,6 +675,9 @@ fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {
         error.AmbiguousDiskId => {
             try writer.print("ambiguous disk id: run `openetcher disks --all --json` and choose a more specific target\n", .{});
         },
+        error.Bzip2Unavailable => {
+            try writer.print("bzip2 images are decompressed with the `bzip2` command, which was not found on PATH; install bzip2 or decompress the image first\n", .{});
+        },
         error.SpoolDirectoryFull => {
             try writer.print("not enough space to decompress the image into the spool directory; pass --spool-dir <dir> on a larger volume, or flash with --force to stream without planning\n", .{});
         },
