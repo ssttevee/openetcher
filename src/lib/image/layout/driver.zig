@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
 const mbr_mod = @import("mbr.zig");
@@ -10,30 +9,49 @@ const mbr_mod = @import("mbr.zig");
 /// mapping or leaves 0 and relies on content sniffing.
 pub const Span = mbr_mod.PartitionSpan;
 
-/// Contract every disk-layout parser satisfies.
-///
-/// Add a container format (for example GPT): create one module exposing
-/// `pub const driver`, then list it in `drivers`. The analyzer in image.zig
-/// owns assembly; a new layout also needs one branch there that turns spans
-/// plus filesystem drivers into an `Analysis`.
-pub const Driver = struct {
-    id: types.Info.Layout,
-    /// Cheap signature check against the whole-image reader. Must not allocate.
-    detect: *const fn (io: std.Io, r: *const reader_mod.Reader) bool,
-    /// Collects partition spans with absolute offsets. Empty for layouts
-    /// without partitions.
-    collect_spans: *const fn (allocator: std.mem.Allocator, io: std.Io, r: *const reader_mod.Reader) anyerror![]Span,
-};
+const Reader = reader_mod.Reader;
 
-/// Registry order is detection precedence among partitioned layouts.
-pub const drivers = [_]Driver{
-    @import("mbr.zig").driver,
+/// Disk-layout drivers, in detection precedence.
+///
+/// Add a container format (for example GPT): create one module satisfying
+/// the contract below, then list it here. The analyzer in image.zig turns
+/// each layout's spans plus the filesystem drivers into an `Analysis`.
+///
+/// Required declarations:
+///   `pub const layout: Layout` - tag reported for images in this layout
+///   `pub fn detect(std.Io, *const Reader) bool` - cheap, allocation-free
+///       signature check against the whole image
+///   `pub fn collectSpans(Allocator, std.Io, *const Reader) ![]Span` -
+///       partition spans with absolute offsets, sorted by offset
+pub const drivers = .{
+    mbr_mod,
 };
 
 comptime {
-    _ = &mbr_mod;
+    var seen: std.EnumSet(types.Info.Layout) = .empty;
+    for (drivers) |L| {
+        validate(L);
+        if (seen.contains(L.layout)) @compileError("two layout drivers report " ++ @tagName(L.layout));
+        seen.insert(L.layout);
+    }
+}
+
+/// Checks `L` against the layout contract. Generic callers invoke it first
+/// so a broken driver reports the contract, not a downstream type error.
+pub fn validate(comptime L: type) void {
+    for ([_][]const u8{ "layout", "detect", "collectSpans" }) |decl| {
+        if (!@hasDecl(L, decl)) @compileError(@typeName(L) ++ ": layout driver is missing `pub " ++ decl ++ "`");
+    }
+    _ = @as(types.Info.Layout, L.layout);
+    _ = @as(fn (std.Io, *const Reader) bool, L.detect);
+    const collect = @typeInfo(@TypeOf(L.collectSpans)).@"fn";
+    if (collect.param_types.len != 3 or collect.param_types[0] != std.mem.Allocator or collect.param_types[1] != std.Io or collect.param_types[2] != *const Reader or
+        @typeInfo(collect.return_type.?).error_union.payload != []Span)
+    {
+        @compileError(@typeName(L) ++ ".collectSpans must be fn (Allocator, std.Io, *const Reader) ![]Span");
+    }
 }
 
 test "layout registry exposes the mbr driver" {
-    try std.testing.expectEqual(types.Info.Layout.mbr, drivers[0].id);
+    try std.testing.expectEqual(types.Info.Layout.mbr, drivers[0].layout);
 }

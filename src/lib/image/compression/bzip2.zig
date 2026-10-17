@@ -17,7 +17,7 @@ const EagerContext = struct {
     }
 };
 
-fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
+pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
     const stdout_limit: std.Io.Limit = if (args.max_image_size) |limit| blk: {
         const limit_plus_one = std.math.add(u64, limit, 1) catch return error.DecompressedImageTooLarge;
         break :blk if (std.math.cast(usize, limit_plus_one)) |value| .limited(value) else .unlimited;
@@ -66,8 +66,7 @@ fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
     };
 }
 
-pub const codec: codec_api.Codec = .{
-    .id = .bzip2,
-    .magic = "BZh",
-    .open = open,
-};
+// Codec contract; see codec.zig.
+
+pub const id: codec_api.Compression = .bzip2;
+pub const magic: []const u8 = "BZh";

@@ -15,7 +15,8 @@ pub const region = @import("image/region.zig");
 pub const observer = @import("image/observer.zig");
 pub const reader = reader_mod;
 
-const drivers = fs_api.driver;
+const fs_drivers = fs_api.driver;
+const layout_drivers = layout_api.driver;
 
 pub const ByteRange = root.ByteRange;
 pub const FlashPlan = root.FlashPlan;
@@ -211,26 +212,24 @@ fn readSourcePass(allocator: std.mem.Allocator, io: std.Io, image_source: *sourc
 //   2. MBR partition table, with per-partition filesystem routing.
 //   3. Raw ext4 fallback (its own parser reports precise errors).
 // A future raw format inserts one detect-gated branch here, in precedence
-// order; a future filesystem registers in fs/driver.zig instead.
+// order; a future filesystem or layout registers in its driver.zig instead.
 fn analyzeReader(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader) !Analysis {
     if (r.size < mbr.sector_size) return error.InvalidImage;
 
-    const iso9660_driver = &fs_api.iso9660.driver;
-    if (iso9660_driver.detect(io, r)) {
-        return analyzeRawFilesystem(io, allocator, r, iso9660_driver, .raw_iso9660);
+    if (fs_api.iso9660.detect(io, r)) {
+        return analyzeRawFilesystem(fs_api.iso9660, io, allocator, r);
     }
 
-    for (&layout_api.driver.drivers) |*layout_driver| {
-        if (!layout_driver.detect(io, r)) continue;
-        return analyzePartitioned(io, allocator, r, layout_driver);
+    inline for (layout_drivers.drivers) |L| {
+        if (L.detect(io, r)) return analyzePartitioned(L, io, allocator, r);
     }
 
-    const ext4_driver = &fs_api.ext4.driver;
-    return analyzeRawFilesystem(io, allocator, r, ext4_driver, .raw_ext4);
+    return analyzeRawFilesystem(fs_api.ext4, io, allocator, r);
 }
 
-fn analyzeRawFilesystem(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader, driver: *const drivers.Driver, layout_tag: Layout) !Analysis {
-    const ranges = try driver.collect_ranges(allocator, io, r);
+fn analyzeRawFilesystem(comptime D: type, io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader) !Analysis {
+    comptime fs_drivers.validate(D);
+    const ranges = try D.collectRanges(allocator, io, r);
     errdefer allocator.free(ranges);
 
     var used_bytes: u64 = 0;
@@ -240,9 +239,9 @@ fn analyzeRawFilesystem(io: std.Io, allocator: std.mem.Allocator, r: *const read
         .info = .{
             .image_size = r.size,
             .encoded_size = r.size,
-            .layout = layout_tag,
-            .filesystem = driver.filesystem_tag,
-            .block_size = if (driver.block_size_fn) |block_size_fn| try block_size_fn(io, r) else null,
+            .layout = D.raw_layout,
+            .filesystem = D.filesystem,
+            .block_size = try D.blockSize(io, r),
             .used_bytes = used_bytes,
             .skipped_bytes = r.size - used_bytes,
             .range_count = ranges.len,
@@ -252,25 +251,9 @@ fn analyzeRawFilesystem(io: std.Io, allocator: std.mem.Allocator, r: *const read
     };
 }
 
-fn looksLikeMbr(io: std.Io, r: *const reader.Reader) !bool {
-    var sector: [mbr.sector_size]u8 = undefined;
-    r.readExactlyAt(io, &sector, 0) catch return false;
-    return mbr.looksLikeMbr(&sector);
-}
-
-fn analyzePartitioned(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader, layout_driver: *const layout_api.driver.Driver) !Analysis {
-    const spans = try layout_driver.collect_spans(allocator, io, r);
-    switch (layout_driver.id) {
-        .mbr => return analyzeMbrWithSpans(io, allocator, r, spans),
-        .raw_ext4, .raw_iso9660 => {
-            // Raw filesystem layouts never route through the partitioned path.
-            allocator.free(spans);
-            return error.InvalidImage;
-        },
-    }
-}
-
-fn analyzeMbrWithSpans(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader, spans: []mbr.PartitionSpan) !Analysis {
+fn analyzePartitioned(comptime L: type, io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader) !Analysis {
+    comptime layout_drivers.validate(L);
+    const spans = try L.collectSpans(allocator, io, r);
     defer allocator.free(spans);
 
     var partitions: std.ArrayList(Info.PartitionInfo) = .empty;
@@ -307,7 +290,7 @@ fn analyzeMbrWithSpans(io: std.Io, allocator: std.mem.Allocator, r: *const reade
 
     var info = Info{
         .image_size = r.size,
-        .layout = .mbr,
+        .layout = L.layout,
         .partitions = try partitions.toOwnedSlice(allocator),
     };
     errdefer info.deinit(allocator);
@@ -352,16 +335,16 @@ const PartitionPlan = struct {
 };
 
 fn planPartition(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader, span: mbr.PartitionSpan) PartitionPlan {
-    if (drivers.findByMbrType(span.partition_type)) |driver| {
-        return planWithDriver(io, allocator, r, span, driver);
+    var slice = reader.Slice.init(r, span.start_offset, span.size);
+    const sr = slice.reader();
+
+    inline for (fs_drivers.drivers) |D| {
+        if (fs_drivers.claimsMbrType(D, span.partition_type)) return planWithDriver(D, io, allocator, span, &sr);
     }
 
     if (span.partition_type == 0x83) {
-        var slice = reader.Slice.init(r, span.start_offset, span.size);
-        const sr = slice.reader();
-
         if (fs_api.squashfs.detect(io, &sr)) {
-            return planWithDriverReader(io, allocator, span, &fs_api.squashfs.driver, &sr);
+            return planWithDriver(fs_api.squashfs, io, allocator, span, &sr);
         }
 
         if (partitionHeadIsZero(io, &sr)) {
@@ -376,7 +359,7 @@ fn planPartition(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Read
             } };
         }
 
-        return planWithDriverReader(io, allocator, span, &fs_api.ext4.driver, &sr);
+        return planWithDriver(fs_api.ext4, io, allocator, span, &sr);
     }
 
     return .{ .partition = .{
@@ -390,27 +373,21 @@ fn planPartition(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Read
     } };
 }
 
-fn planWithDriver(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader, span: mbr.PartitionSpan, driver: *const drivers.Driver) PartitionPlan {
-    var slice = reader.Slice.init(r, span.start_offset, span.size);
-    const sr = slice.reader();
-    return planWithDriverReader(io, allocator, span, driver, &sr);
-}
-
-fn planWithDriverReader(io: std.Io, allocator: std.mem.Allocator, span: mbr.PartitionSpan, driver: *const drivers.Driver, sr: *const reader.Reader) PartitionPlan {
-    const partition = driver.probe_region(allocator, io, sr) catch |err| {
-        const label = driverReasonLabel(driver);
+fn planWithDriver(comptime D: type, io: std.Io, allocator: std.mem.Allocator, span: mbr.PartitionSpan, sr: *const reader.Reader) PartitionPlan {
+    comptime fs_drivers.validate(D);
+    const partition = D.probeRegion(allocator, io, sr) catch |err| {
         return .{ .partition = .{
             .index = span.index,
             .start_offset = span.start_offset,
             .size = span.size,
             .partition_type = span.partition_type,
-            .filesystem = driverFallbackTag(driver),
+            .filesystem = D.unrecognized,
             .supported = false,
-            .reason = std.fmt.allocPrint(allocator, "{s}: {t}", .{ label, err }) catch null,
+            .reason = std.fmt.allocPrint(allocator, D.name ++ " probe failed: {t}", .{err}) catch null,
         } };
     };
 
-    const relative_ranges = driver.collect_ranges(allocator, io, sr) catch |err| {
+    const relative_ranges = D.collectRanges(allocator, io, sr) catch |err| {
         return .{ .partition = .{
             .index = span.index,
             .start_offset = span.start_offset,
@@ -418,7 +395,7 @@ fn planWithDriverReader(io: std.Io, allocator: std.mem.Allocator, span: mbr.Part
             .partition_type = span.partition_type,
             .filesystem = partition.filesystem,
             .supported = false,
-            .reason = std.fmt.allocPrint(allocator, "{s} range collection failed: {t}", .{ driverReasonLabel(driver), err }) catch null,
+            .reason = std.fmt.allocPrint(allocator, D.name ++ " range collection failed: {t}", .{err}) catch null,
         } };
     };
 
@@ -428,19 +405,6 @@ fn planWithDriverReader(io: std.Io, allocator: std.mem.Allocator, span: mbr.Part
     filled.size = span.size;
     filled.partition_type = span.partition_type;
     return .{ .partition = filled, .relative_ranges = relative_ranges };
-}
-
-fn driverReasonLabel(driver: *const drivers.Driver) []const u8 {
-    if (driver == &fs_api.fat.driver) return "fat probe failed";
-    if (driver == &fs_api.squashfs.driver) return "squashfs probe failed";
-    if (driver == &fs_api.ext4.driver) return "ext4 probe failed";
-    if (driver == &fs_api.iso9660.driver) return "iso9660 probe failed";
-    return "probe failed";
-}
-
-fn driverFallbackTag(driver: *const drivers.Driver) Info.Filesystem {
-    if (driver == &fs_api.squashfs.driver) return .squashfs;
-    return .linux_unknown;
 }
 
 fn partitionHeadIsZero(io: std.Io, sr: *const reader.Reader) bool {

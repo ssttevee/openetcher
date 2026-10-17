@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const reader_mod = @import("../reader.zig");
-const driver_api = @import("driver.zig");
+const types = @import("../types.zig");
 
 pub const sector_size: usize = 512;
 pub const partition_entry_offset: usize = 446;
@@ -61,7 +61,11 @@ pub fn collectPartitionSpans(allocator: std.mem.Allocator, sector: *const [secto
     return result;
 }
 
-fn detect(io: std.Io, r: *const reader_mod.Reader) bool {
+// Layout driver contract; see driver.zig.
+
+pub const layout: types.Info.Layout = .mbr;
+
+pub fn detect(io: std.Io, r: *const reader_mod.Reader) bool {
     if (r.size < sector_size) return false;
 
     var buffer: [sector_size]u8 = undefined;
@@ -69,17 +73,11 @@ fn detect(io: std.Io, r: *const reader_mod.Reader) bool {
     return looksLikeMbr(&buffer);
 }
 
-fn collectSpans(allocator: std.mem.Allocator, io: std.Io, r: *const reader_mod.Reader) ![]driver_api.Span {
+pub fn collectSpans(allocator: std.mem.Allocator, io: std.Io, r: *const reader_mod.Reader) ![]PartitionSpan {
     var buffer: [sector_size]u8 = undefined;
     try r.readExactlyAt(io, &buffer, 0);
     return collectPartitionSpans(allocator, &buffer, r.size);
 }
-
-pub const driver: driver_api.Driver = .{
-    .id = .mbr,
-    .detect = detect,
-    .collect_spans = collectSpans,
-};
 
 fn lessByOffset(_: void, lhs: PartitionSpan, rhs: PartitionSpan) bool {
     if (lhs.start_offset != rhs.start_offset) return lhs.start_offset < rhs.start_offset;
@@ -132,9 +130,9 @@ test "layout driver detects an mbr image through a buffer reader" {
     const r = source.reader();
     const io = std.testing.io;
 
-    try std.testing.expect(driver.detect(io, &r));
+    try std.testing.expect(detect(io, &r));
 
-    const spans = try driver.collect_spans(std.testing.allocator, io, &r);
+    const spans = try collectSpans(std.testing.allocator, io, &r);
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(usize, 1), spans.len);
     try std.testing.expectEqual(@as(u64, 512), spans[0].start_offset);

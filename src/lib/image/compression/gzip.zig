@@ -16,7 +16,7 @@ const GzipContext = struct {
     }
 };
 
-fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
+pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
     const context = try args.allocator.create(GzipContext);
     errdefer args.allocator.destroy(context);
 
@@ -36,8 +36,7 @@ fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
     };
 }
 
-pub const codec: codec_api.Codec = .{
-    .id = .gzip,
-    .magic = &.{ 0x1f, 0x8b },
-    .open = open,
-};
+// Codec contract; see codec.zig.
+
+pub const id: codec_api.Compression = .gzip;
+pub const magic: []const u8 = &.{ 0x1f, 0x8b };

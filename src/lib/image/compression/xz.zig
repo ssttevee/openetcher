@@ -4,7 +4,7 @@ const codec_api = @import("codec.zig");
 
 const Decompress = std.compress.xz.Decompress;
 
-fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
+pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
     const decoder = try args.allocator.create(Decompress);
     errdefer args.allocator.destroy(decoder);
 
@@ -26,8 +26,7 @@ fn deinit(allocator: std.mem.Allocator, context: *anyopaque) void {
     allocator.destroy(decoder);
 }
 
-pub const codec: codec_api.Codec = .{
-    .id = .xz,
-    .magic = &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 },
-    .open = open,
-};
+// Codec contract; see codec.zig.
+
+pub const id: codec_api.Compression = .xz;
+pub const magic: []const u8 = &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 };

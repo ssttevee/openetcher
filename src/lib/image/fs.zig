@@ -16,7 +16,6 @@ pub const Filesystem = enum {
 
 /// Driver contract and format registry. See driver.zig.
 pub const driver = @import("fs/driver.zig");
-pub const Driver = driver.Driver;
 
 pub const ext4 = @import("fs/ext4.zig");
 pub const fat = @import("fs/fat.zig");

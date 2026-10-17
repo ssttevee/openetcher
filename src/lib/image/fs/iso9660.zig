@@ -3,7 +3,6 @@ const std = @import("std");
 const types = @import("../types.zig");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
-const driver_api = @import("driver.zig");
 
 pub const ImageInfo = types.Info;
 pub const ByteRange = range.ByteRange;
@@ -24,7 +23,7 @@ pub fn detect(io: std.Io, r: *const Reader) bool {
         descriptor[6] == 1;
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) anyerror!ImageInfo.PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !ImageInfo.PartitionInfo {
     _ = allocator;
     if (!detect(io, r)) return error.InvalidIso9660Image;
 
@@ -82,16 +81,14 @@ pub fn collectIso9660Ranges(allocator: std.mem.Allocator, io: std.Io, file: std.
     return collectRanges(allocator, io, &r);
 }
 
-pub const driver: driver_api.Driver = .{
-    .detect = detect,
-    .probe_region = probeRegion,
-    .collect_ranges = collectRanges,
-    .raw_layout = .raw_iso9660,
-    .filesystem_tag = .iso9660,
-    .block_size_fn = blockSize,
-};
+// Filesystem driver contract; see driver.zig.
 
-fn blockSize(io: std.Io, r: *const Reader) anyerror!u32 {
+pub const name = "iso9660";
+pub const unrecognized: types.Info.Filesystem = .linux_unknown;
+pub const raw_layout: types.Info.Layout = .raw_iso9660;
+pub const filesystem: types.Info.Filesystem = .iso9660;
+
+pub fn blockSize(io: std.Io, r: *const Reader) error{}!u32 {
     _ = io;
     _ = r;
     return logical_block_size;

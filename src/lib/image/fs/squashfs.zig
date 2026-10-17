@@ -3,7 +3,6 @@ const std = @import("std");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
-const driver_api = @import("driver.zig");
 
 pub const ByteRange = range.ByteRange;
 pub const PartitionInfo = types.Info.PartitionInfo;
@@ -24,7 +23,7 @@ pub fn detect(io: std.Io, r: *const Reader) bool {
     return magic == squashfs_magic;
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) anyerror!PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !PartitionInfo {
     _ = allocator;
     const superblock = try readSuperblock(io, r);
 
@@ -83,11 +82,10 @@ fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
     };
 }
 
-pub const driver: driver_api.Driver = .{
-    .detect = detect,
-    .probe_region = probeRegion,
-    .collect_ranges = collectRanges,
-};
+// Filesystem driver contract; see driver.zig.
+
+pub const name = "squashfs";
+pub const unrecognized: types.Info.Filesystem = .squashfs;
 
 test "readSuperblock detects squashfs bytes_used" {
     var bytes: [4096]u8 = @splat(0);

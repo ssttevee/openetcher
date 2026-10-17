@@ -213,13 +213,6 @@ pub fn detectCompression(magic: []const u8) Compression {
     return codec_api.detect(magic);
 }
 
-fn codecFor(compression: Compression) ?*const codec_api.Codec {
-    for (&codec_api.codecs) |*candidate| {
-        if (candidate.id == compression) return candidate;
-    }
-    return null;
-}
-
 pub fn openImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: SourceOptions) !ImageSource {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false });
     defer file.close(io);
@@ -308,8 +301,6 @@ fn openFileStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator
 }
 
 fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator) !Stream {
-    const codec = codecFor(source.compression) orelse return error.UnsupportedCompression;
-
     var file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
     errdefer file.close(io);
 
@@ -331,7 +322,7 @@ fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Alloca
         .io = io,
     };
 
-    const opened = try codec.open(.{
+    const opened = try codec_api.open(source.compression, .{
         .allocator = allocator,
         .encoded_reader = &context.file_reader.interface,
         .io = io,

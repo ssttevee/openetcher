@@ -3,7 +3,6 @@ const std = @import("std");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
-const driver_api = @import("driver.zig");
 
 pub const ByteRange = range.ByteRange;
 pub const PartitionInfo = types.Info.PartitionInfo;
@@ -13,7 +12,7 @@ pub const Reader = reader_mod.Reader;
 const sector_size: u64 = 512;
 
 /// MBR partition-type bytes historically holding FAT.
-const mbr_types = [_]u8{ 0x06, 0x0b, 0x0c, 0x0e };
+pub const mbr_types = [_]u8{ 0x06, 0x0b, 0x0c, 0x0e };
 
 const BootSector = struct {
     bytes_per_sector: u16,
@@ -53,7 +52,7 @@ pub fn detect(io: std.Io, r: *const Reader) bool {
     return true;
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) anyerror!PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !PartitionInfo {
     const boot = try readBootSector(io, r, r.size);
     const ranges = try collectRanges(allocator, io, r);
     defer allocator.free(ranges);
@@ -195,12 +194,10 @@ fn readU32(bytes: []const u8) u32 {
     return std.mem.readInt(u32, bytes[0..4], .little);
 }
 
-pub const driver: driver_api.Driver = .{
-    .mbr_types = &mbr_types,
-    .detect = detect,
-    .probe_region = probeRegion,
-    .collect_ranges = collectRanges,
-};
+// Filesystem driver contract; see driver.zig.
+
+pub const name = "fat";
+pub const unrecognized: Filesystem = .linux_unknown;
 
 test "readBootSector detects fat16" {
     var bytes: [2048 * 512]u8 = @splat(0);

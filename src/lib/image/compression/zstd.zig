@@ -16,7 +16,7 @@ const ZstdContext = struct {
     }
 };
 
-fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
+pub fn open(args: codec_api.OpenArgs) !codec_api.Opened {
     const context = try args.allocator.create(ZstdContext);
     errdefer args.allocator.destroy(context);
 
@@ -36,8 +36,7 @@ fn open(args: codec_api.OpenArgs) anyerror!codec_api.Opened {
     };
 }
 
-pub const codec: codec_api.Codec = .{
-    .id = .zstd,
-    .magic = &.{ 0x28, 0xb5, 0x2f, 0xfd },
-    .open = open,
-};
+// Codec contract; see codec.zig.
+
+pub const id: codec_api.Compression = .zstd;
+pub const magic: []const u8 = &.{ 0x28, 0xb5, 0x2f, 0xfd };

@@ -3,7 +3,6 @@ const std = @import("std");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
-const driver_api = @import("driver.zig");
 
 pub const ByteRange = range.ByteRange;
 pub const ImageInfo = types.Info;
@@ -94,7 +93,7 @@ pub fn superblockBlockSize(io: std.Io, r: *const Reader) !u32 {
     return superblock.blockSize();
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) anyerror!PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !PartitionInfo {
     const superblock = try readSuperblock(io, r);
     try validateSuperblock(superblock, r.size);
 
@@ -392,18 +391,15 @@ fn readU32(bytes: []const u8) u32 {
     return std.mem.readInt(u32, bytes[0..4], .little);
 }
 
-pub const driver: driver_api.Driver = .{
-    .detect = detectImpl,
-    .probe_region = probeRegion,
-    .collect_ranges = collectRanges,
-    .raw_layout = .raw_ext4,
-    .filesystem_tag = .ext4,
-    .block_size_fn = superblockBlockSize,
-};
+// Filesystem driver contract; see driver.zig.
 
-fn detectImpl(io: std.Io, r: *const Reader) bool {
-    return detect(io, r);
-}
+pub const name = "ext4";
+/// ext4 is the fallback for Linux partitions, so a failed probe means the
+/// partition holds some other Linux filesystem.
+pub const unrecognized: types.Info.Filesystem = .linux_unknown;
+pub const raw_layout: types.Info.Layout = .raw_ext4;
+pub const filesystem: types.Info.Filesystem = .ext4;
+pub const blockSize = superblockBlockSize;
 
 test "group index sparse super selection" {
     try std.testing.expect(groupIndexHasSuperblock(0));
