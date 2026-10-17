@@ -205,6 +205,9 @@ fn analyzeReader(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Read
 }
 
 fn analyzeRawFilesystem(comptime D: type, io: std.Io, allocator: std.mem.Allocator, r: *const reader.Reader) !Analysis {
+    // `r.size - used_bytes` trusts the driver to return disjoint ranges;
+    // a driver bug must trap rather than wrap into a huge skipped count.
+    @setRuntimeSafety(true);
     comptime fs_drivers.validate(D);
     const ranges = try D.collectRanges(allocator, io, r);
     errdefer allocator.free(ranges);

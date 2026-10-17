@@ -266,6 +266,11 @@ pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !
 }
 
 pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) ![]ByteRange {
+    // Group and block arithmetic below combines untrusted header fields and
+    // is only overflow-free because `validateSuperblock` and
+    // `checkDescriptor` bound them. If those checks ever miss a case, trap
+    // instead of wrapping into a plan that writes the wrong blocks.
+    @setRuntimeSafety(true);
     const superblock = try readSuperblock(io, r);
     try validateSuperblock(superblock, r.size);
 
@@ -445,6 +450,8 @@ fn inodeSize(superblock: Superblock) u16 {
 
 /// Reads the whole descriptor table in one request and decodes each entry.
 fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, r: *const Reader, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32) !void {
+    // Sizes and offsets derive from untrusted header fields; see `collectRanges`.
+    @setRuntimeSafety(true);
     const entry_size: usize = @intCast(desc_size);
     const table_len = std.math.mul(usize, descriptors.len, entry_size) catch return error.InvalidExt4Superblock;
     const table = try allocator.alloc(u8, table_len);
@@ -468,6 +475,9 @@ fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, r: *const Read
 }
 
 fn appendMetadataRanges(allocator: std.mem.Allocator, list: *std.ArrayList(ByteRange), block_size: u32, group_index: u64, group_first_block: u64, descriptor_table_block: u64, descriptor_table_blocks: u64, descriptor: GroupDescriptor, inode_table_blocks: u64) !void {
+    // Block numbers come from untrusted descriptors that the caller checked
+    // with `checkDescriptor`; see `collectRanges`.
+    @setRuntimeSafety(true);
     if (groupIndexHasSuperblock(group_index)) {
         const superblock_block: u64 = if (group_index == 0 and block_size == 1024) 1 else group_first_block;
         try list.append(allocator, .{ .offset = superblock_block * block_size, .length = block_size });
@@ -482,6 +492,8 @@ fn appendMetadataRanges(allocator: std.mem.Allocator, list: *std.ArrayList(ByteR
 }
 
 fn readBlock(io: std.Io, r: *const Reader, block_number: u64, block_size: u32, buffer: []u8) !void {
+    // `block_number` is an untrusted descriptor field; see `collectRanges`.
+    @setRuntimeSafety(true);
     if (buffer.len < block_size) return error.InternalBufferTooSmall;
     try r.readExactlyAt(io, buffer[0..block_size], block_number * block_size);
 }

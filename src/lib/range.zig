@@ -6,7 +6,12 @@ pub const ByteRange = struct {
     offset: u64,
     length: u64,
 
+    /// Callers must have checked that the range does not overflow, as
+    /// `normalizeRanges` does. Ranges come from untrusted images, so a
+    /// missed check traps here in every build mode instead of being
+    /// undefined behavior.
     pub fn end(self: @This()) u64 {
+        @setRuntimeSafety(true);
         return std.math.add(u64, self.offset, self.length) catch unreachable;
     }
 };

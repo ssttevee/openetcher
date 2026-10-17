@@ -66,6 +66,9 @@ const BootSector = struct {
     filesystem: Filesystem,
 
     fn clusterFirstSector(self: BootSector, cluster: u32) u64 {
+        // u32 sector arithmetic on untrusted geometry, overflow-free only
+        // because `readBootSector` keeps the data area inside the volume.
+        @setRuntimeSafety(true);
         const data_sector = self.first_data_sector + ((cluster - 2) * self.sectors_per_cluster);
         return @as(u64, data_sector) * self.bytes_per_sector;
     }
@@ -75,6 +78,8 @@ const BootSector = struct {
     }
 
     fn fatOffset(self: BootSector, fat_index: u8) u64 {
+        // Bounded by the metadata check in `readBootSector`.
+        @setRuntimeSafety(true);
         const sector = self.reserved_sector_count + (@as(u32, fat_index) * self.fat_size_sectors);
         return @as(u64, sector) * self.bytes_per_sector;
     }
@@ -108,6 +113,9 @@ pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !
 }
 
 pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) ![]ByteRange {
+    // The FAT length is untrusted and narrowed to `usize`, which is 32 bits
+    // on some targets; trap rather than truncate the buffer.
+    @setRuntimeSafety(true);
     const boot = try readBootSector(io, r, r.size);
 
     var ranges: std.ArrayList(ByteRange) = .empty;
