@@ -462,7 +462,7 @@ test "flashImage copies only declared ranges" {
     try source.writeStreamingAll(io, &source_bytes);
     try source.sync(io);
 
-    const filler = [_]u8{0} ** source_bytes.len;
+    const filler: [source_bytes.len]u8 = @splat(0);
     try destination.writeStreamingAll(io, &filler);
     try destination.sync(io);
 
@@ -505,10 +505,10 @@ test "flashToPathFromPath writes and verifies planned ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const source_bytes = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe } ++ [_]u8{0} ** 10;
+    const source_bytes = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe } ++ @as([10]u8, @splat(0));
     try tmp.dir.writeFile(io, .{ .sub_path = "src.img", .data = &source_bytes });
 
-    const dest_bytes = [_]u8{0} ** source_bytes.len;
+    const dest_bytes: [source_bytes.len]u8 = @splat(0);
     try tmp.dir.writeFile(io, .{ .sub_path = "dst.img", .data = &dest_bytes });
 
     const src_path = try tmp.dir.realPathFileAlloc(io, "src.img", std.testing.allocator);
@@ -530,7 +530,7 @@ test "flashToPathFromPath writes and verifies planned ranges" {
     defer dst.close(io);
     _ = try dst.readPositionalAll(io, &written_back, 0);
     try std.testing.expectEqualSlices(u8, source_bytes[0..4], written_back[0..4]);
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 6, written_back[4..10]);
+    try std.testing.expectEqualSlices(u8, &@as([6]u8, @splat(0)), written_back[4..10]);
     try std.testing.expectEqualSlices(u8, source_bytes[10..16], written_back[10..16]);
 }
 

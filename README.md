@@ -20,7 +20,7 @@ The command-line tool is a thin layer over the `openetcher` library. The current
 
 ## Requirements
 
-- Zig `0.16.0`
+- Zig `0.17.0`
 - macOS for physical disk discovery and flashing
 - `diskutil` on macOS, used for device discovery, sizing, and unmounting
 

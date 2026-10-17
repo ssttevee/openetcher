@@ -462,7 +462,7 @@ test "analyzeReader detects mbr partitions through a file region" {
     var file = try tmp.dir.createFile(io, "disk.img", .{ .read = true });
     defer file.close(io);
 
-    var bytes = [_]u8{0} ** (8192 * 512);
+    var bytes: [8192 * 512]u8 = @splat(0);
     bytes[446 + 4] = 0x06;
     std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 2048, .little);
     std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);
@@ -528,7 +528,7 @@ test "planImageFlash rejects unsupported mbr partitions" {
     var file = try tmp.dir.createFile(io, "disk.img", .{ .read = true });
     defer file.close(io);
 
-    var bytes = [_]u8{0} ** (4096 * 512);
+    var bytes: [4096 * 512]u8 = @splat(0);
     bytes[446 + 4] = 0x0c;
     std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 2048, .little);
     std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);

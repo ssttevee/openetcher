@@ -90,7 +90,7 @@ pub const driver: driver_api.Driver = .{
 };
 
 test "readSuperblock detects squashfs bytes_used" {
-    var bytes = [_]u8{0} ** 4096;
+    var bytes: [4096]u8 = @splat(0);
     std.mem.writeInt(u32, bytes[0..4], squashfs_magic, .little);
     std.mem.writeInt(u32, bytes[12..16], 131072, .little);
     std.mem.writeInt(u64, bytes[40..48], 1024, .little);

@@ -417,7 +417,7 @@ test "group index sparse super selection" {
 }
 
 test "detect accepts valid magic through buffer reader" {
-    var bytes = [_]u8{0} ** 4096;
+    var bytes: [4096]u8 = @splat(0);
     std.mem.writeInt(u16, bytes[1024 + 56 ..][0..2], ext4_magic, .little);
     // Minimal plausible geometry so validate passes during probe paths.
     std.mem.writeInt(u32, bytes[1024 + 4 ..][0..4], 512, .little); // blocks_count

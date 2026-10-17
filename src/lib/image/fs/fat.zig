@@ -203,7 +203,7 @@ pub const driver: driver_api.Driver = .{
 };
 
 test "readBootSector detects fat16" {
-    var bytes = [_]u8{0} ** (2048 * 512);
+    var bytes: [2048 * 512]u8 = @splat(0);
     std.mem.writeInt(u16, bytes[11..13], 512, .little);
     bytes[13] = 4;
     std.mem.writeInt(u16, bytes[14..16], 1, .little);

@@ -95,7 +95,7 @@ fn readU32(bytes: []const u8) u32 {
 }
 
 test "looksLikeMbr detects active partition table" {
-    var sector = [_]u8{0} ** sector_size;
+    var sector: [sector_size]u8 = @splat(0);
     sector[partition_entry_offset + 4] = 0x83;
     std.mem.writeInt(u32, sector[partition_entry_offset + 8 ..][0..4], 2048, .little);
     std.mem.writeInt(u32, sector[partition_entry_offset + 12 ..][0..4], 1024, .little);
@@ -105,7 +105,7 @@ test "looksLikeMbr detects active partition table" {
 }
 
 test "partition spans are sorted by logical offset" {
-    var sector = [_]u8{0} ** sector_size;
+    var sector: [sector_size]u8 = @splat(0);
     sector[partition_entry_offset + 4] = 0x83;
     std.mem.writeInt(u32, sector[partition_entry_offset + 8 ..][0..4], 4096, .little);
     std.mem.writeInt(u32, sector[partition_entry_offset + 12 ..][0..4], 8, .little);
@@ -122,7 +122,7 @@ test "partition spans are sorted by logical offset" {
 }
 
 test "layout driver detects an mbr image through a buffer reader" {
-    var bytes = [_]u8{0} ** (2048 * 512);
+    var bytes: [2048 * 512]u8 = @splat(0);
     bytes[446 + 4] = 0x06;
     std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 1, .little);
     std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);
