@@ -70,6 +70,7 @@ test {
         @import("lib/range.zig"),
         @import("lib/scan.zig"),
         @import("lib/flash.zig"),
+        @import("lib/fault_io.zig"),
         @import("lib/device.zig"),
         @import("lib/image.zig"),
         @import("lib/image/source.zig"),

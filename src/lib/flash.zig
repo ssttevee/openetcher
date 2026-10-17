@@ -29,6 +29,11 @@ pub const UnsupportedPolicy = enum {
 
 pub const Options = struct {
     block_size: usize = 1024 * 1024,
+    /// Chunks in flight at once. Each is hashed, and when flashing written,
+    /// on tasks of its own while the next is read, so a deeper pipeline
+    /// keeps more transfers queued at the target. Each costs one
+    /// `block_size` buffer; 0 behaves as 1.
+    pipeline_depth: usize = 4,
     verify: VerifyMode = .digest,
     unsupported: UnsupportedPolicy = .fail,
     strategy: Strategy = .planned_sparse,
@@ -144,104 +149,166 @@ fn countRanges(ranges: []const ByteRange) u64 {
     return total;
 }
 
+/// SHA-256 rather than BLAKE3: on Apple silicon, with SHA-2 instructions,
+/// it hashes about 1.5 times faster per core than `std.crypto.hash.Blake3`.
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Digest = [Sha256.digest_length]u8;
+const WriteResult = @typeInfo(@TypeOf(device.target_io.writeAt)).@"fn".return_type.?;
 
-/// Two buffers passed back and forth between the caller, which fills one,
-/// and an `io.async` task that consumes the other, so producing the next
-/// chunk overlaps consuming the last. At most one consume is in flight, so
-/// consumers run in submission order and may keep state without locking.
-fn Pipeline(comptime Consumer: type) type {
-    const Result = @typeInfo(@TypeOf(Consumer.consume)).@"fn".return_type.?;
+/// Every buffer starts on this boundary, which satisfies the memory
+/// alignment any raw device asks of positional transfers.
+const buffer_alignment: std.mem.Alignment = .fromByteUnits(4096);
 
-    return struct {
-        consumer: *Consumer,
-        slots: [2][]u8,
-        next: u1 = 0,
-        pending: ?std.Io.Future(Result) = null,
+/// A ring of chunk buffers cycled between the caller, which fills them in
+/// order, and concurrent consumers: every submitted chunk is hashed on one
+/// task and, when flashing, written on another. Writes are positional, so
+/// with one slot per `Options.pipeline_depth` that many chunks are hashed and
+/// written at once while the caller reads the next.
+///
+/// The digest is a SHA-256 over the chunks' SHA-256 digests, folded in as
+/// slots are reclaimed, which happens in submission order. Chunk digests are
+/// independent, so hashing spreads across cores instead of serializing the
+/// whole pipeline behind one SHA-256 stream. Flashing and verification cut
+/// identical chunks from identical ranges, so their digests compare.
+const Pipeline = struct {
+    memory: []align(buffer_alignment.toByteUnits()) u8,
+    slots: []Slot,
+    next: usize = 0,
+    /// Null when only hashing, as digest verification does.
+    target: ?*device.OpenTarget,
+    digest: Sha256 = .init(.{}),
+    /// Bytes of reclaimed chunks: hashed and, when flashing, written.
+    completed: u64 = 0,
 
-        const Self = @This();
+    const Slot = struct {
+        buffer: []u8,
+        len: usize = 0,
+        chunk_digest: Digest = undefined,
+        hashing: ?std.Io.Future(void) = null,
+        writing: ?std.Io.Future(WriteResult) = null,
+    };
 
-        fn init(allocator: std.mem.Allocator, consumer: *Consumer, slot_len: usize) !Self {
-            const first = try allocator.alloc(u8, slot_len);
-            errdefer allocator.free(first);
-            return .{ .consumer = consumer, .slots = .{ first, try allocator.alloc(u8, slot_len) } };
+    fn init(allocator: std.mem.Allocator, depth: usize, slot_len: usize, target: ?*device.OpenTarget) !Pipeline {
+        const slots = try allocator.alloc(Slot, @max(depth, 1));
+        errdefer allocator.free(slots);
+        const stride = buffer_alignment.forward(slot_len);
+        const memory = try allocator.alignedAlloc(u8, buffer_alignment, try std.math.mul(usize, slots.len, stride));
+        for (slots, 0..) |*slot, index| slot.* = .{ .buffer = memory[index * stride ..][0..slot_len] };
+        return .{ .memory = memory, .slots = slots, .target = target };
+    }
+
+    /// Cancels and awaits every task still in flight, so none can touch a
+    /// buffer after it is freed.
+    fn deinit(self: *Pipeline, allocator: std.mem.Allocator, io: std.Io) void {
+        for (self.slots) |*slot| {
+            if (slot.hashing) |*future| future.cancel(io);
+            if (slot.writing) |*future| future.cancel(io) catch {};
         }
+        allocator.free(self.memory);
+        allocator.free(self.slots);
+        self.* = undefined;
+    }
 
-        /// Cancels any consume still in flight before freeing its buffer.
-        fn deinit(self: *Self, allocator: std.mem.Allocator, io: std.Io) void {
-            if (self.pending) |*future| _ = future.cancel(io) catch {};
-            for (self.slots) |slot| allocator.free(slot);
+    /// The buffer to fill next, once the chunk it last carried is done.
+    fn buffer(self: *Pipeline, io: std.Io) ![]u8 {
+        const slot = &self.slots[self.next];
+        try self.reclaim(io, slot);
+        return slot.buffer;
+    }
+
+    /// Hands the first `len` bytes of `buffer()` to the consumers.
+    fn submit(self: *Pipeline, io: std.Io, len: usize, offset: u64) void {
+        const slot = &self.slots[self.next];
+        slot.len = len;
+        // Writes zero-pad past `len` in place while the hash reads only up
+        // to it, so the two tasks never touch the same bytes.
+        slot.hashing = start(io, hashChunk, .{ slot.buffer[0..len], &slot.chunk_digest });
+        if (self.target) |target| slot.writing = start(io, device.target_io.writeAt, .{ io, target, slot.buffer, len, offset });
+        self.next = (self.next + 1) % self.slots.len;
+    }
+
+    /// Waits for every chunk in submission order and returns the digest. A
+    /// failed write surfaces here or from `buffer`, in submission order.
+    fn finish(self: *Pipeline, io: std.Io) !Digest {
+        for (0..self.slots.len) |_| {
+            try self.reclaim(io, &self.slots[self.next]);
+            self.next = (self.next + 1) % self.slots.len;
         }
+        return self.digest.finalResult();
+    }
 
-        /// The buffer to fill next. It is never the one being consumed.
-        fn buffer(self: *const Self) []u8 {
-            return self.slots[self.next];
+    fn reclaim(self: *Pipeline, io: std.Io, slot: *Slot) !void {
+        if (slot.hashing) |*future| {
+            future.await(io);
+            slot.hashing = null;
+            self.digest.update(&slot.chunk_digest);
         }
-
-        /// Hands `buffer()[0..len]` to the consumer, first waiting for the
-        /// previous consume so its errors surface in order.
-        fn submit(self: *Self, io: std.Io, len: usize, offset: u64) !void {
-            try self.wait(io);
-            self.pending = io.async(Consumer.consume, .{ self.consumer, io, self.slots[self.next], len, offset });
-            self.next ^= 1;
-        }
-
-        /// Waits for the consume in flight, if any.
-        fn wait(self: *Self, io: std.Io) !void {
-            var future = self.pending orelse return;
-            self.pending = null;
+        if (slot.writing) |pending| {
+            // Cleared first: a failed chunk has been awaited and must not be
+            // canceled again by `deinit`.
+            var future = pending;
+            slot.writing = null;
             try future.await(io);
         }
+        self.completed += slot.len;
+        slot.len = 0;
+    }
+
+    fn hashChunk(bytes: []const u8, digest: *Digest) void {
+        Sha256.hash(bytes, digest, .{});
+    }
+};
+
+/// Starts `function` on a task of its own, which `io.concurrent` guarantees
+/// overlaps the caller. An `Io` that cannot supply one, such as a
+/// single-threaded build or one at its concurrency limit, gets `io.async`
+/// instead, which may finish `function` before returning: the flash still
+/// completes, just without the overlap.
+fn start(io: std.Io, function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.Future(@typeInfo(@TypeOf(function)).@"fn".return_type.?) {
+    return io.concurrent(function, args) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => io.async(function, args),
     };
 }
 
-/// Pipeline consumer for flashing: writes each chunk and folds it into the
-/// image digest, off the thread that reads and decodes the source.
-const TargetWriter = struct {
-    target: *device.OpenTarget,
-    hasher: Sha256 = .init(.{}),
-
-    fn consume(self: *TargetWriter, io: std.Io, buffer: []u8, len: usize, offset: u64) !void {
-        // Hash first: device writes zero-pad `buffer` past `len` in place.
-        self.hasher.update(buffer[0..len]);
-        try device.target_io.writeAt(io, self.target, buffer, len, offset);
-    }
-};
-
-/// Pipeline consumer for digest verification: hashes chunks read back from
-/// the target while the next chunk is being read.
-const DigestHasher = struct {
-    hasher: Sha256 = .init(.{}),
-
-    fn consume(self: *DigestHasher, io: std.Io, buffer: []u8, len: usize, offset: u64) error{}!void {
-        _ = io;
-        _ = offset;
-        self.hasher.update(buffer[0..len]);
-    }
-};
-
 /// The single write engine. `ranges` selects sparse writing; null writes the
 /// whole decoded stream sequentially.
-///
-/// Reading and decoding the source overlaps hashing and writing the previous
-/// chunk. All buffers are allocated up front, so the per-chunk path does not
-/// touch `allocator`.
 fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, target: *device.OpenTarget, expected_size: ?u64, ranges: ?[]const ByteRange, options: Options) !StreamFlashResult {
-    if (options.block_size == 0) return error.InvalidBlockSize;
+    const capabilities = target.info.capabilities;
+    const chunk_len = try capabilities.chunkLength(options.block_size);
     if (expected_size) |size| {
-        if (target.info.capabilities.size < size) return error.DestinationTooSmall;
+        if (capabilities.size < size) return error.DestinationTooSmall;
     }
     if (ranges) |items| {
         const image_size = expected_size orelse return error.InvalidImageSize;
         try validatePlan(.{ .image_size = image_size, .ranges = @constCast(items) });
+        // Chunks start at range offsets, so this check before the first
+        // write keeps a plan the device would reject from half-writing it.
+        for (items) |item| if (!capabilities.isWriteAligned(item.offset)) return error.UnalignedTargetOffset;
     }
 
-    var writer: TargetWriter = .{ .target = target };
-    var pipeline: Pipeline(TargetWriter) = try .init(allocator, &writer, try target.info.capabilities.writeBufferLength(options.block_size));
+    const result = try writeStream(allocator, io, stream, target, expected_size, ranges, chunk_len, options);
+    if (options.verify == .digest) {
+        const verify_range = if (ranges) |items| items else &[_]ByteRange{.{ .offset = 0, .length = result.report.image_size }};
+        try verifyDigestTarget(allocator, io, target, verify_range, chunk_len, result.digest, options);
+    }
+    return result;
+}
+
+/// Streams the source through a `Pipeline` into `target`, then syncs it.
+///
+/// Reading and decoding overlaps hashing and writing earlier chunks. All
+/// buffers are allocated up front, so the per-chunk path does not touch
+/// `allocator`. On failure, including cancelation, every task in flight is
+/// canceled and awaited before the buffers are freed, and the target is
+/// still synced so whatever reached it is durable.
+fn writeStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, target: *device.OpenTarget, expected_size: ?u64, ranges: ?[]const ByteRange, chunk_len: usize, options: Options) !StreamFlashResult {
+    // Declared first so it runs after `pipeline.deinit` has stopped writes.
+    errdefer syncAfterFailure(io, target);
+    var pipeline: Pipeline = try .init(allocator, options.pipeline_depth, try target.info.capabilities.writeBufferLength(chunk_len), target);
     defer pipeline.deinit(allocator, io);
 
     const total = if (ranges) |items| countRanges(items) else expected_size orelse 0;
-    var progress = options.progress.start("KiB written", progress_units.fromBytes(total));
+    const progress = options.progress.start("KiB written", progress_units.fromBytes(total));
     defer progress.end();
 
     var logical_size: u64 = 0;
@@ -253,61 +320,47 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
             var remaining = item.length;
             var offset = item.offset;
             while (remaining > 0) {
-                const chunk = pipeline.buffer()[0..@intCast(@min(remaining, options.block_size))];
-                const count = try stream.read(chunk);
-                if (count == 0) return error.UnexpectedEndOfImage;
-                for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk[0..count]);
-                try pipeline.submit(io, count, offset);
-                // `submit` waited for every earlier chunk, so those are written.
-                progress.setCompletedItems(progress_units.fromBytes(bytes_written));
+                const count: usize = @intCast(@min(remaining, chunk_len));
+                const chunk = (try pipeline.buffer(io))[0..count];
+                try stream.readExactly(chunk);
+                for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk);
+                pipeline.submit(io, count, offset);
+                progress.setCompletedItems(progress_units.fromBytes(pipeline.completed));
                 bytes_written += count;
                 offset += count;
-                logical_size = @max(logical_size, offset);
                 remaining -= count;
             }
         }
 
-        if (expected_size) |size| {
-            if (stream.position < size) try stream.discardTo(size);
-            if (stream.position != size) return error.ImageSizeMismatch;
-            var tail: [1]u8 = undefined;
-            if (try stream.read(&tail) != 0) return error.ImageSizeMismatch;
-            logical_size = size;
-        }
+        // `flashStream` requires `expected_size` with `ranges`.
+        const size = expected_size.?;
+        if (stream.position < size) try stream.discardTo(size);
+        if (stream.position != size) return error.ImageSizeMismatch;
+        var tail: [1]u8 = undefined;
+        if (try stream.read(&tail) != 0) return error.ImageSizeMismatch;
+        logical_size = size;
     } else {
         while (true) {
-            const chunk = pipeline.buffer()[0..options.block_size];
-            const count = try stream.read(chunk);
+            const chunk = (try pipeline.buffer(io))[0..chunk_len];
+            const count = try readChunk(stream, chunk);
             if (count == 0) break;
             const offset = logical_size;
             const next = std.math.add(u64, logical_size, count) catch return error.DecompressedImageTooLarge;
             if (target.info.capabilities.size < next) return error.DestinationTooSmall;
             for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk[0..count]);
-            try pipeline.submit(io, count, offset);
-            progress.setCompletedItems(progress_units.fromBytes(bytes_written));
+            pipeline.submit(io, count, offset);
+            progress.setCompletedItems(progress_units.fromBytes(pipeline.completed));
             logical_size = next;
             bytes_written += count;
         }
         if (expected_size) |size| if (logical_size != size) return error.ImageSizeMismatch;
     }
 
-    try pipeline.wait(io);
-    progress.setCompletedItems(progress_units.fromBytes(bytes_written));
+    const digest = try pipeline.finish(io);
+    progress.setCompletedItems(progress_units.fromBytes(pipeline.completed));
     for (options.observers) |*observer| try observer.finish(logical_size);
 
     try device.target_io.sync(io, target);
-    // Writing is done before verification starts. Clearing the node keeps
-    // the deferred `end` from ending it twice, which std.Progress would
-    // take for ending the root and stop the whole display.
-    progress.end();
-    progress = .none;
-    var digest: [Sha256.digest_length]u8 = undefined;
-    writer.hasher.final(&digest);
-    if (options.verify == .digest) {
-        const verify_range = if (ranges) |items| items else &[_]ByteRange{.{ .offset = 0, .length = logical_size }};
-        try verifyDigestTarget(allocator, io, target, verify_range, digest, options);
-    }
-
     return .{
         .report = .{
             .image_size = logical_size,
@@ -320,40 +373,57 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     };
 }
 
+/// Fills `buffer` unless the stream ends first, so chunk boundaries depend
+/// only on offsets, as the chunked digest requires.
+fn readChunk(stream: *root.Stream, buffer: []u8) !usize {
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const count = try stream.read(buffer[filled..]);
+        if (count == 0) break;
+        filled += count;
+    }
+    return filled;
+}
+
+/// Best-effort sync after a failed or canceled write phase. Cancel
+/// protection keeps a pending cancelation from skipping it: a canceled flash
+/// should still leave what it wrote durable.
+fn syncAfterFailure(io: std.Io, target: *device.OpenTarget) void {
+    const protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(protection);
+    device.target_io.sync(io, target) catch {};
+}
+
 const StreamFlashResult = struct {
     report: Report,
-    digest: [Sha256.digest_length]u8,
+    digest: Digest,
 };
 
 /// Reads the written ranges back and compares their digest, overlapping
-/// each read with hashing the previous chunk.
-fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, ranges: []const ByteRange, expected: [Sha256.digest_length]u8, options: Options) !void {
-    var digest_hasher: DigestHasher = .{};
-    var pipeline: Pipeline(DigestHasher) = try .init(allocator, &digest_hasher, options.block_size);
+/// each read with hashing earlier chunks.
+fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, ranges: []const ByteRange, chunk_len: usize, expected: Digest, options: Options) !void {
+    var pipeline: Pipeline = try .init(allocator, options.pipeline_depth, chunk_len, null);
     defer pipeline.deinit(allocator, io);
-    const scratch = try allocator.alloc(u8, try target.info.capabilities.readScratchLength(options.block_size));
+    const scratch = try allocator.alloc(u8, try target.info.capabilities.readScratchLength(chunk_len));
     defer allocator.free(scratch);
 
-    var completed: u64 = 0;
     const progress = options.progress.start("KiB verified", progress_units.fromBytes(countRanges(ranges)));
     defer progress.end();
     for (ranges) |item| {
         var remaining = item.length;
         var offset = item.offset;
         while (remaining > 0) {
-            const count: usize = @intCast(@min(remaining, options.block_size));
-            const actual = try device.target_io.readAt(io, target, pipeline.buffer()[0..count], offset, scratch);
+            const count: usize = @intCast(@min(remaining, chunk_len));
+            const actual = try device.target_io.readAt(io, target, (try pipeline.buffer(io))[0..count], offset, scratch);
             if (actual != count) return error.VerificationFailed;
-            try pipeline.submit(io, count, offset);
+            pipeline.submit(io, count, offset);
             offset += count;
             remaining -= count;
-            completed += count;
-            progress.setCompletedItems(progress_units.fromBytes(completed));
+            progress.setCompletedItems(progress_units.fromBytes(pipeline.completed));
         }
     }
-    try pipeline.wait(io);
-    var actual_digest: [Sha256.digest_length]u8 = undefined;
-    digest_hasher.hasher.final(&actual_digest);
+    const actual_digest = try pipeline.finish(io);
+    progress.setCompletedItems(progress_units.fromBytes(pipeline.completed));
     if (!std.mem.eql(u8, &expected, &actual_digest)) return error.VerificationFailed;
 }
 
@@ -438,7 +508,7 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File,
                 .read_alignment = if (kind == .regular_file) 1 else 512,
                 .write_alignment = if (kind == .regular_file) 1 else 512,
                 .optimal_io_size = stat.block_size,
-                .access_pattern = if (kind == .regular_file) .positional else .seek_and_stream,
+                .access_pattern = .positional,
                 .supports_verify_reads = true,
             },
         },
@@ -488,7 +558,7 @@ test "aligned device chunk reads go through the platform dispatcher" {
                 .read_alignment = 512,
                 .write_alignment = 512,
                 .optimal_io_size = 512,
-                .access_pattern = .seek_and_stream,
+                .access_pattern = .positional,
                 .supports_verify_reads = true,
             },
         },
@@ -718,15 +788,16 @@ fn testDeviceTarget(io: std.Io, file: std.Io.File) !device.OpenTarget {
                 .read_alignment = 512,
                 .write_alignment = 512,
                 .optimal_io_size = 512,
-                .access_pattern = .seek_and_stream,
+                .access_pattern = .positional,
                 .supports_verify_reads = true,
             },
         },
     };
 }
 
-/// Flashes `image` to a fresh device-posing file and returns what the
-/// allocator saw. Chunks of 1000 bytes leave every write unaligned.
+/// Flashes `image` to a fresh device-posing file and returns what it holds
+/// afterwards. Blocks of 1000 bytes round up to 1024-byte chunks, so the
+/// last chunk of every range with an unaligned length is padded.
 fn flashToTestDevice(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, image: []const u8, ranges: []const ByteRange) ![]u8 {
     try dir.writeFile(io, .{ .sub_path = "image.img", .data = image });
     var source = try dir.openFile(io, "image.img", .{});
@@ -783,6 +854,165 @@ test "flash allocations do not grow with chunk or range count" {
         std.testing.allocator.free(written);
         count.* = failing.allocations;
     }
-    // 1 chunk versus 49 chunks over 3 ranges: same setup, nothing per chunk.
+    // 1 chunk versus 48 chunks over 3 ranges: same setup, nothing per chunk.
     try std.testing.expectEqual(counts[0], counts[1]);
+}
+
+const FaultIo = @import("fault_io.zig");
+
+/// A 64 KiB image of sixteen 4 KiB chunks for the fault tests.
+const fault_chunk = 4096;
+const fault_image: [16 * fault_chunk]u8 = image: {
+    @setEvalBranchQuota(100_000);
+    var bytes: [16 * fault_chunk]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index *% 31 +% 7);
+    break :image bytes;
+};
+
+/// Sets up `fault_image` and an empty target with `std.testing.io`, then
+/// flashes it through `io` with digest verification. The target poses as a
+/// raw device when `as_device` is set. Returns the report, or the flash
+/// error once everything is closed.
+fn flashThrough(io: std.Io, dir: std.Io.Dir, as_device: bool, options: Options) !Report {
+    const setup_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try dir.writeFile(setup_io, .{ .sub_path = "image.img", .data = &fault_image });
+    var source = try dir.openFile(setup_io, "image.img", .{});
+    defer source.close(setup_io);
+    var destination = try dir.createFile(setup_io, "target.img", .{ .read = true, .truncate = true });
+    defer destination.close(setup_io);
+    try destination.setLength(setup_io, fault_image.len);
+
+    var target: device.OpenTarget = if (as_device) try testDeviceTarget(setup_io, destination) else .{
+        .file = destination,
+        .info = .{
+            .requested_path = "<test-file>",
+            .resolved_path = &.{},
+            .owns_resolved_path = false,
+            .capabilities = .{
+                .kind = .regular_file,
+                .size = fault_image.len,
+                .read_alignment = 1,
+                .write_alignment = 1,
+                .optimal_io_size = fault_chunk,
+                .access_pattern = .positional,
+                .supports_verify_reads = true,
+            },
+        },
+    };
+    var stream = try openFileStream(io, allocator, source);
+    defer stream.deinit();
+    const ranges = [_]ByteRange{.{ .offset = 0, .length = fault_image.len }};
+    var with_defaults = options;
+    with_defaults.block_size = fault_chunk;
+    return (try flashStream(allocator, io, &stream, &target, fault_image.len, &ranges, with_defaults)).report;
+}
+
+fn expectTargetHoldsImage(dir: std.Io.Dir) !void {
+    const written = try dir.readFileAlloc(std.testing.io, "target.img", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualSlices(u8, &fault_image, written);
+}
+
+test "a failed write cancels writes in flight and reports the failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Chunk 3 hangs, so only cancelation can finish it; chunk 2 fails, and
+    // the engine notices when it reclaims that slot for chunk 6.
+    var fault_io: FaultIo = .init(std.testing.io, &.{
+        .{ .op = .write, .offset = 3 * fault_chunk, .effect = .stall },
+        .{ .op = .write, .offset = 2 * fault_chunk, .effect = .input_output },
+    });
+    try std.testing.expectError(error.InputOutput, flashThrough(fault_io.io(), tmp.dir, false, .{ .pipeline_depth = 4, .verify = .digest }));
+    try std.testing.expectEqual(@as(u32, 1), fault_io.canceled.load(.monotonic));
+}
+
+test "canceling a flash stops its writes and returns Canceled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault_io: FaultIo = .init(std.testing.io, &.{.{ .op = .write, .offset = 5 * fault_chunk, .effect = .stall }});
+    const io = fault_io.io();
+
+    var flash = try io.concurrent(flashThrough, .{ io, tmp.dir, false, Options{ .verify = .digest } });
+    var waited: usize = 0;
+    while (fault_io.stalled.load(.monotonic) == 0) : (waited += 1) {
+        if (waited == 10_000) {
+            _ = flash.cancel(io) catch {};
+            return error.TestFlashNeverStalled;
+        }
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.Canceled, flash.cancel(io));
+    try std.testing.expectEqual(@as(u32, 1), fault_io.canceled.load(.monotonic));
+}
+
+test "a failed verification read is reported" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault_io: FaultIo = .init(std.testing.io, &.{.{ .op = .read, .offset = 7 * fault_chunk + 1, .effect = .input_output }});
+    try std.testing.expectError(error.InputOutput, flashThrough(fault_io.io(), tmp.dir, false, .{ .verify = .digest }));
+    // The write phase completed and synced before verification failed.
+    try expectTargetHoldsImage(tmp.dir);
+}
+
+test "short writes are resumed, except off a device sector" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var fault_io: FaultIo = .init(std.testing.io, &.{.{ .op = .write, .offset = fault_chunk, .effect = .{ .short = 100 } }});
+        _ = try flashThrough(fault_io.io(), tmp.dir, false, .{ .verify = .digest });
+        try expectTargetHoldsImage(tmp.dir);
+    }
+    {
+        var fault_io: FaultIo = .init(std.testing.io, &.{.{ .op = .write, .offset = fault_chunk, .effect = .{ .short = 512 } }});
+        _ = try flashThrough(fault_io.io(), tmp.dir, true, .{ .verify = .digest });
+        try expectTargetHoldsImage(tmp.dir);
+    }
+    {
+        // Resuming mid-sector would need an unaligned device write.
+        var fault_io: FaultIo = .init(std.testing.io, &.{.{ .op = .write, .offset = fault_chunk, .effect = .{ .short = 100 } }});
+        try std.testing.expectError(error.ShortWrite, flashThrough(fault_io.io(), tmp.dir, true, .{ .verify = .digest }));
+    }
+}
+
+test "a write that makes no progress fails instead of spinning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault_io: FaultIo = .init(std.testing.io, &.{.{ .op = .write, .offset = 9 * fault_chunk, .effect = .{ .short = 0 } }});
+    try std.testing.expectError(error.ShortWrite, flashThrough(fault_io.io(), tmp.dir, false, .{ .verify = .digest }));
+}
+
+test "flashing falls back to serial work without concurrency" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault_io: FaultIo = .init(std.testing.io, &.{});
+    fault_io.serial = true;
+    // Device targets last: platforms without raw-device support skip there.
+    for ([_]bool{ false, true }) |as_device| {
+        for ([_]usize{ 1, 3 }) |depth| {
+            _ = try flashThrough(fault_io.io(), tmp.dir, as_device, .{ .pipeline_depth = depth, .verify = .digest });
+            try expectTargetHoldsImage(tmp.dir);
+        }
+    }
+}
+
+test "a range off the device's sector boundary fails before writing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "image.img", .data = &fault_image });
+    var source = try tmp.dir.openFile(io, "image.img", .{});
+    defer source.close(io);
+    var destination = try tmp.dir.createFile(io, "target.img", .{ .read = true });
+    defer destination.close(io);
+    try destination.setLength(io, fault_image.len);
+
+    var target = try testDeviceTarget(io, destination);
+    var stream = try openFileStream(io, std.testing.allocator, source);
+    defer stream.deinit();
+    const ranges = [_]ByteRange{ .{ .offset = 0, .length = 512 }, .{ .offset = 1000, .length = 24 } };
+    try std.testing.expectError(error.UnalignedTargetOffset, flashStream(std.testing.allocator, io, &stream, &target, fault_image.len, &ranges, .{}));
+    var first: [512]u8 = undefined;
+    _ = try destination.readPositionalAll(io, &first, 0);
+    try std.testing.expect(std.mem.allEqual(u8, &first, 0));
 }

@@ -10,7 +10,11 @@ pub const TargetKind = enum {
 };
 
 pub const AccessPattern = enum {
+    /// Every transfer carries its own offset, so several can be in flight.
+    /// The POSIX backend serves regular files and raw devices this way.
     positional,
+    /// Transfers share the file position; for a backend whose targets
+    /// cannot do positional I/O.
     seek_and_stream,
 };
 
@@ -25,6 +29,21 @@ pub const TargetCapabilities = struct {
 
     pub fn isDevice(self: @This()) bool {
         return self.kind == .block_device or self.kind == .character_device;
+    }
+
+    /// Transfer size for a requested `block_size`, rounded up to the write
+    /// alignment. Chunks then start on aligned offsets whenever their range
+    /// does, which raw devices require of every positional write.
+    pub fn chunkLength(self: @This(), block_size: usize) error{ InvalidBlockSize, Overflow }!usize {
+        const alignment = try checkedAlignment(self.write_alignment);
+        if (block_size == 0) return error.InvalidBlockSize;
+        const padded = std.math.add(usize, block_size, alignment - 1) catch return error.Overflow;
+        return std.mem.alignBackward(usize, padded, alignment);
+    }
+
+    /// Whether a write may start at `offset`.
+    pub fn isWriteAligned(self: @This(), offset: u64) bool {
+        return self.write_alignment <= 1 or offset % self.write_alignment == 0;
     }
 
     /// Length of a buffer that can carry `max_len` bytes to `target_io.writeAt`,
@@ -162,5 +181,7 @@ pub const lookupDiskByPath = platform.lookupDiskByPath;
 /// engine calls only `writeAt`, `readAt`, and `sync`; alignment, padding, and
 /// syscall strategy live in each platform backend. Callers supply every
 /// buffer, sized with `TargetCapabilities.writeBufferLength` and
-/// `readScratchLength`, so the backends never allocate.
+/// `readScratchLength`, so the backends never allocate. Every transfer goes
+/// through the caller's `std.Io` with its own offset, so transfers are
+/// cancelable and calls for disjoint chunks may run concurrently.
 pub const target_io = platform.target_io;

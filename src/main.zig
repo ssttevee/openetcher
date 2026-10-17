@@ -293,6 +293,7 @@ const error_texts = [_]ErrorText{
     .{ .errors = error{DecompressedImageTooLarge}, .text = "the decompressed image is larger than the size limit" },
     .{ .errors = error{UnsupportedTargetType}, .text = "the target must be a regular file or a disk this platform can write" },
     .{ .errors = error{DestinationTooSmall}, .text = "the target is smaller than the image" },
+    .{ .errors = error{UnalignedTargetOffset}, .text = "the image's write plan starts a range inside a sector of the target, which the device cannot write" },
     .{ .errors = error{VerificationFailed}, .text = "verification failed: the target does not read back what was written" },
     .{ .errors = error{DiskListFailed}, .text = "listing disks failed: `diskutil` reported an error" },
     .{ .errors = error{UnmountFailed}, .text = "could not unmount the target disk; close anything using it and retry" },
@@ -383,7 +384,6 @@ const platform_specific_errors = error{
     ConcurrencyUnavailable,
     StreamTooLong,
     // Raw-device I/O in the POSIX backend.
-    ShortWrite,
     InvalidDeviceRead,
     ScratchBufferTooSmall,
 };

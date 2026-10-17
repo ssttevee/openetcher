@@ -49,7 +49,7 @@ pub fn probeTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !
             .read_alignment = 512,
             .write_alignment = 512,
             .optimal_io_size = 1024 * 1024,
-            .access_pattern = .seek_and_stream,
+            .access_pattern = .positional,
             .supports_verify_reads = true,
         },
     };

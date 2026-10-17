@@ -293,11 +293,19 @@ Uncompressed images are analyzed in place and need no spool.
 
 gzip, xz, and zstd use Zig's built-in decoders. bzip2 is decoded by the system `bzip2` command, streamed through a pipe like the built-in decoders, so it must be on `PATH`; a `bzip2` that exits with an error, for example on a truncated file, fails the read rather than producing a short image.
 
-Writing is pipelined with `std.Io`: while one chunk is hashed and written to the target on an `io.async` task, the next is read and decompressed from the source. Digest verification overlaps reading the target with hashing in the same way. Every buffer is allocated before the first chunk, so the per-chunk path never allocates.
+Writing is pipelined with `std.Io`. The source is read and decompressed into a ring of chunk buffers, four by default (`pipeline_depth`); each chunk is then hashed on one task and written to the target on another, started with `io.concurrent`, while the next chunk is read. Writes are positional, so up to `pipeline_depth` chunks are written at once. Digest verification reads the target back the same way, hashing earlier chunks while reading the next. Every buffer is allocated before the first chunk, so the per-chunk path never allocates. An `Io` that cannot run tasks concurrently, such as a single-threaded build, falls back to `io.async`, which may do the work in place: the flash still completes, without the overlap.
 
-Default chunk size is 1 MiB. Device writes use the backend's alignment requirement. The macOS backend uses 512-byte device alignment and pads a non-aligned final chunk as needed for raw device I/O.
+The digest is a SHA-256 over the SHA-256 of each chunk, so chunks hash in parallel on separate cores instead of one hash stream limiting the whole flash. SHA-256 beat BLAKE3 from `std.crypto` by about 1.5 times per core on Apple silicon, which has SHA-2 instructions.
 
-The implementation uses positional I/O for regular files. For device targets, it uses seek-and-stream I/O with direct POSIX reads and writes to avoid inappropriate threaded file-I/O behavior for raw devices.
+Default chunk size is 1 MiB. For a device target the chunk size is rounded up to the backend's write alignment, so every chunk starts on a sector boundary; a plan with a range that starts inside a sector fails with `UnalignedTargetOffset` before anything is written. The macOS backend uses 512-byte device alignment and zero-pads a non-aligned final chunk.
+
+All target I/O, for regular files and raw devices alike, is positional I/O through the caller's `std.Io`. It works under any `Io` implementation, can be canceled, and carries its own offset, so concurrent writes never contend for a shared file position.
+
+### Cancellation
+
+The flash engine is cancelable through `std.Io`: canceling the task running a flash makes it return `error.Canceled`. Before it returns, every chunk still being hashed or written is canceled and awaited, then the buffers are freed, the target is synced with cancelation blocked so that what reached it is durable, and the target is closed. A failed write takes the same path, reporting the write's error.
+
+The CLI does not turn Ctrl-C into cancelation: Zig 0.17's standard library has no way to deliver a signal as `Io` cancelation, and a signal handler cannot safely cancel a future itself. Ctrl-C ends the process as before, leaving the target partly written.
 
 ### Verification
 
@@ -396,7 +404,8 @@ pub fn flashImage(
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `block_size` | `1024 * 1024` | Transfer chunk size. Must be non-zero. |
+| `block_size` | `1024 * 1024` | Transfer chunk size. Must be non-zero. Rounded up to the write alignment for devices. |
+| `pipeline_depth` | `4` | Chunks hashed and written concurrently while the next is read. Each costs one chunk buffer. |
 | `verify` | `.written` | `.written` verifies planned ranges; `.none` disables verification. |
 | `unsupported` | `.fail` | Unsupported layout policy. Only fail-hard behavior exists currently. |
 | `progress` | `.none` | Parent `std.Progress.Node` for the write and verify nodes. |
@@ -458,6 +467,7 @@ src/
   root.zig                       Public library module
   lib/
     flash.zig                    Single write engine: planned writing, sync, verification, progress
+    fault_io.zig                 Test-only std.Io wrapper that injects target I/O faults
     image.zig                    Shared analyzer over Reader; entry points
     progress.zig                 Unit of the library's std.Progress counts (KiB)
     range.zig                    Byte-range normalization and merging
@@ -494,7 +504,7 @@ src/
 - One analyzer serves every input. `image.zig` analyzes any random-access `Reader`; open files wrap in a region source, decoded bytes wrap in a buffer source. There are no parallel probe pipelines.
 - Format drivers are resolved at compile time. Each filesystem, disk layout, and compression codec is a module exposing a fixed set of `pub` declarations, listed in a comptime tuple in `image/fs/driver.zig`, `image/layout/driver.zig`, or `image/compression/codec.zig`. Callers dispatch with `inline for`, so there are no vtables, and each registry checks its entries at compile time: missing declarations, wrong signatures, two drivers claiming one MBR type, overlapping codec magic, or a `Compression` tag without a codec all fail the build with a message naming the contract.
 - Detection precedence lives in one documented place per registry. The whole-image chain is ISO9660, then partitioned layouts, then raw ext4.
-- Target I/O lives in the platform backend. The flash engine calls only `target_io.writeAt`, `readAt`, and `sync`, resolved at compile time; alignment padding and syscall strategy belong to macOS/Linux shared POSIX code, not the engine.
+- Target I/O lives in the platform backend. The flash engine calls only `target_io.writeAt`, `readAt`, and `sync`, resolved at compile time; alignment padding belongs to macOS/Linux shared POSIX code, not the engine. Backends do every transfer as positional I/O through the caller's `std.Io`, never with direct syscalls, so transfers are cancelable, run under evented `Io` implementations, overlap safely, and can be fault-injected: `fault_io.zig` wraps `std.testing.io` to fail, shorten, or stall chosen transfers in tests.
 - File-handle APIs use `std.Io.File` values. Path variants are named with a `FromPath` suffix.
 - Platform code lives under `src/lib/device/platforms/` and is selected at compile time using `@import("builtin").target.os.tag`.
 - The image layer fails hard when an unsupported non-empty partition would make a sparse plan unsafe.
