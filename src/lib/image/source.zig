@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const codec_api = @import("compression/codec.zig");
+const progress_units = @import("../progress.zig");
 const reader_mod = @import("reader.zig");
 const scan = @import("../scan.zig");
 
@@ -18,6 +19,11 @@ pub const SourceOptions = struct {
     /// Directory for the decoded copy of a compressed image. Defaults to
     /// `/tmp`, or the working directory on Windows.
     spool_dir: ?[]const u8 = null,
+    /// Parent for a node that tracks decoding a compressed image into its
+    /// spool, which can take minutes before anything is flashed. It must
+    /// not end while the source might still spool; see
+    /// `ImageSource.progress`.
+    progress: std.Progress.Node = .none,
 };
 
 const default_spool_dir = if (builtin.os.tag == .windows) "." else "/tmp";
@@ -113,6 +119,15 @@ pub const Stream = struct {
         return .{ .backend = .{ .decoded = backend } };
     }
 
+    /// How many encoded bytes the codec has consumed, or null when nothing
+    /// is decoded or the codec reads the file itself.
+    pub fn encodedPosition(self: *const Stream) ?u64 {
+        return switch (self.backend) {
+            .file => null,
+            .decoded => |backend| if (codec_api.readsEncodedReader(&backend.decoder)) backend.encoded.logicalPos() else null,
+        };
+    }
+
     fn interface(self: *const Stream) *std.Io.Reader {
         return switch (self.backend) {
             .file => |backend| &backend.reader.interface,
@@ -202,6 +217,9 @@ pub const ImageSource = struct {
     metadata: Metadata,
     max_image_size: ?u64,
     spool_dir: ?[]u8,
+    /// Parent for the spooling node, from `SourceOptions.progress`. Set it
+    /// directly to report spooling under a node started later.
+    progress: std.Progress.Node,
     content: Content,
 
     pub const Content = union(enum) {
@@ -315,6 +333,7 @@ pub fn openImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, path: [
         },
         .max_image_size = options.max_image_size,
         .spool_dir = spool_dir,
+        .progress = options.progress,
         .content = if (compression == .none) .raw else .{ .encoded = compression },
     };
 }
@@ -347,10 +366,20 @@ fn createSpool(source: *const ImageSource, io: std.Io, compression: Compression,
     const buffer = try allocator.alloc(u8, spool_chunk_size);
     defer allocator.free(buffer);
 
+    // The decoded size is unknown until the end, so measure how much of the
+    // encoded file the codec has consumed instead. A codec that reads the
+    // file itself leaves only the decoded count, with no total.
+    const progress = if (stream.encodedPosition() != null)
+        source.progress.start("compressed KiB decoded", progress_units.fromBytes(source.metadata.encoded_size orelse 0))
+    else
+        source.progress.start("KiB decompressed", 0);
+    defer progress.end();
+
     var size: u64 = 0;
     while (true) {
         const count = try stream.read(buffer);
         if (count == 0) break;
+        progress.setCompletedItems(progress_units.fromBytes(stream.encodedPosition() orelse size + count));
         const chunk = buffer[0..count];
         if (!scan.isZero(chunk)) spool.file.writePositionalAll(io, chunk, size) catch |err| return switch (err) {
             error.NoSpaceLeft, error.DiskQuota, error.FileTooBig => error.SpoolDirectoryFull,
@@ -525,6 +554,41 @@ test "stream enforces decoded size limit" {
     try stream.readExactly(&bytes);
     try std.testing.expectEqualStrings("abcd", &bytes);
     try std.testing.expectError(error.DecompressedImageTooLarge, stream.read(&bytes));
+}
+
+test "decoded streams measure the encoded input they consumed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bytes = try testing.sparseImage(allocator);
+    defer allocator.free(bytes);
+    const path = try testing.writeGzip(allocator, io, tmp.dir, "image.img.gz", bytes);
+    defer allocator.free(path);
+    var image_source = try openImageSourceFromPath(allocator, io, path, .{});
+    defer image_source.deinit();
+
+    var stream = try image_source.openStream(io, allocator);
+    defer stream.deinit();
+    try std.testing.expectEqual(@as(?u64, 0), stream.encodedPosition());
+    const decoded = try allocator.alloc(u8, bytes.len);
+    defer allocator.free(decoded);
+    try stream.readExactly(decoded);
+    var tail: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try stream.read(&tail));
+    // Spooling progress counts against this total, so it must end there.
+    try std.testing.expectEqual(image_source.metadata.encoded_size, stream.encodedPosition());
+
+    // Raw images are not decoded, so there is no encoded position.
+    try tmp.dir.writeFile(io, .{ .sub_path = "raw.img", .data = "abcdef" });
+    const raw_path = try tmp.dir.realPathFileAlloc(io, "raw.img", allocator);
+    defer allocator.free(raw_path);
+    var raw_source = try openImageSourceFromPath(allocator, io, raw_path, .{});
+    defer raw_source.deinit();
+    var raw_stream = try raw_source.openStream(io, allocator);
+    defer raw_stream.deinit();
+    try std.testing.expectEqual(null, raw_stream.encodedPosition());
 }
 
 test "corrupt compressed input reports InvalidCompressedImage" {

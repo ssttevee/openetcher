@@ -2,73 +2,6 @@ const std = @import("std");
 
 const openetcher = @import("openetcher");
 
-const ProgressState = struct {
-    writer: *std.Io.Writer,
-    humanize: bool = false,
-    last_phase: ?openetcher.FlashPhase = null,
-    last_line_len: usize = 0,
-
-    fn update(context: *anyopaque, progress: openetcher.FlashProgress) void {
-        const self: *ProgressState = @ptrCast(@alignCast(context));
-        // A broken terminal must not abort the flash; the final report
-        // surfaces any lasting write failure.
-        self.render(progress) catch {};
-    }
-
-    fn render(self: *ProgressState, progress: openetcher.FlashProgress) !void {
-        const label = switch (progress.phase) {
-            .probe => "probe",
-            .plan => "plan",
-            .flash => "flash",
-            .verify => "verify",
-        };
-        const percent = if (progress.total_bytes == 0)
-            100
-        else
-            @min(100, @as(u64, @intCast((progress.completed_bytes * 100) / progress.total_bytes)));
-
-        var line_buffer: [128]u8 = undefined;
-        var completed_buffer: [32]u8 = undefined;
-        var total_buffer: [32]u8 = undefined;
-        const completed = if (self.humanize)
-            try formatBytes(&completed_buffer, progress.completed_bytes)
-        else
-            "";
-        const total = if (self.humanize)
-            try formatBytes(&total_buffer, progress.total_bytes)
-        else
-            "";
-        const line = if (self.humanize)
-            try std.fmt.bufPrint(&line_buffer, "{s}: {s}/{s} ({}%)", .{ label, completed, total, percent })
-        else
-            try std.fmt.bufPrint(&line_buffer, "{s}: {}/{} bytes ({}%)", .{ label, progress.completed_bytes, progress.total_bytes, percent });
-
-        if (self.last_phase != null and self.last_phase.? != progress.phase) {
-            try self.writer.writeByte('\n');
-            self.last_line_len = 0;
-        }
-
-        try self.writer.writeByte('\r');
-        try self.writer.writeAll(line);
-        if (line.len < self.last_line_len) {
-            var pad_len = self.last_line_len - line.len;
-            while (pad_len > 0) : (pad_len -= 1) try self.writer.writeByte(' ');
-            try self.writer.writeByte('\r');
-            try self.writer.writeAll(line);
-        }
-        try self.writer.flush();
-
-        self.last_phase = progress.phase;
-        self.last_line_len = line.len;
-    }
-
-    fn finish(self: *ProgressState) !void {
-        if (self.last_phase == null) return;
-        try self.writer.writeByte('\n');
-        try self.writer.flush();
-    }
-};
-
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -96,18 +29,23 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const image_path = parsed.image_path;
-        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map) }) catch |err| {
+        // Probing spools compressed images, which can take minutes.
+        const progress = startProgress(io);
+        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map), .progress = progress }) catch |err| {
+            progress.end();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
         };
         defer image_source.deinit();
         var info = openetcher.probeImageSource(arena, io, &image_source, .{}) catch |err| {
+            progress.end();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
         };
         defer info.deinit(arena);
+        progress.end();
         if (parsed.json) {
             try writeImageInfoJson(stdout, info);
         } else {
@@ -125,18 +63,23 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const image_path = parsed.image_path;
-        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map) }) catch |err| {
+        // Planning spools compressed images, which can take minutes.
+        const progress = startProgress(io);
+        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map), .progress = progress }) catch |err| {
+            progress.end();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
         };
         defer image_source.deinit();
         const plan = openetcher.planImageFlashSource(arena, io, &image_source, .{}) catch |err| {
+            progress.end();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
         };
         defer plan.deinit(arena);
+        progress.end();
         if (parsed.json) {
             try writeFlashPlanJson(stdout, plan);
         } else {
@@ -221,10 +164,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
 
-        var progress = ProgressState{ .writer = stderr, .humanize = parsed.humanize };
+        const progress = startProgress(io);
         const start_time = std.Io.Clock.awake.now(io);
-        var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map) }) catch |err| {
-            try progress.finish();
+        var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map), .progress = progress }) catch |err| {
+            progress.end();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
@@ -233,17 +176,14 @@ pub fn main(init: std.process.Init) !void {
         const report = openetcher.flashSource(arena, io, &image_source, target_path, .{
             .prepare_target = false,
             .strategy = if (parsed.force) .force_full_streaming else .planned_sparse,
-            .progress_handler = .{
-                .context = &progress,
-                .callback = ProgressState.update,
-            },
+            .progress = progress,
         }) catch |err| {
-            try progress.finish();
+            progress.end();
             try writeUserError(stderr, err);
             try stderr.flush();
             std.process.exit(1);
         };
-        try progress.finish();
+        progress.end();
 
         const elapsed = start_time.durationTo(std.Io.Clock.awake.now(io));
         const elapsed_ns: u64 = @intCast(@max(elapsed.nanoseconds, 1));
@@ -270,6 +210,14 @@ pub fn main(init: std.process.Init) !void {
     try writeUsage(stderr);
     try stderr.flush();
     std.process.exit(1);
+}
+
+/// Starts the progress display on stderr. It draws only when stderr is a
+/// terminal, and forwards to a parent process instead when `ZIG_PROGRESS`
+/// is set. End the returned node before writing anything else to stderr,
+/// since ending it erases the display.
+fn startProgress(io: std.Io) std.Progress.Node {
+    return std.Progress.start(io, .{});
 }
 
 fn writeUsage(writer: *std.Io.Writer) !void {

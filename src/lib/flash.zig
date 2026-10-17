@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const device = @import("device.zig");
+const progress_units = @import("progress.zig");
 const root = @import("../root.zig");
 
 pub const ByteRange = root.ByteRange;
@@ -12,13 +13,6 @@ pub const VerifyMode = enum {
     written,
 };
 
-pub const Phase = enum {
-    probe,
-    plan,
-    flash,
-    verify,
-};
-
 pub const Strategy = enum {
     planned_sparse,
     full_if_unsupported,
@@ -27,19 +21,6 @@ pub const Strategy = enum {
 
 pub const PrepareOptions = struct {
     max_image_size: ?u64 = null,
-};
-
-pub const Progress = struct {
-    phase: Phase,
-    completed_bytes: u64,
-    total_bytes: u64,
-};
-
-/// Receives progress from the flash loop. The callback cannot fail: a
-/// broken progress display must not abort a half-written disk.
-pub const ProgressHandler = struct {
-    context: *anyopaque,
-    callback: *const fn (context: *anyopaque, progress: Progress) void,
 };
 
 pub const UnsupportedPolicy = enum {
@@ -53,7 +34,11 @@ pub const Options = struct {
     strategy: Strategy = .planned_sparse,
     max_image_size: ?u64 = null,
     observers: []root.Observer = &.{},
-    progress_handler: ?ProgressHandler = null,
+    /// Parent of the "KiB written" and "KiB verified" nodes, counted in
+    /// KiB (see `progress.zig`). Updates are lock-free atomic stores, and
+    /// nothing about progress can fail, so a broken display never aborts a
+    /// half-written disk.
+    progress: std.Progress.Node = .none,
     prepare_target: bool = true,
 };
 
@@ -159,11 +144,6 @@ fn countRanges(ranges: []const ByteRange) u64 {
     return total;
 }
 
-fn emitProgress(options: Options, progress: Progress) void {
-    const handler = options.progress_handler orelse return;
-    handler.callback(handler.context, progress);
-}
-
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Two buffers passed back and forth between the caller, which fills one,
@@ -261,7 +241,8 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     defer pipeline.deinit(allocator, io);
 
     const total = if (ranges) |items| countRanges(items) else expected_size orelse 0;
-    emitProgress(options, .{ .phase = .flash, .completed_bytes = 0, .total_bytes = total });
+    var progress = options.progress.start("KiB written", progress_units.fromBytes(total));
+    defer progress.end();
 
     var logical_size: u64 = 0;
     var bytes_written: u64 = 0;
@@ -278,7 +259,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
                 for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk[0..count]);
                 try pipeline.submit(io, count, offset);
                 // `submit` waited for every earlier chunk, so those are written.
-                emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+                progress.setCompletedItems(progress_units.fromBytes(bytes_written));
                 bytes_written += count;
                 offset += count;
                 logical_size = @max(logical_size, offset);
@@ -303,7 +284,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
             if (target.info.capabilities.size < next) return error.DestinationTooSmall;
             for (options.observers) |*observer| try root.deliverObserver(observer, offset, chunk[0..count]);
             try pipeline.submit(io, count, offset);
-            emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+            progress.setCompletedItems(progress_units.fromBytes(bytes_written));
             logical_size = next;
             bytes_written += count;
         }
@@ -311,10 +292,15 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     }
 
     try pipeline.wait(io);
-    emitProgress(options, .{ .phase = .flash, .completed_bytes = bytes_written, .total_bytes = total });
+    progress.setCompletedItems(progress_units.fromBytes(bytes_written));
     for (options.observers) |*observer| try observer.finish(logical_size);
 
     try device.target_io.sync(io, target);
+    // Writing is done before verification starts. Clearing the node keeps
+    // the deferred `end` from ending it twice, which std.Progress would
+    // take for ending the root and stop the whole display.
+    progress.end();
+    progress = .none;
     var digest: [Sha256.digest_length]u8 = undefined;
     writer.hasher.final(&digest);
     if (options.verify == .digest) {
@@ -349,8 +335,8 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
     defer allocator.free(scratch);
 
     var completed: u64 = 0;
-    const total = countRanges(ranges);
-    emitProgress(options, .{ .phase = .verify, .completed_bytes = 0, .total_bytes = total });
+    const progress = options.progress.start("KiB verified", progress_units.fromBytes(countRanges(ranges)));
+    defer progress.end();
     for (ranges) |item| {
         var remaining = item.length;
         var offset = item.offset;
@@ -362,7 +348,7 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
             offset += count;
             remaining -= count;
             completed += count;
-            emitProgress(options, .{ .phase = .verify, .completed_bytes = completed, .total_bytes = total });
+            progress.setCompletedItems(progress_units.fromBytes(completed));
         }
     }
     try pipeline.wait(io);
@@ -380,6 +366,9 @@ fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.St
     const scratch = try allocator.alloc(u8, try target.info.capabilities.readScratchLength(options.block_size));
     defer allocator.free(scratch);
 
+    var completed: u64 = 0;
+    const progress = options.progress.start("KiB verified", progress_units.fromBytes(countRanges(ranges)));
+    defer progress.end();
     for (ranges) |item| {
         try stream.discardTo(item.offset);
         var remaining = item.length;
@@ -391,6 +380,8 @@ fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.St
             if (actual != count or !std.mem.eql(u8, source_buffer[0..count], target_buffer[0..count])) return error.VerificationFailed;
             offset += count;
             remaining -= count;
+            completed += count;
+            progress.setCompletedItems(progress_units.fromBytes(completed));
         }
     }
     if (stream.position < image_size) try stream.discardTo(image_size);

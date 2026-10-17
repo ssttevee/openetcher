@@ -38,6 +38,11 @@ pub const InitArgs = struct {
 ///   `pub fn init(*State, InitArgs) !void`
 ///   `pub fn reader(*State) *std.Io.Reader` - the decoded bytes
 ///   `pub fn deinit(*State) void` - releases what `init` acquired
+///
+/// Optional declarations:
+///   `pub const reads_path: bool` - true for decoders that open `path`
+///       themselves rather than reading `encoded_reader`, whose position
+///       then says nothing about progress
 pub const codecs = .{
     @import("gzip.zig"),
     @import("xz.zig"),
@@ -70,6 +75,7 @@ comptime {
         if (seen.contains(C.id)) @compileError("compression ." ++ @tagName(C.id) ++ " is registered twice or is reserved");
         seen.insert(C.id);
         if (C.magic.len == 0) @compileError(@typeName(C) ++ ": magic must not be empty");
+        if (@hasDecl(C, "reads_path") and @TypeOf(C.reads_path) != bool) @compileError(@typeName(C) ++ ": reads_path must be a bool");
 
         // Detection matches prefixes, so overlapping magic would make the
         // registry order silently decide the codec.
@@ -108,6 +114,17 @@ pub fn initDecoder(decoder: *Decoder, compression: Compression, args: InitArgs) 
 pub fn decodedReader(decoder: *Decoder) *std.Io.Reader {
     return switch (decoder.*) {
         inline else => |*state, tag| codecs[@backingInt(tag)].reader(state),
+    };
+}
+
+/// Whether `decoder` reads its input through `InitArgs.encoded_reader`, so
+/// that reader's position measures how far decoding has got.
+pub fn readsEncodedReader(decoder: *const Decoder) bool {
+    return switch (decoder.*) {
+        inline else => |_, tag| {
+            const C = codecs[@backingInt(tag)];
+            return !(@hasDecl(C, "reads_path") and C.reads_path);
+        },
     };
 }
 

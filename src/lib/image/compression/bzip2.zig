@@ -73,6 +73,7 @@ pub fn deinit(state: *State) void {
 
 pub const id: codec_api.Compression = .bzip2;
 pub const magic: []const u8 = "BZh";
+pub const reads_path = true;
 
 const source = @import("../source.zig");
 
@@ -133,6 +134,8 @@ test "bzip2 sources stream without buffering the image" {
         offset += count;
     }
     try std.testing.expectEqual(bytes.len, offset);
+    // bzip2 reads the file itself, so spooling cannot measure its input.
+    try std.testing.expectEqual(null, stream.encodedPosition());
 }
 
 test "truncated bzip2 input fails instead of yielding a short image" {

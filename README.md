@@ -179,7 +179,7 @@ openetcher flash image.img --disk-id macos-0123456789abcdef
 
 On macOS, `/dev/diskN` is normalized to `/dev/rdiskN` for raw device I/O. The normalization is printed before flashing. If the raw device cannot be opened directly, OpenEtcher uses `/usr/libexec/authopen` to present the macOS administrator authorization dialog and receive an authorized read/write descriptor. The OpenEtcher process itself remains unprivileged.
 
-The CLI reports progress separately for the flash and verify phases. On success it prints:
+While it works, the CLI draws progress on stderr for decoding a compressed image into its spool, writing, and verifying; `info` and `plan` show the decoding step too. Counts are in KiB. Nothing is drawn when stderr is not a terminal, so redirected output holds only the messages and the report. When `ZIG_PROGRESS` is set, as it is for a child of a Zig program that passes a progress node, progress goes to the parent process over that pipe instead, so a GUI wrapper can show it without parsing text. On success it prints:
 
 - bytes written
 - write range count
@@ -398,34 +398,23 @@ pub fn flashImage(
 | `block_size` | `1024 * 1024` | Transfer chunk size. Must be non-zero. |
 | `verify` | `.written` | `.written` verifies planned ranges; `.none` disables verification. |
 | `unsupported` | `.fail` | Unsupported layout policy. Only fail-hard behavior exists currently. |
-| `progress_handler` | `null` | Optional phase progress callback. |
+| `progress` | `.none` | Parent `std.Progress.Node` for the write and verify nodes. |
 | `prepare_target` | `true` | Prepare a path target before opening it. |
 
-The progress handler receives `FlashProgress` values:
+Progress is reported through `std.Progress`. Flashing starts a `KiB written` child of `progress`, and verification a `KiB verified` child, each with its total set before the first chunk. Decoding a compressed image into its spool starts a `compressed KiB decoded` child of `SourceOptions.progress` (also settable as `ImageSource.progress`), which counts encoded bytes consumed against the file size, since the decoded size is unknown until the end; bzip2, decoded by an external process, reports `KiB decompressed` without a total instead.
+
+Counts are KiB (`openetcher.progress_unit_bytes`), rounded up. `std.Progress` counters are saturating `u32`s, so bytes would stop counting at 4 GiB; KiB lasts to 4 TiB. Nodes update with atomic stores and are drawn by `std.Progress`'s own thread at a fixed rate, so the flash loop never waits on a terminal, and nothing about progress can fail and abort a half-written disk.
 
 ```zig
-pub const FlashProgress = struct {
-    phase: enum { flash, verify },
-    completed_bytes: u64,
-    total_bytes: u64,
-};
+const progress = std.Progress.start(io, .{});
+defer progress.end();
+
+var source = try openetcher.openImageSourceFromPath(allocator, io, image_path, .{ .progress = progress });
+defer source.deinit();
+const report = try openetcher.flashSource(allocator, io, &source, target_path, .{ .progress = progress });
 ```
 
-The callback cannot fail, so a broken progress display never aborts a half-written disk. An example callback setup:
-
-```zig
-fn onProgress(context: *anyopaque, progress: openetcher.FlashProgress) void {
-    _ = context;
-    _ = progress;
-}
-
-const options: openetcher.FlashOptions = .{
-    .progress_handler = .{
-        .context = state,
-        .callback = onProgress,
-    },
-};
-```
+`std.Progress.start` draws on stderr only when it is a terminal. When `ZIG_PROGRESS` is set, it forwards every node to the parent process over that pipe instead, which is how a GUI that launches the CLI, or any program embedding the library, gets progress without parsing text: spawn the child with a progress node and read the nodes, or decode the pipe's packets directly. A library caller that wants no output at all leaves the field at `.none`.
 
 `FlashReport` contains the full image size, source bytes read, bytes written, skipped bytes, and range count.
 
@@ -467,6 +456,7 @@ src/
   lib/
     flash.zig                    Single write engine: planned writing, sync, verification, progress
     image.zig                    Shared analyzer over Reader; entry points
+    progress.zig                 Unit of the library's std.Progress counts (KiB)
     range.zig                    Byte-range normalization and merging
     scan.zig                     SIMD zero detection and word-at-a-time bitmap run scanning
     device.zig                   Device abstraction, comptime platform selection, target I/O contract
@@ -494,7 +484,7 @@ src/
 
 - Library-first: the CLI delegates probing, planning, and flashing to the public module.
 - Callers provide `std.Io` and allocators. There is no global library I/O state or global allocator.
-- Closed sets are tagged unions, not vtables. An `ImageSource` is raw, encoded, or spooled; a `Stream` reads a file or a decoder; the decoder is a union generated from the codec registry. Every library error set is concrete, so callers can switch on them exhaustively. The only interfaces left take caller code: `Observer`, which reports `ObserverFailed` the way `std.Io.Reader` reports `ReadFailed`, and the progress callback.
+- Closed sets are tagged unions, not vtables. An `ImageSource` is raw, encoded, or spooled; a `Stream` reads a file or a decoder; the decoder is a union generated from the codec registry. Every library error set is concrete, so callers can switch on them exhaustively. The only interfaces left take caller code: `Observer`, which reports `ObserverFailed` the way `std.Io.Reader` reports `ReadFailed`. Progress is a `std.Progress.Node`, not a callback.
 - The CLI's error messages are checked at compile time. `writeUserError` in `main.zig` takes the exact union of the commands' error sets, and every member must have an entry in `error_texts`; entries naming errors no command returns fail the build too, except for a short list of platform-specific ones. Partition failure reasons are values (`Info.Reason`), formatted only when shown.
 - Parser code whose overflow safety depends on validation done in another function turns on `@setRuntimeSafety(true)` (ext4 group and block arithmetic, FAT cluster math, `ByteRange.end`). A missed check on a hostile image then traps in every build mode instead of becoming undefined behavior in ReleaseFast. Hot paths and locally validated code stay at the build's mode.
 - One analyzer serves every input. `image.zig` analyzes any random-access `Reader`; open files wrap in a region source, decoded bytes wrap in a buffer source. There are no parallel probe pipelines.

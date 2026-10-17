@@ -3,6 +3,7 @@ const std = @import("std");
 const flash = @import("lib/flash.zig");
 const device = @import("lib/device.zig");
 const image = @import("lib/image.zig");
+const progress_units = @import("lib/progress.zig");
 const range = @import("lib/range.zig");
 const source = @import("lib/image/source.zig");
 const region = @import("lib/image/region.zig");
@@ -39,9 +40,8 @@ pub const UnsupportedPolicy = flash.UnsupportedPolicy;
 pub const Strategy = flash.Strategy;
 pub const PrepareOptions = flash.PrepareOptions;
 pub const VerifyMode = flash.VerifyMode;
-pub const FlashPhase = flash.Phase;
-pub const FlashProgress = flash.Progress;
-pub const FlashProgressHandler = flash.ProgressHandler;
+/// Bytes per count in every `std.Progress` node the library reports.
+pub const progress_unit_bytes = progress_units.bytes_per_unit;
 pub const FlashOptions = flash.Options;
 pub const FlashReport = flash.Report;
 pub const Plan = flash.Plan;
@@ -66,6 +66,7 @@ test {
     inline for (.{
         @This(),
         @import("lib/contract.zig"),
+        @import("lib/progress.zig"),
         @import("lib/range.zig"),
         @import("lib/scan.zig"),
         @import("lib/flash.zig"),
