@@ -1,12 +1,38 @@
 const std = @import("std");
 
 const reader_mod = @import("../reader.zig");
+const ondisk = @import("../ondisk.zig");
 const types = @import("../types.zig");
 
 pub const sector_size: usize = 512;
 pub const partition_entry_offset: usize = 446;
 pub const partition_entry_size: usize = 16;
 pub const partition_entry_count: usize = 4;
+
+/// The classic MBR sector. Partition entries start at the unaligned offset
+/// 446, so every multi-byte field is declared `align(1)`.
+const OnDiskMbr = extern struct {
+    boot_code: [partition_entry_offset]u8,
+    partitions: [partition_entry_count]Entry,
+    signature: u16 align(1),
+
+    const Entry = extern struct {
+        status: u8,
+        chs_first: [3]u8,
+        partition_type: u8,
+        chs_last: [3]u8,
+        start_lba: u32 align(1),
+        sector_count: u32 align(1),
+
+        comptime {
+            ondisk.expectLayout(Entry, partition_entry_size, .{ .partition_type = 4, .start_lba = 8, .sector_count = 12 });
+        }
+    };
+
+    comptime {
+        ondisk.expectLayout(OnDiskMbr, sector_size, .{ .partitions = partition_entry_offset, .signature = 510 });
+    }
+};
 
 pub const PartitionSpan = struct {
     index: u8,
@@ -16,17 +42,12 @@ pub const PartitionSpan = struct {
 };
 
 pub fn looksLikeMbr(sector: *const [sector_size]u8) bool {
-    if (readU16(sector[510..512]) != 0xAA55) return false;
+    const mbr = ondisk.decode(OnDiskMbr, sector);
+    if (mbr.signature != 0xAA55) return false;
 
-    for (0..partition_entry_count) |entry_index| {
-        const entry_offset = partition_entry_offset + (entry_index * partition_entry_size);
-        const entry = sector[entry_offset .. entry_offset + partition_entry_size];
-        const partition_type = entry[4];
-        const start_lba = readU32(entry[8..12]);
-        const size_lba = readU32(entry[12..16]);
-        if (partition_type != 0 and size_lba != 0 and start_lba != 0) return true;
+    for (mbr.partitions) |entry| {
+        if (entry.partition_type != 0 and entry.sector_count != 0 and entry.start_lba != 0) return true;
     }
-
     return false;
 }
 
@@ -34,23 +55,18 @@ pub fn collectPartitionSpans(allocator: std.mem.Allocator, sector: *const [secto
     var spans: std.ArrayList(PartitionSpan) = .empty;
     defer spans.deinit(allocator);
 
-    for (0..partition_entry_count) |entry_index| {
-        const entry_offset = partition_entry_offset + (entry_index * partition_entry_size);
-        const entry = sector[entry_offset .. entry_offset + partition_entry_size];
-        const partition_type = entry[4];
-        const start_lba = readU32(entry[8..12]);
-        const size_lba = readU32(entry[12..16]);
+    const mbr = ondisk.decode(OnDiskMbr, sector);
+    for (mbr.partitions, 0..) |entry, entry_index| {
+        if (entry.partition_type == 0 or entry.sector_count == 0) continue;
 
-        if (partition_type == 0 or size_lba == 0) continue;
-
-        const start_offset = @as(u64, start_lba) * sector_size;
-        const size = @as(u64, size_lba) * sector_size;
+        const start_offset = @as(u64, entry.start_lba) * sector_size;
+        const size = @as(u64, entry.sector_count) * sector_size;
         const end_offset = std.math.add(u64, start_offset, size) catch return error.InvalidPartitionTable;
         if (start_offset >= image_size or end_offset > image_size) return error.InvalidPartitionTable;
 
         try spans.append(allocator, .{
             .index = @intCast(entry_index + 1),
-            .partition_type = partition_type,
+            .partition_type = entry.partition_type,
             .start_offset = start_offset,
             .size = size,
         });
@@ -82,14 +98,6 @@ pub fn collectSpans(allocator: std.mem.Allocator, io: std.Io, r: *const reader_m
 fn lessByOffset(_: void, lhs: PartitionSpan, rhs: PartitionSpan) bool {
     if (lhs.start_offset != rhs.start_offset) return lhs.start_offset < rhs.start_offset;
     return lhs.index < rhs.index;
-}
-
-fn readU16(bytes: []const u8) u16 {
-    return std.mem.readInt(u16, bytes[0..2], .little);
-}
-
-fn readU32(bytes: []const u8) u32 {
-    return std.mem.readInt(u32, bytes[0..4], .little);
 }
 
 test "looksLikeMbr detects active partition table" {

@@ -3,6 +3,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
+const ondisk = @import("../ondisk.zig");
 
 pub const ImageInfo = types.Info;
 pub const ByteRange = range.ByteRange;
@@ -12,15 +13,27 @@ const logical_block_size: u32 = 2048;
 const primary_volume_descriptor_offset: u64 = 16 * logical_block_size;
 const volume_descriptor_size: usize = logical_block_size;
 
+/// The header every ECMA-119 volume descriptor starts with.
+const VolumeDescriptorHeader = extern struct {
+    type: u8,
+    identifier: [5]u8,
+    version: u8,
+
+    comptime {
+        ondisk.expectLayout(VolumeDescriptorHeader, 7, .{ .type = 0, .identifier = 1, .version = 6 });
+    }
+};
+
+const primary_volume_descriptor_type = 1;
+
 /// Reader-core API. All offsets and ranges use reader coordinates.
 pub fn detect(io: std.Io, r: *const Reader) bool {
-    if (r.size < primary_volume_descriptor_offset + 7) return false;
+    if (r.size < primary_volume_descriptor_offset + @sizeOf(VolumeDescriptorHeader)) return false;
 
-    var descriptor: [7]u8 = undefined;
-    r.readExactlyAt(io, &descriptor, primary_volume_descriptor_offset) catch return false;
-    return descriptor[0] == 1 and
-        std.mem.eql(u8, descriptor[1..6], "CD001") and
-        descriptor[6] == 1;
+    const header = ondisk.read(VolumeDescriptorHeader, io, r, primary_volume_descriptor_offset) catch return false;
+    return header.type == primary_volume_descriptor_type and
+        std.mem.eql(u8, &header.identifier, "CD001") and
+        header.version == 1;
 }
 
 pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !ImageInfo.PartitionInfo {

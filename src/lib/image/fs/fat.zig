@@ -3,6 +3,7 @@ const std = @import("std");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
+const ondisk = @import("../ondisk.zig");
 
 pub const ByteRange = range.ByteRange;
 pub const PartitionInfo = types.Info.PartitionInfo;
@@ -10,6 +11,43 @@ pub const Filesystem = types.Info.Filesystem;
 pub const Reader = reader_mod.Reader;
 
 const sector_size: u64 = 512;
+
+/// The boot sector with its BIOS Parameter Block, as in Microsoft's FAT
+/// specification. BPB fields are packed, so several are unaligned.
+const OnDiskBootSector = extern struct {
+    jump: [3]u8,
+    oem_name: [8]u8,
+    bytes_per_sector: u16 align(1),
+    sectors_per_cluster: u8,
+    reserved_sector_count: u16 align(1),
+    num_fats: u8,
+    root_entry_count: u16 align(1),
+    total_sectors_16: u16 align(1),
+    media: u8,
+    fat_size_16: u16 align(1),
+    sectors_per_track: u16 align(1),
+    num_heads: u16 align(1),
+    hidden_sectors: u32 align(1),
+    total_sectors_32: u32 align(1),
+    fat_size_32: u32 align(1),
+    _extended_bpb_and_boot_code: [470]u8,
+    signature: u16 align(1),
+
+    comptime {
+        ondisk.expectLayout(OnDiskBootSector, 512, .{
+            .bytes_per_sector = 11,
+            .sectors_per_cluster = 13,
+            .reserved_sector_count = 14,
+            .num_fats = 16,
+            .root_entry_count = 17,
+            .total_sectors_16 = 19,
+            .fat_size_16 = 22,
+            .total_sectors_32 = 32,
+            .fat_size_32 = 36,
+            .signature = 510,
+        });
+    }
+};
 
 /// MBR partition-type bytes historically holding FAT.
 pub const mbr_types = [_]u8{ 0x06, 0x0b, 0x0c, 0x0e };
@@ -121,20 +159,19 @@ pub fn collectFatRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: 
 }
 
 fn readBootSector(io: std.Io, r: *const Reader, size: u64) !BootSector {
-    var sector: [sector_size]u8 = undefined;
-    if (r.size < sector.len) return error.InvalidFatBootSector;
-    try r.readExactlyAt(io, &sector, 0);
-    if (std.mem.readInt(u16, sector[510..512], .little) != 0xAA55) return error.InvalidFatBootSector;
+    if (r.size < sector_size) return error.InvalidFatBootSector;
+    const raw = try ondisk.read(OnDiskBootSector, io, r, 0);
+    if (raw.signature != 0xAA55) return error.InvalidFatBootSector;
 
-    const bytes_per_sector = readU16(sector[11..13]);
-    const sectors_per_cluster = sector[13];
-    const reserved_sector_count = readU16(sector[14..16]);
-    const num_fats = sector[16];
-    const root_entry_count = readU16(sector[17..19]);
-    const total_sectors_16 = readU16(sector[19..21]);
-    const fat_size_16 = readU16(sector[22..24]);
-    const total_sectors_32 = readU32(sector[32..36]);
-    const fat_size_32 = readU32(sector[36..40]);
+    const bytes_per_sector = raw.bytes_per_sector;
+    const sectors_per_cluster = raw.sectors_per_cluster;
+    const reserved_sector_count = raw.reserved_sector_count;
+    const num_fats = raw.num_fats;
+    const root_entry_count = raw.root_entry_count;
+    const total_sectors_16 = raw.total_sectors_16;
+    const fat_size_16 = raw.fat_size_16;
+    const total_sectors_32 = raw.total_sectors_32;
+    const fat_size_32 = raw.fat_size_32;
 
     if (bytes_per_sector == 0 or sectors_per_cluster == 0 or reserved_sector_count == 0 or num_fats == 0) {
         return error.InvalidFatBootSector;

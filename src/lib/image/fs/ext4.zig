@@ -9,35 +9,187 @@ pub const ImageInfo = types.Info;
 pub const PartitionInfo = types.Info.PartitionInfo;
 pub const Reader = reader_mod.Reader;
 
+const ondisk = @import("../ondisk.zig");
+const mbr = @import("../layout/mbr.zig");
+
 const superblock_offset: u64 = 1024;
-const superblock_size: usize = 1024;
 const sector_size: usize = 512;
 const ext4_magic: u16 = 0xEF53;
 
-const compat_has_journal: u32 = 0x0004;
-const compat_ext_attr: u32 = 0x0008;
-const compat_resize_inode: u32 = 0x0010;
-const compat_dir_index: u32 = 0x0020;
-const compat_sparse_super2: u32 = 0x0200;
-const compat_orphan_file: u32 = 0x1000;
-const incompat_filetype: u32 = 0x0002;
-const incompat_recover: u32 = 0x0004;
-const incompat_extents: u32 = 0x0040;
-const incompat_sixtyfourbit: u32 = 0x0080;
-const incompat_flex_bg: u32 = 0x0200;
-const incompat_orphan_file: u32 = 0x1000;
-const incompat_checksum_seed: u32 = 0x2000;
-const ro_compat_sparse_super: u32 = 0x0001;
-const ro_compat_large_file: u32 = 0x0002;
-const ro_compat_huge_file: u32 = 0x0008;
-const ro_compat_dir_nlink: u32 = 0x0020;
-const ro_compat_extra_isize: u32 = 0x0040;
-const ro_compat_stable_inodes: u32 = 0x0100;
-const ro_compat_metadata_csum: u32 = 0x0400;
+/// On-disk ext4 structures, as laid out in the kernel's ext4 documentation.
+const OnDisk = struct {
+    const Superblock = extern struct {
+        inodes_count: u32,
+        blocks_count_lo: u32,
+        _counts: [12]u8,
+        first_data_block: u32,
+        log_block_size: u32,
+        log_cluster_size: u32,
+        blocks_per_group: u32,
+        clusters_per_group: u32,
+        inodes_per_group: u32,
+        _times: [12]u8,
+        magic: u16,
+        state: u16,
+        _errors_to_creator_os: [16]u8,
+        rev_level: u32,
+        _reserved_ids_first_ino: [8]u8,
+        inode_size: u16,
+        block_group_nr: u16,
+        feature_compat: CompatFeatures,
+        feature_incompat: IncompatFeatures,
+        feature_ro_compat: RoCompatFeatures,
+        _uuid_to_hash_version: [0x96]u8,
+        desc_size: u16,
+        _mount_opts_to_jnl_blocks: [0x50]u8,
+        blocks_count_hi: u32,
+        _rest: [0x400 - 0x154]u8,
+    };
 
-const supported_compat: u32 = compat_has_journal | compat_ext_attr | compat_resize_inode | compat_dir_index | compat_sparse_super2 | compat_orphan_file;
-const supported_incompat: u32 = incompat_filetype | incompat_recover | incompat_extents | incompat_sixtyfourbit | incompat_flex_bg | incompat_orphan_file | incompat_checksum_seed;
-const supported_ro_compat: u32 = ro_compat_sparse_super | ro_compat_large_file | ro_compat_huge_file | ro_compat_dir_nlink | ro_compat_extra_isize | ro_compat_stable_inodes | ro_compat_metadata_csum;
+    /// The 64-byte descriptor. Filesystems without the 64bit feature store
+    /// only the first 32 bytes; the high halves then read as zero.
+    const GroupDescriptor = extern struct {
+        block_bitmap_lo: u32,
+        inode_bitmap_lo: u32,
+        inode_table_lo: u32,
+        free_blocks_count_lo: u16,
+        free_inodes_count_lo: u16,
+        used_dirs_count_lo: u16,
+        flags: u16,
+        _exclude_bitmap_to_checksum: [12]u8,
+        block_bitmap_hi: u32,
+        inode_bitmap_hi: u32,
+        inode_table_hi: u32,
+        free_blocks_count_hi: u16,
+        _rest: [18]u8,
+    };
+
+    const CompatFeatures = packed struct(u32) {
+        dir_prealloc: bool = false,
+        imagic_inodes: bool = false,
+        has_journal: bool = false,
+        ext_attr: bool = false,
+        resize_inode: bool = false,
+        dir_index: bool = false,
+        lazy_bg: bool = false,
+        exclude_inode: bool = false,
+        exclude_bitmap: bool = false,
+        sparse_super2: bool = false,
+        fast_commit: bool = false,
+        stable_inodes: bool = false,
+        orphan_file: bool = false,
+        _unknown: u19 = 0,
+    };
+
+    const IncompatFeatures = packed struct(u32) {
+        compression: bool = false,
+        filetype: bool = false,
+        recover: bool = false,
+        journal_dev: bool = false,
+        meta_bg: bool = false,
+        _unused_5: bool = false,
+        extents: bool = false,
+        @"64bit": bool = false,
+        mmp: bool = false,
+        flex_bg: bool = false,
+        ea_inode: bool = false,
+        _unused_11: bool = false,
+        dirdata: bool = false,
+        csum_seed: bool = false,
+        largedir: bool = false,
+        inline_data: bool = false,
+        encrypt: bool = false,
+        casefold: bool = false,
+        _unknown: u14 = 0,
+    };
+
+    const RoCompatFeatures = packed struct(u32) {
+        sparse_super: bool = false,
+        large_file: bool = false,
+        btree_dir: bool = false,
+        huge_file: bool = false,
+        gdt_csum: bool = false,
+        dir_nlink: bool = false,
+        extra_isize: bool = false,
+        has_snapshot: bool = false,
+        quota: bool = false,
+        bigalloc: bool = false,
+        metadata_csum: bool = false,
+        replica: bool = false,
+        readonly: bool = false,
+        project: bool = false,
+        shared_blocks: bool = false,
+        verity: bool = false,
+        orphan_present: bool = false,
+        _unknown: u15 = 0,
+    };
+
+    comptime {
+        ondisk.expectLayout(OnDisk.Superblock, 1024, .{
+            .blocks_count_lo = 0x04,
+            .first_data_block = 0x14,
+            .log_block_size = 0x18,
+            .blocks_per_group = 0x20,
+            .inodes_per_group = 0x28,
+            .magic = 0x38,
+            .state = 0x3A,
+            .rev_level = 0x4C,
+            .inode_size = 0x58,
+            .feature_compat = 0x5C,
+            .feature_incompat = 0x60,
+            .feature_ro_compat = 0x64,
+            .desc_size = 0xFE,
+            .blocks_count_hi = 0x150,
+        });
+        ondisk.expectLayout(OnDisk.GroupDescriptor, 64, .{
+            .block_bitmap_lo = 0x00,
+            .inode_bitmap_lo = 0x04,
+            .inode_table_lo = 0x08,
+            .free_blocks_count_lo = 0x0C,
+            .flags = 0x12,
+            .block_bitmap_hi = 0x20,
+            .inode_bitmap_hi = 0x24,
+            .inode_table_hi = 0x28,
+            .free_blocks_count_hi = 0x2C,
+        });
+    }
+};
+
+/// Features the planner can handle: none of them moves group metadata or
+/// changes what a block bitmap bit means. Anything else is rejected.
+const supported_compat: OnDisk.CompatFeatures = .{
+    .has_journal = true,
+    .ext_attr = true,
+    .resize_inode = true,
+    .dir_index = true,
+    .sparse_super2 = true,
+    .stable_inodes = true,
+    .orphan_file = true,
+};
+const supported_incompat: OnDisk.IncompatFeatures = .{
+    .filetype = true,
+    .recover = true,
+    .extents = true,
+    .@"64bit" = true,
+    .flex_bg = true,
+    .dirdata = true,
+    .csum_seed = true,
+};
+const supported_ro_compat: OnDisk.RoCompatFeatures = .{
+    .sparse_super = true,
+    .large_file = true,
+    .huge_file = true,
+    .dir_nlink = true,
+    .extra_isize = true,
+    .quota = true,
+    .metadata_csum = true,
+};
+
+/// True when `present` sets any flag `supported` does not.
+fn hasUnsupported(comptime Features: type, present: Features, supported: Features) bool {
+    const Bits = @typeInfo(Features).@"struct".backing_integer.?;
+    return @as(Bits, @bitCast(present)) & ~@as(Bits, @bitCast(supported)) != 0;
+}
 
 const Superblock = struct {
     blocks_count: u64,
@@ -48,9 +200,9 @@ const Superblock = struct {
     magic: u16,
     state: u16,
     rev_level: u32,
-    feature_compat: u32,
-    feature_incompat: u32,
-    feature_ro_compat: u32,
+    feature_compat: OnDisk.CompatFeatures,
+    feature_incompat: OnDisk.IncompatFeatures,
+    feature_ro_compat: OnDisk.RoCompatFeatures,
     desc_size: u16,
     inode_size: u16,
 
@@ -80,7 +232,7 @@ const GroupDescriptor = struct {
 
 /// Reader-core API. All offsets and ranges use reader coordinates.
 pub fn detect(io: std.Io, r: *const Reader) bool {
-    const magic_offset = superblock_offset + 56;
+    const magic_offset = superblock_offset + @offsetOf(OnDisk.Superblock, "magic");
     if (r.size < magic_offset + 2) return false;
     const magic = r.readU16LeAt(io, magic_offset) catch return false;
     return magic == ext4_magic;
@@ -230,40 +382,25 @@ pub fn probeExt4Partition(io: std.Io, allocator: std.mem.Allocator, file: std.Io
 }
 
 fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
-    var buffer: [superblock_size]u8 = undefined;
-    try r.readExactlyAt(io, &buffer, superblock_offset);
+    const raw = try ondisk.read(OnDisk.Superblock, io, r, superblock_offset);
+    if (raw.magic != ext4_magic) return error.InvalidExt4Superblock;
 
-    const magic = readU16(buffer[56..58]);
-    if (magic != ext4_magic) return error.InvalidExt4Superblock;
-
-    const blocks_lo = readU32(buffer[4..8]);
-    const first_data_block = readU32(buffer[20..24]);
-    const log_block_size = readU32(buffer[24..28]);
-    const blocks_per_group = readU32(buffer[32..36]);
-    const inodes_per_group = readU32(buffer[40..44]);
-    const rev_level = readU32(buffer[76..80]);
-    const feature_compat = readU32(buffer[92..96]);
-    const feature_incompat = readU32(buffer[96..100]);
-    const feature_ro_compat = readU32(buffer[100..104]);
-    const desc_size = readU16(buffer[254..256]);
-    const state = readU16(buffer[58..60]);
-    const inode_size = if (rev_level >= 1) readU16(buffer[88..90]) else 128;
-    const blocks_hi = if (rev_level >= 1) readU32(buffer[336..340]) else 0;
-
+    // Revision 0 filesystems predate these fields and leave them undefined.
+    const dynamic = raw.rev_level >= 1;
     return .{
-        .blocks_count = (@as(u64, blocks_hi) << 32) | blocks_lo,
-        .first_data_block = first_data_block,
-        .log_block_size = log_block_size,
-        .blocks_per_group = blocks_per_group,
-        .inodes_per_group = inodes_per_group,
-        .magic = magic,
-        .state = state,
-        .rev_level = rev_level,
-        .feature_compat = feature_compat,
-        .feature_incompat = feature_incompat,
-        .feature_ro_compat = feature_ro_compat,
-        .desc_size = desc_size,
-        .inode_size = inode_size,
+        .blocks_count = (@as(u64, if (dynamic) raw.blocks_count_hi else 0) << 32) | raw.blocks_count_lo,
+        .first_data_block = raw.first_data_block,
+        .log_block_size = raw.log_block_size,
+        .blocks_per_group = raw.blocks_per_group,
+        .inodes_per_group = raw.inodes_per_group,
+        .magic = raw.magic,
+        .state = raw.state,
+        .rev_level = raw.rev_level,
+        .feature_compat = raw.feature_compat,
+        .feature_incompat = raw.feature_incompat,
+        .feature_ro_compat = raw.feature_ro_compat,
+        .desc_size = raw.desc_size,
+        .inode_size = if (dynamic) raw.inode_size else 128,
     };
 }
 
@@ -274,23 +411,8 @@ fn rejectUnsupportedImageLayout(io: std.Io, file: std.Io.File, image_size: u64) 
     const count = try file.readPositionalAll(io, &sector, 0);
     if (count != sector.len) return error.InvalidExt4Superblock;
 
-    if (!looksLikeMbr(&sector)) return;
+    if (!mbr.looksLikeMbr(&sector)) return;
     return error.UnsupportedImageLayout;
-}
-
-fn looksLikeMbr(sector: *const [sector_size]u8) bool {
-    if (readU16(sector[510..512]) != 0xAA55) return false;
-
-    for (0..4) |entry_index| {
-        const entry_offset = 446 + (entry_index * 16);
-        const entry = sector[entry_offset .. entry_offset + 16];
-        const partition_type = entry[4];
-        const start_lba = readU32(entry[8..12]);
-        const size_lba = readU32(entry[12..16]);
-        if (partition_type != 0 and size_lba != 0 and start_lba != 0) return true;
-    }
-
-    return false;
 }
 
 fn validateSuperblock(superblock: Superblock, image_size: u64) !void {
@@ -305,9 +427,9 @@ fn validateSuperblock(superblock: Superblock, image_size: u64) !void {
     // block_size * 8 blocks.
     if (superblock.blocks_per_group > @as(u64, try superblock.blockSize()) * 8) return error.InvalidExt4Superblock;
 
-    if ((superblock.feature_compat & ~supported_compat) != 0) return error.UnsupportedExt4CompatFeature;
-    if ((superblock.feature_incompat & ~supported_incompat) != 0) return error.UnsupportedExt4IncompatFeature;
-    if ((superblock.feature_ro_compat & ~supported_ro_compat) != 0) return error.UnsupportedExt4ReadOnlyFeature;
+    if (hasUnsupported(OnDisk.CompatFeatures, superblock.feature_compat, supported_compat)) return error.UnsupportedExt4CompatFeature;
+    if (hasUnsupported(OnDisk.IncompatFeatures, superblock.feature_incompat, supported_incompat)) return error.UnsupportedExt4IncompatFeature;
+    if (hasUnsupported(OnDisk.RoCompatFeatures, superblock.feature_ro_compat, supported_ro_compat)) return error.UnsupportedExt4ReadOnlyFeature;
 }
 
 /// Descriptor block numbers are untrusted. Keeping them inside the
@@ -320,7 +442,7 @@ fn checkDescriptor(descriptor: GroupDescriptor, blocks_count: u64, inode_table_b
 }
 
 fn descriptorSize(superblock: Superblock) u64 {
-    if ((superblock.feature_incompat & incompat_sixtyfourbit) != 0 and superblock.desc_size >= 32) {
+    if (superblock.feature_incompat.@"64bit" and superblock.desc_size >= 32) {
         return superblock.desc_size;
     }
     return 32;
@@ -330,31 +452,26 @@ fn inodeSize(superblock: Superblock) u16 {
     return if (superblock.inode_size >= 128) superblock.inode_size else 128;
 }
 
+/// Reads the whole descriptor table in one request and decodes each entry.
 fn readGroupDescriptors(io: std.Io, allocator: std.mem.Allocator, r: *const Reader, descriptors: []GroupDescriptor, descriptor_table_block: u64, desc_size: u64, block_size: u32) !void {
-    var descriptor_buffer = try allocator.alloc(u8, @intCast(desc_size));
-    defer allocator.free(descriptor_buffer);
+    const entry_size: usize = @intCast(desc_size);
+    const table_len = std.math.mul(usize, descriptors.len, entry_size) catch return error.InvalidExt4Superblock;
+    const table = try allocator.alloc(u8, table_len);
+    defer allocator.free(table);
+    try r.readExactlyAt(io, table, descriptor_table_block * block_size);
 
-    const table_offset = descriptor_table_block * block_size;
     for (descriptors, 0..) |*descriptor, index| {
-        const offset = table_offset + (index * desc_size);
-        try r.readExactlyAt(io, descriptor_buffer, offset);
-
-        const block_bitmap_lo = readU32(descriptor_buffer[0..4]);
-        const inode_bitmap_lo = readU32(descriptor_buffer[4..8]);
-        const inode_table_lo = readU32(descriptor_buffer[8..12]);
-        const free_blocks_lo = readU16(descriptor_buffer[12..14]);
-        const flags = readU16(descriptor_buffer[18..20]);
-        const block_bitmap_hi = if (desc_size >= 64) readU32(descriptor_buffer[32..36]) else 0;
-        const inode_bitmap_hi = if (desc_size >= 64) readU32(descriptor_buffer[36..40]) else 0;
-        const inode_table_hi = if (desc_size >= 64) readU32(descriptor_buffer[40..44]) else 0;
-        const free_blocks_hi = if (desc_size >= 64) readU16(descriptor_buffer[44..46]) else 0;
+        var entry: [@sizeOf(OnDisk.GroupDescriptor)]u8 = @splat(0);
+        const stored = @min(entry_size, entry.len);
+        @memcpy(entry[0..stored], table[index * entry_size ..][0..stored]);
+        const raw = ondisk.decode(OnDisk.GroupDescriptor, &entry);
 
         descriptor.* = .{
-            .block_bitmap = (@as(u64, block_bitmap_hi) << 32) | block_bitmap_lo,
-            .inode_bitmap = (@as(u64, inode_bitmap_hi) << 32) | inode_bitmap_lo,
-            .inode_table = (@as(u64, inode_table_hi) << 32) | inode_table_lo,
-            .free_blocks_count = (@as(u32, free_blocks_hi) << 16) | free_blocks_lo,
-            .flags = flags,
+            .block_bitmap = (@as(u64, raw.block_bitmap_hi) << 32) | raw.block_bitmap_lo,
+            .inode_bitmap = (@as(u64, raw.inode_bitmap_hi) << 32) | raw.inode_bitmap_lo,
+            .inode_table = (@as(u64, raw.inode_table_hi) << 32) | raw.inode_table_lo,
+            .free_blocks_count = (@as(u32, raw.free_blocks_count_hi) << 16) | raw.free_blocks_count_lo,
+            .flags = raw.flags,
         };
     }
 }
@@ -394,14 +511,6 @@ fn isPowerOf(value: u64, base: u64) bool {
     var current = value;
     while (current % base == 0) current /= base;
     return current == 1;
-}
-
-fn readU16(bytes: []const u8) u16 {
-    return std.mem.readInt(u16, bytes[0..2], .little);
-}
-
-fn readU32(bytes: []const u8) u32 {
-    return std.mem.readInt(u32, bytes[0..4], .little);
 }
 
 // Filesystem driver contract; see driver.zig.
@@ -478,7 +587,7 @@ test "64-bit block numbers that overflow byte offsets are rejected" {
     var bytes: [256 * 1024]u8 = undefined;
     writeTestExt4(&bytes, 8192);
     const superblock = bytes[1024..][0..1024];
-    std.mem.writeInt(u32, superblock[96..100], incompat_sixtyfourbit, .little);
+    std.mem.writeInt(u32, superblock[0x60..0x64], @bitCast(OnDisk.IncompatFeatures{ .@"64bit" = true }), .little);
     std.mem.writeInt(u16, superblock[254..256], 64, .little);
     std.mem.writeInt(u32, bytes[2048 + 32 ..][0..4], 0xffff_ffff, .little); // block bitmap, high half
 

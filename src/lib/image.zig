@@ -438,6 +438,7 @@ fn appendGapRanges(allocator: std.mem.Allocator, ranges: *std.ArrayList(ByteRang
 
 test {
     _ = @import("image/fuzz.zig");
+    _ = @import("image/ondisk.zig");
 }
 
 test "analyzeReader detects mbr partitions through a file region" {

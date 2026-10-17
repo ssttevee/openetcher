@@ -3,13 +3,41 @@ const std = @import("std");
 const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
+const ondisk = @import("../ondisk.zig");
 
 pub const ByteRange = range.ByteRange;
 pub const PartitionInfo = types.Info.PartitionInfo;
 pub const Reader = reader_mod.Reader;
 
 const squashfs_magic = 0x73717368;
-const superblock_size = 96;
+const superblock_size = @sizeOf(OnDiskSuperblock);
+
+/// The SquashFS 4.0 superblock.
+const OnDiskSuperblock = extern struct {
+    magic: u32,
+    inode_count: u32,
+    modification_time: u32,
+    block_size: u32,
+    fragment_entry_count: u32,
+    compression_id: u16,
+    block_log: u16,
+    flags: u16,
+    id_count: u16,
+    version_major: u16,
+    version_minor: u16,
+    root_inode_ref: u64,
+    bytes_used: u64,
+    id_table_start: u64,
+    xattr_id_table_start: u64,
+    inode_table_start: u64,
+    directory_table_start: u64,
+    fragment_table_start: u64,
+    export_table_start: u64,
+
+    comptime {
+        ondisk.expectLayout(OnDiskSuperblock, 96, .{ .magic = 0, .block_size = 12, .bytes_used = 40, .export_table_start = 88 });
+    }
+};
 
 const Superblock = struct {
     block_size: u32,
@@ -70,9 +98,10 @@ pub fn collectSquashfsRangesInRegion(io: std.Io, allocator: std.mem.Allocator, f
 fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
     if (r.size < superblock_size) return error.InvalidSquashfsSuperblock;
 
-    if (try r.readU32LeAt(io, 0) != squashfs_magic) return error.InvalidSquashfsSuperblock;
-    const block_size = try r.readU32LeAt(io, 12);
-    const bytes_used = try r.readU64LeAt(io, 40);
+    const raw = try ondisk.read(OnDiskSuperblock, io, r, 0);
+    if (raw.magic != squashfs_magic) return error.InvalidSquashfsSuperblock;
+    const block_size = raw.block_size;
+    const bytes_used = raw.bytes_used;
 
     if (block_size == 0 or bytes_used == 0 or bytes_used > r.size) return error.InvalidSquashfsSuperblock;
 
