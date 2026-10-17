@@ -51,17 +51,12 @@ pub fn detect(io: std.Io, r: *const Reader) bool {
     return magic == squashfs_magic;
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !types.Info.Probe {
     _ = allocator;
     const superblock = try readSuperblock(io, r);
 
     return .{
-        .index = 0,
-        .start_offset = 0,
-        .size = r.size,
-        .partition_type = 0,
         .filesystem = .squashfs,
-        .supported = true,
         .block_size = superblock.block_size,
         .used_bytes = superblock.bytes_used,
         .skipped_bytes = r.size - superblock.bytes_used,
@@ -84,9 +79,7 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
 pub fn probeSquashfsPartition(io: std.Io, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
     var region = reader_mod.FileRegion.init(io, file, start_offset, size);
     const r = region.reader();
-    var partition = try probeRegion(undefined, io, &r);
-    partition.start_offset = start_offset;
-    return partition;
+    return .probed(try probeRegion(undefined, io, &r), 0, start_offset, size, 0);
 }
 
 pub fn collectSquashfsRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {

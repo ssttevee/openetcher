@@ -90,7 +90,7 @@ pub fn detect(io: std.Io, r: *const Reader) bool {
     return true;
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !types.Info.Probe {
     const boot = try readBootSector(io, r, r.size);
     const ranges = try collectRanges(allocator, io, r);
     defer allocator.free(ranges);
@@ -99,12 +99,7 @@ pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !
     for (ranges) |segment| used_bytes += segment.length;
 
     return .{
-        .index = 0,
-        .start_offset = 0,
-        .size = r.size,
-        .partition_type = 0,
         .filesystem = boot.filesystem,
-        .supported = true,
         .block_size = @intCast(boot.clusterLength()),
         .used_bytes = used_bytes,
         .skipped_bytes = r.size - used_bytes,
@@ -147,9 +142,7 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
 pub fn probeFatPartition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
     var region = reader_mod.FileRegion.init(io, file, start_offset, size);
     const r = region.reader();
-    var partition = try probeRegion(allocator, io, &r);
-    partition.start_offset = start_offset;
-    return partition;
+    return .probed(try probeRegion(allocator, io, &r), 0, start_offset, size, 0);
 }
 
 pub fn collectFatRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {

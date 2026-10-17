@@ -36,17 +36,12 @@ pub fn detect(io: std.Io, r: *const Reader) bool {
         header.version == 1;
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !ImageInfo.PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !types.Info.Probe {
     _ = allocator;
     if (!detect(io, r)) return error.InvalidIso9660Image;
 
     return .{
-        .index = 0,
-        .start_offset = 0,
-        .size = r.size,
-        .partition_type = 0,
         .filesystem = .iso9660,
-        .supported = true,
         .block_size = logical_block_size,
         .used_bytes = r.size,
         .skipped_bytes = 0,

@@ -244,10 +244,7 @@ fn analyzePartitioned(comptime L: type, io: std.Io, allocator: std.mem.Allocator
     defer occupied.deinit(allocator);
 
     {
-        errdefer {
-            for (partitions.items) |partition| if (partition.reason) |reason| allocator.free(reason);
-            partitions.deinit(allocator);
-        }
+        errdefer partitions.deinit(allocator);
 
         for (spans) |span| {
             try occupied.append(allocator, .{ .offset = span.start_offset, .length = span.size });
@@ -334,7 +331,7 @@ fn planPartition(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Read
                 .partition_type = span.partition_type,
                 .filesystem = .empty,
                 .supported = false,
-                .reason = allocator.dupe(u8, "partition appears empty") catch null,
+                .reason = .empty,
             } };
         }
 
@@ -348,13 +345,13 @@ fn planPartition(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Read
         .partition_type = span.partition_type,
         .filesystem = .unknown,
         .supported = false,
-        .reason = allocator.dupe(u8, "unknown partition type") catch null,
+        .reason = .unknown_type,
     } };
 }
 
 fn planWithDriver(comptime D: type, io: std.Io, allocator: std.mem.Allocator, span: mbr.PartitionSpan, sr: *const reader.Reader) PartitionPlan {
     comptime fs_drivers.validate(D);
-    const partition = D.probeRegion(allocator, io, sr) catch |err| {
+    const probe = D.probeRegion(allocator, io, sr) catch |err| {
         return .{ .partition = .{
             .index = span.index,
             .start_offset = span.start_offset,
@@ -362,7 +359,7 @@ fn planWithDriver(comptime D: type, io: std.Io, allocator: std.mem.Allocator, sp
             .partition_type = span.partition_type,
             .filesystem = D.unrecognized,
             .supported = false,
-            .reason = std.fmt.allocPrint(allocator, D.name ++ " probe failed: {t}", .{err}) catch null,
+            .reason = .{ .driver_failed = .{ .driver = D.name, .stage = .probe, .err = err } },
         } };
     };
 
@@ -372,18 +369,16 @@ fn planWithDriver(comptime D: type, io: std.Io, allocator: std.mem.Allocator, sp
             .start_offset = span.start_offset,
             .size = span.size,
             .partition_type = span.partition_type,
-            .filesystem = partition.filesystem,
+            .filesystem = probe.filesystem,
             .supported = false,
-            .reason = std.fmt.allocPrint(allocator, D.name ++ " range collection failed: {t}", .{err}) catch null,
+            .reason = .{ .driver_failed = .{ .driver = D.name, .stage = .range_collection, .err = err } },
         } };
     };
 
-    var filled = partition;
-    filled.index = span.index;
-    filled.start_offset = span.start_offset;
-    filled.size = span.size;
-    filled.partition_type = span.partition_type;
-    return .{ .partition = filled, .relative_ranges = relative_ranges };
+    return .{
+        .partition = .probed(probe, span.index, span.start_offset, span.size, span.partition_type),
+        .relative_ranges = relative_ranges,
+    };
 }
 
 fn partitionHeadIsZero(io: std.Io, sr: *const reader.Reader) bool {

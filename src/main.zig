@@ -465,7 +465,7 @@ fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo, humanize: 
         try writeByteValue(writer, partition.size, humanize);
         try writer.writeByte('\n');
         if (partition.reason) |reason| {
-            try writer.print("     reason={s}\n", .{reason});
+            try writer.print("     reason={f}\n", .{reason});
         }
         if (partition.block_size) |block_size| {
             try writeByteField(writer, "     block_size=", block_size, humanize);
@@ -667,34 +667,188 @@ fn writeCandidateDisksJson(writer: *std.Io.Writer, disks: []const openetcher.Dev
     try writer.print("\n]\n", .{});
 }
 
-fn writeUserError(writer: *std.Io.Writer, err: anyerror) !void {
+fn ErrorSetOf(comptime function: anytype) type {
+    return @typeInfo(@typeInfo(@TypeOf(function)).@"fn".return_type.?).error_union.error_set;
+}
+
+/// Every error a command reports through `writeUserError`.
+const CommandError = ErrorSetOf(openetcher.openImageSourceFromPath) ||
+    ErrorSetOf(openetcher.probeImageSource) ||
+    ErrorSetOf(openetcher.planImageFlashSource) ||
+    ErrorSetOf(openetcher.flashSource) ||
+    ErrorSetOf(openetcher.device_api.listCandidateDisks) ||
+    ErrorSetOf(openetcher.device_api.resolveDiskId) ||
+    ErrorSetOf(openetcher.device_api.lookupDiskByPath) ||
+    ErrorSetOf(openetcher.device_api.probeTarget) ||
+    ErrorSetOf(openetcher.device_api.prepareTargetPath) ||
+    error{ProtectedTargetRequiresForce};
+
+const ErrorText = struct {
+    errors: type,
+    text: []const u8,
+    /// Appends the error name, for groups whose members are worth telling
+    /// apart.
+    show_name: bool = false,
+};
+
+/// What the CLI prints for each error. Every member of `CommandError` must
+/// appear in exactly one entry or the build fails, so a new library error
+/// cannot reach users without a message.
+const error_texts = [_]ErrorText{
+    .{ .errors = error{UnsupportedPartitionFilesystem}, .text = "image contains unsupported partition filesystems; run `openetcher info <image>` for details, or flash with --force to write the whole image" },
+    .{ .errors = error{UnknownDiskId}, .text = "unknown disk id: run `openetcher disks` to list candidate ids" },
+    .{ .errors = error{AmbiguousDiskId}, .text = "ambiguous disk id: run `openetcher disks --all --json` and choose a more specific target" },
+    .{ .errors = error{ProtectedTargetRequiresForce}, .text = "refusing to write a protected system disk without --force" },
+    .{ .errors = error{Bzip2Unavailable}, .text = "bzip2 images are decompressed with the `bzip2` command, which was not found on PATH; install bzip2 or decompress the image first" },
+    .{ .errors = error{SpoolDirectoryFull}, .text = "not enough space to decompress the image into the spool directory; pass --spool-dir <dir> on a larger volume, or flash with --force to stream without planning" },
+    .{ .errors = error{SpoolDirectoryUnavailable}, .text = "cannot create the decompressed image in the spool directory; pass --spool-dir <dir> with a writable directory" },
+    .{ .errors = error{UnsupportedImageSource}, .text = "the image must be a regular file" },
+    .{ .errors = error{UnsupportedCompression}, .text = "the image uses an unsupported compression format" },
+    .{ .errors = error{InvalidCompressedImage}, .text = "the compressed image is corrupt or truncated" },
+    .{ .errors = error{DecompressedImageTooLarge}, .text = "the decompressed image is larger than the size limit" },
+    .{ .errors = error{UnsupportedTargetType}, .text = "the target must be a regular file or a disk this platform can write" },
+    .{ .errors = error{DestinationTooSmall}, .text = "the target is smaller than the image" },
+    .{ .errors = error{VerificationFailed}, .text = "verification failed: the target does not read back what was written" },
+    .{ .errors = error{DiskListFailed}, .text = "listing disks failed: `diskutil` reported an error" },
+    .{ .errors = error{UnmountFailed}, .text = "could not unmount the target disk; close anything using it and retry" },
+    .{ .errors = error{ AccessDenied, PermissionDenied }, .text = "permission denied; writing to a disk usually needs administrator rights" },
+    .{ .errors = error{FileNotFound}, .text = "file not found" },
+    .{ .errors = error{ReadOnlyFileSystem}, .text = "the target is read-only" },
+    .{ .errors = error{ NoSpaceLeft, DiskQuota, FileTooBig }, .text = "no space left", .show_name = true },
+    .{ .errors = error{ DeviceBusy, FileBusy, LockViolation, PipeBusy, AntivirusInterference }, .text = "the file or device is in use", .show_name = true },
+    .{ .errors = error{ IsDir, NotDir, PathAlreadyExists, SymLinkLoop, NameTooLong, BadPathName, InvalidWtf8, NetworkNotFound }, .text = "invalid path", .show_name = true },
+    .{
+        .errors = error{
+            InvalidImage,
+            InvalidIso9660Image,
+            ImageTruncated,
+            InvalidPartitionTable,
+            InvalidExt4Superblock,
+            InvalidExt4GroupDescriptor,
+            RangeOverflow,
+            RangeOutsideRegion,
+            RegionOutOfBounds,
+            InvalidImageSize,
+            UnexpectedEndOfImage,
+            ImageSizeMismatch,
+        },
+        .text = "the image is corrupt or truncated",
+        .show_name = true,
+    },
+    .{
+        .errors = error{ UnsupportedExt4Feature, UnsupportedExt4CompatFeature, UnsupportedExt4IncompatFeature, UnsupportedExt4ReadOnlyFeature },
+        .text = "the ext4 filesystem uses features the planner cannot handle; flash with --force to write the whole image",
+        .show_name = true,
+    },
+    .{
+        .errors = error{
+            InputOutput,
+            ShortWrite,
+            InvalidDeviceRead,
+            NoDevice,
+            BrokenPipe,
+            ConnectionResetByPeer,
+            SocketUnconnected,
+            EndOfStream,
+            ReadFailed,
+            Unseekable,
+            Streaming,
+            NotOpenForReading,
+            NotOpenForWriting,
+            WouldBlock,
+            Timeout,
+            OperationUnsupported,
+            FileLocksUnsupported,
+            FileSystem,
+            UnrecognizedVolume,
+            NonResizable,
+        },
+        .text = "I/O error",
+        .show_name = true,
+    },
+    .{
+        .errors = error{ OutOfMemory, SystemResources, ProcessFdQuotaExceeded, SystemFdQuotaExceeded, ResourceLimitReached, ConcurrencyUnavailable },
+        .text = "out of system resources",
+        .show_name = true,
+    },
+    .{
+        .errors = error{ InvalidExe, InvalidBatchScriptArg, InvalidUserId, InvalidProcessGroupId, InvalidName, ProcessAlreadyExec, StreamTooLong },
+        .text = "a helper command (`bzip2` or `diskutil`) could not run",
+        .show_name = true,
+    },
+    .{ .errors = error{Canceled}, .text = "canceled" },
+    .{
+        // Failures of the engine's own invariants: bugs, not bad input.
+        .errors = error{ InvalidFlashPlan, RangeOutsideImage, InvalidBlockSize, BackwardStreamRequest, ScratchBufferTooSmall, InternalBufferTooSmall, ObserverFailed, Overflow, DivisionByZero, Unexpected },
+        .text = "internal error",
+        .show_name = true,
+    },
+};
+
+/// Errors in `error_texts` that only some platforms' backends return. Any
+/// other entry must be a member of `CommandError`, so stale or misspelled
+/// entries fail the build too.
+const platform_specific_errors = error{
+    // macOS disk discovery, which runs `diskutil`.
+    UnknownDiskId,
+    AmbiguousDiskId,
+    DiskListFailed,
+    UnmountFailed,
+    Timeout,
+    ConcurrencyUnavailable,
+    StreamTooLong,
+    // Raw-device I/O in the POSIX backend.
+    ShortWrite,
+    InvalidDeviceRead,
+    ScratchBufferTooSmall,
+};
+
+comptime {
+    @setEvalBranchQuota(200_000);
+    var seen: []const []const u8 = &.{};
+    var stale: []const u8 = "";
+    for (error_texts) |entry| {
+        for (errorNames(entry.errors)) |name| {
+            for (seen) |other| if (std.mem.eql(u8, name, other)) @compileError("error." ++ name ++ " appears twice in error_texts");
+            seen = seen ++ .{name};
+            if (!hasError(CommandError, name) and !hasError(platform_specific_errors, name)) stale = stale ++ " " ++ name;
+        }
+    }
+    if (stale.len != 0) @compileError("error_texts describes errors no command returns on this target; remove them or list them in platform_specific_errors:" ++ stale);
+
+    var missing: []const u8 = "";
+    for (errorNames(CommandError)) |name| {
+        for (seen) |other| {
+            if (std.mem.eql(u8, name, other)) break;
+        } else missing = missing ++ " " ++ name;
+    }
+    if (missing.len != 0) @compileError("no message in error_texts for:" ++ missing);
+}
+
+fn errorNames(comptime Set: type) []const [:0]const u8 {
+    return @typeInfo(Set).error_set.error_names.?;
+}
+
+fn hasError(comptime Set: type, comptime name: []const u8) bool {
+    for (errorNames(Set)) |member| if (std.mem.eql(u8, member, name)) return true;
+    return false;
+}
+
+fn errorText(comptime name: []const u8) ErrorText {
+    @setEvalBranchQuota(100_000);
+    for (error_texts) |entry| if (hasError(entry.errors, name)) return entry;
+    @compileError("no message for error." ++ name ++ "; add it to error_texts in main.zig");
+}
+
+fn writeUserError(writer: *std.Io.Writer, err: CommandError) !void {
     switch (err) {
-        error.UnsupportedImageLayout => {
-            try writer.print("unsupported image layout: only raw ext4 filesystem images are supported right now\n", .{});
-        },
-        error.UnsupportedPartitionFilesystem => {
-            try writer.print("image contains unsupported partition filesystems; run `openetcher info <image>` for details\n", .{});
-        },
-        error.UnknownDiskId => {
-            try writer.print("unknown disk id: run `openetcher disks` to list candidate ids\n", .{});
-        },
-        error.AmbiguousDiskId => {
-            try writer.print("ambiguous disk id: run `openetcher disks --all --json` and choose a more specific target\n", .{});
-        },
-        error.Bzip2Unavailable => {
-            try writer.print("bzip2 images are decompressed with the `bzip2` command, which was not found on PATH; install bzip2 or decompress the image first\n", .{});
-        },
-        error.SpoolDirectoryFull => {
-            try writer.print("not enough space to decompress the image into the spool directory; pass --spool-dir <dir> on a larger volume, or flash with --force to stream without planning\n", .{});
-        },
-        error.SpoolDirectoryUnavailable => {
-            try writer.print("cannot create the decompressed image in the spool directory; pass --spool-dir <dir> with a writable directory\n", .{});
-        },
-        error.ProtectedTargetRequiresForce => {
-            try writer.print("refusing to write a protected system disk without --force\n", .{});
-        },
-        else => {
-            try writer.print("error: {t}\n", .{err});
+        inline else => |known| {
+            const entry = comptime errorText(@errorName(known));
+            if (entry.show_name) {
+                try writer.print("{s}: {t}\n", .{ entry.text, known });
+            } else {
+                try writer.print("{s}\n", .{entry.text});
+            }
         },
     }
 }
@@ -725,4 +879,16 @@ fn formatBytes(buffer: []u8, value: u64) ![]const u8 {
     }
 
     return std.fmt.bufPrint(buffer, "{}.{} {s}", .{ scaled, decimal, units[unit_index] });
+}
+
+test "writeUserError prints specific and grouped messages" {
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeUserError(&writer, error.DestinationTooSmall);
+    try writeUserError(&writer, error.InvalidExt4Superblock);
+    try std.testing.expectEqualStrings(
+        "the target is smaller than the image\n" ++
+            "the image is corrupt or truncated: InvalidExt4Superblock\n",
+        writer.buffered(),
+    );
 }

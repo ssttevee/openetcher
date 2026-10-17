@@ -7,7 +7,7 @@ const types = @import("../types.zig");
 
 const Reader = reader_mod.Reader;
 const expectFn = contract.expectFn;
-const PartitionInfo = types.Info.PartitionInfo;
+const Probe = types.Info.Probe;
 
 /// Filesystem drivers, in content-sniffing precedence.
 ///
@@ -19,7 +19,7 @@ const PartitionInfo = types.Info.PartitionInfo;
 ///   `pub const name: []const u8` - label used in partition failure reasons
 ///   `pub const unrecognized: Filesystem` - tag reported when probing fails
 ///   `pub fn detect(std.Io, *const Reader) bool` - cheap, allocation-free sniff
-///   `pub fn probeRegion(Allocator, std.Io, *const Reader) !PartitionInfo`
+///   `pub fn probeRegion(Allocator, std.Io, *const Reader) !Probe`
 ///   `pub fn collectRanges(Allocator, std.Io, *const Reader) ![]ByteRange`
 ///
 /// Optional declarations:
@@ -35,6 +35,15 @@ pub const drivers = .{
     @import("fat.zig"),
     @import("squashfs.zig"),
     @import("ext4.zig"),
+};
+
+/// Every error a driver's `probeRegion` or `collectRanges` can return.
+pub const Error = Error: {
+    var set = error{};
+    for (drivers) |D| {
+        set = set || contract.ErrorSetOf(D.probeRegion) || contract.ErrorSetOf(D.collectRanges);
+    }
+    break :Error set;
 };
 
 comptime {
@@ -55,7 +64,7 @@ pub fn validate(comptime D: type) void {
     _ = @as([]const u8, D.name);
     _ = @as(types.Info.Filesystem, D.unrecognized);
     expectFn(D, "detect", &.{ std.Io, *const Reader }, bool);
-    expectFn(D, "probeRegion", &.{ std.mem.Allocator, std.Io, *const Reader }, PartitionInfo);
+    expectFn(D, "probeRegion", &.{ std.mem.Allocator, std.Io, *const Reader }, Probe);
     expectFn(D, "collectRanges", &.{ std.mem.Allocator, std.Io, *const Reader }, []range.ByteRange);
     if (@hasDecl(D, "mbr_types")) _ = @as([]const u8, &D.mbr_types);
     if (@hasDecl(D, "raw_layout")) {

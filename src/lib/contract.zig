@@ -32,3 +32,8 @@ pub fn expectFn(comptime Owner: type, comptime decl: []const u8, comptime params
     };
     if (actual != payload) @compileError(where ++ " must return " ++ @typeName(payload));
 }
+
+/// The error set `function` returns.
+pub fn ErrorSetOf(comptime function: anytype) type {
+    return @typeInfo(@typeInfo(@TypeOf(function)).@"fn".return_type.?).error_union.error_set;
+}

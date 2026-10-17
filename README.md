@@ -495,6 +495,7 @@ src/
 - Library-first: the CLI delegates probing, planning, and flashing to the public module.
 - Callers provide `std.Io` and allocators. There is no global library I/O state or global allocator.
 - Closed sets are tagged unions, not vtables. An `ImageSource` is raw, encoded, or spooled; a `Stream` reads a file or a decoder; the decoder is a union generated from the codec registry. Every library error set is concrete, so callers can switch on them exhaustively. The only interfaces left take caller code: `Observer`, which reports `ObserverFailed` the way `std.Io.Reader` reports `ReadFailed`, and the progress callback.
+- The CLI's error messages are checked at compile time. `writeUserError` in `main.zig` takes the exact union of the commands' error sets, and every member must have an entry in `error_texts`; entries naming errors no command returns fail the build too, except for a short list of platform-specific ones. Partition failure reasons are values (`Info.Reason`), formatted only when shown.
 - One analyzer serves every input. `image.zig` analyzes any random-access `Reader`; open files wrap in a region source, decoded bytes wrap in a buffer source. There are no parallel probe pipelines.
 - Format drivers are resolved at compile time. Each filesystem, disk layout, and compression codec is a module exposing a fixed set of `pub` declarations, listed in a comptime tuple in `image/fs/driver.zig`, `image/layout/driver.zig`, or `image/compression/codec.zig`. Callers dispatch with `inline for`, so there are no vtables, and each registry checks its entries at compile time: missing declarations, wrong signatures, two drivers claiming one MBR type, overlapping codec magic, or a `Compression` tag without a codec all fail the build with a message naming the contract.
 - Detection precedence lives in one documented place per registry. The whole-image chain is ISO9660, then partitioned layouts, then raw ext4.
@@ -508,7 +509,7 @@ src/
 
 | Goal | Work required |
 | --- | --- |
-| New filesystem | One module under `image/fs/` exposing `name`, `unrecognized`, `detect`, `probeRegion`, `collectRanges`, and optionally `mbr_types` or `raw_layout` with `filesystem` and `blockSize`; one line in `fs/driver.zig`; tests beside the module |
+| New filesystem | One module under `image/fs/` exposing `name`, `unrecognized`, `detect`, `probeRegion` (returning an `Info.Probe`), `collectRanges`, and optionally `mbr_types` or `raw_layout` with `filesystem` and `blockSize`; one line in `fs/driver.zig`; tests beside the module |
 | New disk layout such as GPT | One module under `image/layout/` exposing `layout`, `detect`, and `collectSpans`; one line in `layout/driver.zig` and one tag in `Info.Layout` |
 | New compression codec | One module under `image/compression/` exposing `id`, `magic`, a `State` type, and `init`, `reader`, and `deinit` over it; one line in `compression/codec.zig` and one tag in `Compression`. `codec.Decoder` gains a variant automatically |
 | New platform | One backend under `device/platforms/` implementing the seven device functions plus a `target_io` dispatcher, one line in the OS switch in `device.zig`. `device.zig` checks the backend against this contract at compile time |

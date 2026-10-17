@@ -246,7 +246,7 @@ pub fn superblockBlockSize(io: std.Io, r: *const Reader) !u32 {
     return superblock.blockSize();
 }
 
-pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !PartitionInfo {
+pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !types.Info.Probe {
     const superblock = try readSuperblock(io, r);
     try validateSuperblock(superblock, r.size);
 
@@ -257,12 +257,7 @@ pub fn probeRegion(allocator: std.mem.Allocator, io: std.Io, r: *const Reader) !
     for (ranges) |segment| used_bytes += segment.length;
 
     return .{
-        .index = 0,
-        .start_offset = 0,
-        .size = r.size,
-        .partition_type = 0,
         .filesystem = .ext4,
-        .supported = true,
         .block_size = try superblock.blockSize(),
         .used_bytes = used_bytes,
         .skipped_bytes = r.size - used_bytes,
@@ -374,10 +369,7 @@ pub fn collectExt4RangesInRegion(io: std.Io, allocator: std.mem.Allocator, file:
 pub fn probeExt4Partition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
     var region = reader_mod.FileRegion.init(io, file, start_offset, size);
     const r = region.reader();
-    var partition = try probeRegion(allocator, io, &r);
-    partition.start_offset = start_offset;
-    partition.partition_type = 0x83;
-    return partition;
+    return .probed(try probeRegion(allocator, io, &r), 0, start_offset, size, 0x83);
 }
 
 fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
