@@ -9,36 +9,23 @@ const std = @import("std");
 
 const device = @import("../../device.zig");
 
-fn writePositional(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
-    _ = allocator;
-    try target.file.writePositionalAll(io, bytes, offset);
-}
-
 fn syncFile(io: std.Io, target: *device.OpenTarget) !void {
     try target.file.sync(io);
 }
 
 /// Reads a possibly unaligned span from a raw device by rounding the request
-/// out to alignment boundaries and copying the interior.
-pub fn readAlignedDeviceChunk(allocator: std.mem.Allocator, target: *device.OpenTarget, io: std.Io, buffer: []u8, offset: u64) !usize {
-    _ = io;
+/// out to alignment boundaries inside `scratch` and copying the interior.
+/// `scratch` must hold `readScratchLength(buffer.len)` bytes.
+pub fn readAlignedDeviceChunk(target: *device.OpenTarget, buffer: []u8, offset: u64, scratch: []u8) !usize {
     if (buffer.len == 0) return 0;
-
-    const alignment: usize = @intCast(target.info.capabilities.read_alignment);
-    if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidBlockSize;
+    if (scratch.len < try target.info.capabilities.readScratchLength(buffer.len)) return error.ScratchBufferTooSmall;
+    const alignment: usize = target.info.capabilities.read_alignment;
 
     const aligned_offset = std.mem.alignBackward(u64, offset, alignment);
     const prefix: usize = @intCast(offset - aligned_offset);
-    const requested_end = std.math.add(usize, prefix, buffer.len) catch return error.OutOfMemory;
-    const aligned_len = std.mem.alignForward(usize, requested_end, alignment);
-    const allocation_len = std.math.add(usize, aligned_len, alignment - 1) catch return error.OutOfMemory;
-    const allocation = try allocator.alloc(u8, allocation_len);
-    defer allocator.free(allocation);
-
-    const allocation_address = @intFromPtr(allocation.ptr);
-    const aligned_address = std.mem.alignForward(usize, allocation_address, alignment);
-    const start = aligned_address - allocation_address;
-    const aligned_buffer = allocation[start..][0..aligned_len];
+    const aligned_len = std.mem.alignForward(usize, prefix + buffer.len, alignment);
+    const start = std.mem.alignPointerOffset(scratch.ptr, alignment).?;
+    const aligned_buffer = scratch[start..][0..aligned_len];
 
     try seekDevice(target.file.handle, aligned_offset);
     const read_count = try readDeviceAll(target.file.handle, aligned_buffer);
@@ -48,21 +35,17 @@ pub fn readAlignedDeviceChunk(allocator: std.mem.Allocator, target: *device.Open
     return available;
 }
 
-/// Writes a possibly unaligned span to a raw device, zero-padding the final
-/// partial block so every kernel write lands on an alignment boundary.
-pub fn writeAlignedDeviceChunk(allocator: std.mem.Allocator, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
-    const alignment: usize = @intCast(target.info.capabilities.write_alignment);
-    if (alignment == 0) return error.InvalidBlockSize;
+/// Writes `buffer[0..len]` to a raw device. A partial final block is
+/// zero-padded in place, so `buffer` must hold `writeBufferLength(len)` bytes;
+/// the bytes past `len` are overwritten.
+pub fn writeAlignedDeviceChunk(target: *device.OpenTarget, buffer: []u8, len: usize, offset: u64) !void {
+    const alignment: usize = target.info.capabilities.write_alignment;
+    const padded_len = std.mem.alignForward(usize, len, alignment);
+    if (buffer.len < padded_len) return error.ScratchBufferTooSmall;
+    @memset(buffer[len..padded_len], 0);
 
     try seekDevice(target.file.handle, offset);
-    if (bytes.len % alignment == 0) return writeDeviceAll(target.file.handle, bytes);
-
-    const aligned_len = std.mem.alignForward(usize, bytes.len, alignment);
-    const aligned = try allocator.alloc(u8, aligned_len);
-    defer allocator.free(aligned);
-    @memcpy(aligned[0..bytes.len], bytes);
-    @memset(aligned[bytes.len..], 0);
-    try writeDeviceAll(target.file.handle, aligned);
+    try writeDeviceAll(target.file.handle, buffer[0..padded_len]);
 }
 
 fn seekDevice(fd: std.posix.fd_t, offset: u64) !void {
@@ -124,14 +107,16 @@ fn readDeviceAll(fd: std.posix.fd_t, buffer: []u8) !usize {
 /// Backend used by macOS and Linux: positional I/O for files,
 /// alignment-aware raw I/O for devices.
 pub const posix = struct {
-    pub fn writeAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
-        if (!target.info.capabilities.isDevice()) return writePositional(allocator, io, target, bytes, offset);
-        return writeAlignedDeviceChunk(allocator, target, bytes, offset);
+    /// Writes `buffer[0..len]` at `offset`; see `writeAlignedDeviceChunk`
+    /// for how devices use the rest of `buffer`.
+    pub fn writeAt(io: std.Io, target: *device.OpenTarget, buffer: []u8, len: usize, offset: u64) !void {
+        if (!target.info.capabilities.isDevice()) return target.file.writePositionalAll(io, buffer[0..len], offset);
+        return writeAlignedDeviceChunk(target, buffer, len, offset);
     }
 
-    pub fn readAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64) !usize {
+    pub fn readAt(io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64, scratch: []u8) !usize {
         if (!target.info.capabilities.isDevice()) return target.file.readPositionalAll(io, buffer, offset);
-        return readAlignedDeviceChunk(allocator, target, io, buffer, offset);
+        return readAlignedDeviceChunk(target, buffer, offset, scratch);
     }
 
     pub fn sync(io: std.Io, target: *device.OpenTarget) !void {
@@ -141,13 +126,13 @@ pub const posix = struct {
 
 /// Backend used by platforms without raw-device support yet.
 pub const positional_only = struct {
-    pub fn writeAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
+    pub fn writeAt(io: std.Io, target: *device.OpenTarget, buffer: []u8, len: usize, offset: u64) !void {
         if (target.info.capabilities.isDevice()) return error.UnsupportedTargetType;
-        return writePositional(allocator, io, target, bytes, offset);
+        return target.file.writePositionalAll(io, buffer[0..len], offset);
     }
 
-    pub fn readAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64) !usize {
-        _ = allocator;
+    pub fn readAt(io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64, scratch: []u8) !usize {
+        _ = scratch;
         if (target.info.capabilities.isDevice()) return error.UnsupportedTargetType;
         return target.file.readPositionalAll(io, buffer, offset);
     }

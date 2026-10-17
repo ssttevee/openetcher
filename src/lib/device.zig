@@ -24,6 +24,26 @@ pub const TargetCapabilities = struct {
     pub fn isDevice(self: @This()) bool {
         return self.kind == .block_device or self.kind == .character_device;
     }
+
+    /// Length of a buffer that can carry `max_len` bytes to `target_io.writeAt`,
+    /// including room to zero-pad the tail to the write alignment.
+    pub fn writeBufferLength(self: @This(), max_len: usize) error{ InvalidBlockSize, Overflow }!usize {
+        const alignment = try checkedAlignment(self.write_alignment);
+        return std.math.add(usize, max_len, alignment - 1) catch error.Overflow;
+    }
+
+    /// Length of the scratch buffer `target_io.readAt` needs for reads of up
+    /// to `max_len` bytes: the request rounded out to alignment at both ends,
+    /// plus slack to align the buffer address itself.
+    pub fn readScratchLength(self: @This(), max_len: usize) error{ InvalidBlockSize, Overflow }!usize {
+        const alignment = try checkedAlignment(self.read_alignment);
+        return std.math.add(usize, max_len, 3 * alignment) catch error.Overflow;
+    }
+
+    fn checkedAlignment(alignment: u32) error{InvalidBlockSize}!usize {
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidBlockSize;
+        return alignment;
+    }
 };
 
 pub const TargetInfo = struct {
@@ -111,5 +131,7 @@ pub const resolveDiskId = platform.resolveDiskId;
 pub const lookupDiskByPath = platform.lookupDiskByPath;
 /// Platform-provided target operations, chosen at compile time. The flash
 /// engine calls only `writeAt`, `readAt`, and `sync`; alignment, padding, and
-/// syscall strategy live in each platform backend.
+/// syscall strategy live in each platform backend. Callers supply every
+/// buffer, sized with `TargetCapabilities.writeBufferLength` and
+/// `readScratchLength`, so the backends never allocate.
 pub const target_io = platform.target_io;

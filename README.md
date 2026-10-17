@@ -279,6 +279,8 @@ On macOS and Linux the spool is unlinked as soon as it is created, so an interru
 
 Uncompressed images are analyzed in place and need no spool.
 
+Writing is pipelined with `std.Io`: while one chunk is hashed and written to the target on an `io.async` task, the next is read and decompressed from the source. Digest verification overlaps reading the target with hashing in the same way. Every buffer is allocated before the first chunk, so the per-chunk path never allocates.
+
 Default chunk size is 1 MiB. Device writes use the backend's alignment requirement. The macOS backend uses 512-byte device alignment and pads a non-aligned final chunk as needed for raw device I/O.
 
 The implementation uses positional I/O for regular files. For device targets, it uses seek-and-stream I/O with direct POSIX reads and writes to avoid inappropriate threaded file-I/O behavior for raw devices.
