@@ -277,6 +277,8 @@ Planning needs random access to the decoded image, so a compressed image is deco
 
 On macOS and Linux the spool is unlinked as soon as it is created, so an interrupted run leaves nothing behind. If the spool directory is full, `flash` fails before writing anything; pass a larger `--spool-dir`, or use `--force` to stream straight from the decoder without a plan.
 
+All-zero chunks are detected with SIMD vector compares, so the check runs at memory speed rather than byte by byte.
+
 Uncompressed images are analyzed in place and need no spool.
 
 Writing is pipelined with `std.Io`: while one chunk is hashed and written to the target on an `io.async` task, the next is read and decompressed from the source. Digest verification overlaps reading the target with hashing in the same way. Every buffer is allocated before the first chunk, so the per-chunk path never allocates.
@@ -455,9 +457,13 @@ src/
     flash.zig                    Single write engine: planned writing, sync, verification, progress
     image.zig                    Shared analyzer over Reader; entry points
     range.zig                    Byte-range normalization and merging
-    device.zig                   Device abstraction, comptime platform selection, TargetIo contract
+    scan.zig                     SIMD zero detection and word-at-a-time bitmap run scanning
+    device.zig                   Device abstraction, comptime platform selection, target I/O contract
     device/platforms/            macOS backend, Linux/Windows placeholders, shared target-I/O backends
     image/reader.zig             Random-access Reader plus file-region, buffer, and slice sources
+    image/ondisk.zig             Little-endian extern struct decoding and compile-time layout checks
+    image/fuzz.zig               Fuzz harness over the whole analyzer
+    image/source.zig             Image sources, decoded streams, and the decompression spool
     image/layout/mbr.zig         MBR parsing, partition spans, layout driver
     image/layout/driver.zig      Disk-layout driver contract and registry
     image/fs/driver.zig          Filesystem driver contract and registry

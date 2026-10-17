@@ -45,6 +45,21 @@ pub fn normalizeRanges(allocator: std.mem.Allocator, input: []const ByteRange) !
     return merged.toOwnedSlice(allocator);
 }
 
+/// Appends `item`, extending the last range instead when `item` starts
+/// where it ends. Scanners that emit ranges in ascending order use this to
+/// keep one entry per run rather than one per block.
+pub fn appendCoalesced(allocator: std.mem.Allocator, list: *std.ArrayList(ByteRange), item: ByteRange) !void {
+    if (list.items.len != 0) {
+        const last = &list.items[list.items.len - 1];
+        const last_end = std.math.add(u64, last.offset, last.length) catch return error.RangeOverflow;
+        if (last_end == item.offset) {
+            last.length = std.math.add(u64, last.length, item.length) catch return error.RangeOverflow;
+            return;
+        }
+    }
+    try list.append(allocator, item);
+}
+
 /// Normalizes `input` and requires every range to lie within `[0, size)`.
 /// Filesystem parsers use this so a corrupt on-disk pointer becomes an
 /// error instead of a plan that writes past the region.
@@ -97,6 +112,15 @@ test "normalizeWithin rejects ranges past the region" {
     defer allocator.free(inside);
     try std.testing.expectEqual(@as(usize, 2), inside.len);
     try std.testing.expectError(error.RangeOutsideRegion, normalizeWithin(allocator, &input, 5119));
+}
+
+test "appendCoalesced merges adjacent ranges only" {
+    var list: std.ArrayList(ByteRange) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendCoalesced(std.testing.allocator, &list, .{ .offset = 0, .length = 4 });
+    try appendCoalesced(std.testing.allocator, &list, .{ .offset = 4, .length = 4 });
+    try appendCoalesced(std.testing.allocator, &list, .{ .offset = 12, .length = 4 });
+    try std.testing.expectEqualSlices(ByteRange, &.{ .{ .offset = 0, .length = 8 }, .{ .offset = 12, .length = 4 } }, list.items);
 }
 
 test "normalize ranges rejects overflow" {

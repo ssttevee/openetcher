@@ -16,6 +16,7 @@ pub const observer = @import("image/observer.zig");
 pub const reader = reader_mod;
 
 const range_api = @import("range.zig");
+const scan = @import("scan.zig");
 const fs_drivers = fs_api.driver;
 const layout_drivers = layout_api.driver;
 
@@ -414,10 +415,7 @@ fn partitionHeadIsZero(io: std.Io, sr: *const reader.Reader) bool {
     var head: [4096]u8 = undefined;
     const length = @min(sr.size, head.len);
     sr.readExactlyAt(io, head[0..@intCast(length)], 0) catch return false;
-    for (head[0..@intCast(length)]) |byte| {
-        if (byte != 0) return false;
-    }
-    return true;
+    return scan.isZero(head[0..@intCast(length)]);
 }
 
 fn appendGapRanges(allocator: std.mem.Allocator, ranges: *std.ArrayList(ByteRange), occupied_ranges: []const ByteRange, image_size: u64) !void {

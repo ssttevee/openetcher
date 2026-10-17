@@ -11,6 +11,7 @@ pub const Reader = reader_mod.Reader;
 
 const ondisk = @import("../ondisk.zig");
 const mbr = @import("../layout/mbr.zig");
+const scan = @import("../../scan.zig");
 
 const superblock_offset: u64 = 1024;
 const sector_size: usize = 512;
@@ -303,14 +304,12 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
         try appendMetadataRanges(allocator, &used_blocks, block_size, group_index, group_first_block, descriptor_table_block, descriptor_table_blocks, descriptor, inode_table_blocks);
         try readBlock(io, r, descriptor.block_bitmap, block_size, bitmap_buffer);
 
-        var block_in_group: u64 = 0;
-        while (block_in_group < blocks_in_group) : (block_in_group += 1) {
-            if (!bitmapBitIsSet(bitmap_buffer, block_in_group)) continue;
-
-            const block_number = group_first_block + block_in_group;
-            try used_blocks.append(allocator, .{
-                .offset = block_number * block_size,
-                .length = block_size,
+        // One range per run of used blocks, found a bitmap word at a time.
+        var runs = scan.SetRuns.init(bitmap_buffer, blocks_in_group);
+        while (runs.next()) |run| {
+            try range.appendCoalesced(allocator, &used_blocks, .{
+                .offset = (group_first_block + run.start) * block_size,
+                .length = (run.end - run.start) * block_size,
             });
         }
     }
@@ -493,12 +492,6 @@ fn appendMetadataRanges(allocator: std.mem.Allocator, list: *std.ArrayList(ByteR
 fn readBlock(io: std.Io, r: *const Reader, block_number: u64, block_size: u32, buffer: []u8) !void {
     if (buffer.len < block_size) return error.InternalBufferTooSmall;
     try r.readExactlyAt(io, buffer[0..block_size], block_number * block_size);
-}
-
-fn bitmapBitIsSet(buffer: []const u8, index: u64) bool {
-    const byte_index: usize = @intCast(index / 8);
-    const bit_mask: u8 = @as(u8, 1) << @intCast(index % 8);
-    return (buffer[byte_index] & bit_mask) != 0;
 }
 
 fn groupIndexHasSuperblock(group_index: u64) bool {

@@ -133,7 +133,7 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
     var cluster: u32 = 2;
     while (cluster < last_cluster) : (cluster += 1) {
         if (!clusterAllocated(boot.filesystem, fat, cluster)) continue;
-        try ranges.append(allocator, .{
+        try range.appendCoalesced(allocator, &ranges, .{
             .offset = boot.clusterFirstSector(cluster),
             .length = boot.clusterLength(),
         });

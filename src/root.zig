@@ -60,6 +60,7 @@ pub const device_api = device;
 
 test {
     _ = @import("lib/range.zig");
+    _ = @import("lib/scan.zig");
     _ = @import("lib/flash.zig");
     _ = @import("lib/device.zig");
     _ = @import("lib/image.zig");

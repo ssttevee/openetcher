@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 
 const codec_api = @import("compression/codec.zig");
 const reader_mod = @import("reader.zig");
+const scan = @import("../scan.zig");
 
 pub const Compression = codec_api.Compression;
 
@@ -401,7 +402,7 @@ fn createSpool(source: *PathContext, io: std.Io, limit: ?u64) !Spool {
         const count = try stream.read(buffer);
         if (count == 0) break;
         const chunk = buffer[0..count];
-        if (!std.mem.allEqual(u8, chunk, 0)) spool.file.writePositionalAll(io, chunk, size) catch |err| return switch (err) {
+        if (!scan.isZero(chunk)) spool.file.writePositionalAll(io, chunk, size) catch |err| return switch (err) {
             error.NoSpaceLeft, error.DiskQuota, error.FileTooBig => error.SpoolDirectoryFull,
             else => |other| other,
         };
