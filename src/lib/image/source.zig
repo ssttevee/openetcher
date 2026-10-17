@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const codec_api = @import("compression/codec.zig");
+const reader_mod = @import("reader.zig");
 
 pub const Compression = codec_api.Compression;
 
@@ -14,18 +15,20 @@ pub const SourceOptions = struct {
     max_image_size: ?u64 = null,
 };
 
-pub const RandomAccessReader = struct {
-    context: *anyopaque,
-    size: u64,
-    read_at_fn: *const fn (context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize,
-    deinit_fn: ?*const fn (context: *anyopaque) void = null,
+/// A random-access view over decoded image bytes, backed by an open file.
+///
+/// Call `reader` on the caller-owned value; the returned `Reader` points into
+/// it, so the `OpenedReader` must not move while the reader is in use.
+pub const OpenedReader = struct {
+    region: reader_mod.FileRegion,
+    owns_file: bool,
 
-    pub fn readAt(self: *@This(), io: std.Io, buffer: []u8, offset: u64) !usize {
-        return self.read_at_fn(self.context, io, buffer, offset);
+    pub fn reader(self: *OpenedReader) reader_mod.Reader {
+        return self.region.reader();
     }
 
-    pub fn deinit(self: *@This()) void {
-        if (self.deinit_fn) |deinit_fn| deinit_fn(self.context);
+    pub fn close(self: *OpenedReader, io: std.Io) void {
+        if (self.owns_file) self.region.file.close(io);
         self.* = undefined;
     }
 };
@@ -104,16 +107,18 @@ pub const ImageSource = struct {
     context: *anyopaque,
     metadata: Metadata,
     open_stream_fn: *const fn (context: *anyopaque, io: std.Io, allocator: std.mem.Allocator) anyerror!Stream,
-    open_random_access_fn: ?*const fn (context: *anyopaque, io: std.Io) anyerror!?RandomAccessReader = null,
+    /// Opens random access over the decoded bytes, or returns null when the
+    /// source can only be streamed. `max_image_size` bounds the decoded size.
+    open_reader_fn: ?*const fn (context: *anyopaque, io: std.Io, max_image_size: ?u64) anyerror!?OpenedReader = null,
     deinit_fn: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) void = null,
 
     pub fn openStream(self: *@This(), io: std.Io, allocator: std.mem.Allocator) !Stream {
         return self.open_stream_fn(self.context, io, allocator);
     }
 
-    pub fn openRandomAccess(self: *@This(), io: std.Io) !?RandomAccessReader {
-        const open_fn = self.open_random_access_fn orelse return null;
-        return open_fn(self.context, io);
+    pub fn openReader(self: *@This(), io: std.Io, max_image_size: ?u64) !?OpenedReader {
+        const open_fn = self.open_reader_fn orelse return null;
+        return open_fn(self.context, io, max_image_size);
     }
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
@@ -142,6 +147,11 @@ const RawStreamContext = struct {
         self.file.close(self.io);
         self.allocator.free(self.buffer);
         self.allocator.destroy(self);
+    }
+
+    fn seekTo(context: *anyopaque, position: u64) anyerror!void {
+        const self: *RawStreamContext = @ptrCast(@alignCast(context));
+        try self.file_reader.seekTo(position);
     }
 };
 
@@ -209,7 +219,7 @@ pub fn openImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, path: [
             .image_size = if (compression == .none) stat.size else null,
         },
         .open_stream_fn = openPathStream,
-        .open_random_access_fn = if (compression == .none) openPathRandomAccess else null,
+        .open_reader_fn = openPathReader,
         .deinit_fn = destroyPathContext,
     };
 }
@@ -243,7 +253,7 @@ fn openRawStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator)
 
     stream_context.* = .{
         .file = file,
-        .file_reader = std.Io.File.Reader.initStreaming(file, io, buffer),
+        .file_reader = std.Io.File.Reader.init(file, io, buffer),
         .buffer = buffer,
         .allocator = allocator,
         .io = io,
@@ -254,6 +264,7 @@ fn openRawStream(source: *PathContext, io: std.Io, allocator: std.mem.Allocator)
         .max_image_size = source.max_image_size,
         .context = stream_context,
         .deinit_fn = RawStreamContext.destroy,
+        .seek_to_fn = RawStreamContext.seekTo,
     };
 }
 
@@ -312,16 +323,21 @@ fn openDecodedStream(source: *PathContext, io: std.Io, allocator: std.mem.Alloca
     };
 }
 
-fn openPathRandomAccess(context: *anyopaque, io: std.Io) !?RandomAccessReader {
-    _ = io;
-    return .{ .context = context, .size = @as(*PathContext, @ptrCast(@alignCast(context))).encoded_size, .read_at_fn = readPathAt };
+fn openPathReader(context: *anyopaque, io: std.Io, max_image_size: ?u64) !?OpenedReader {
+    const source: *PathContext = @ptrCast(@alignCast(context));
+    if (source.compression != .none) return null;
+
+    const file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
+    errdefer file.close(io);
+    const size = try file.length(io);
+    try checkSizeLimit(size, source.max_image_size);
+    try checkSizeLimit(size, max_image_size);
+
+    return .{ .region = .init(io, file, 0, size), .owns_file = true };
 }
 
-fn readPathAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) !usize {
-    const source: *PathContext = @ptrCast(@alignCast(context));
-    var file = try std.Io.Dir.cwd().openFile(io, source.path, .{ .mode = .read_only, .allow_directory = false });
-    defer file.close(io);
-    return file.readPositionalAll(io, buffer, offset);
+fn checkSizeLimit(size: u64, limit: ?u64) !void {
+    if (limit) |max| if (size > max) return error.DecompressedImageTooLarge;
 }
 
 test "compression detection uses magic bytes" {
@@ -366,6 +382,33 @@ test "raw source opens independent streams" {
     var second_bytes: [6]u8 = undefined;
     try second.readExactly(&second_bytes);
     try std.testing.expectEqualSlices(u8, "abcdef", &second_bytes);
+}
+
+test "raw source streams seek over skipped bytes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var file = try tmp.dir.createFile(io, "sparse.img", .{ .read = true });
+        defer file.close(io);
+        try file.setLength(io, 64 * 1024 * 1024);
+        try file.writePositionalAll(io, "tail", 64 * 1024 * 1024 - 4);
+    }
+
+    const path = try tmp.dir.realPathFileAlloc(io, "sparse.img", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var image_source = try openImageSourceFromPath(std.testing.allocator, io, path, .{});
+    defer image_source.deinit(std.testing.allocator);
+
+    var stream = try image_source.openStream(io, std.testing.allocator);
+    defer stream.deinit();
+    try std.testing.expect(stream.seek_to_fn != null);
+    try stream.discardTo(64 * 1024 * 1024 - 4);
+
+    var tail: [4]u8 = undefined;
+    try stream.readExactly(&tail);
+    try std.testing.expectEqualStrings("tail", &tail);
 }
 
 test "stream enforces decoded size limit" {

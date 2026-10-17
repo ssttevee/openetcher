@@ -116,17 +116,14 @@ pub fn planImageFlashFromPath(allocator: std.mem.Allocator, io: std.Io, image_pa
 // Entry points over compressed or streamed sources.
 
 pub fn probeImageSource(allocator: std.mem.Allocator, io: std.Io, image_source: *source.ImageSource, options: ProbeOptions) !Info {
-    const bytes = try readSourcePass(allocator, io, image_source, options.max_image_size);
-    defer allocator.free(bytes);
-
-    var analysis = try analyzeBytes(io, allocator, bytes);
+    var analysis = try analyzeSource(allocator, io, image_source, options.max_image_size);
     defer analysis.deinit(allocator);
 
-    image_source.metadata.image_size = bytes.len;
+    const image_size = analysis.info.image_size;
     const info = analysis.takeInfo();
     return .{
-        .image_size = bytes.len,
-        .encoded_size = image_source.metadata.encoded_size orelse bytes.len,
+        .image_size = image_size,
+        .encoded_size = image_source.metadata.encoded_size orelse image_size,
         .compression = image_source.metadata.compression,
         .layout = info.layout,
         .filesystem = info.filesystem,
@@ -151,18 +148,36 @@ pub fn planImageFlashSourceFromPath(allocator: std.mem.Allocator, io: std.Io, im
 }
 
 pub fn planImageFlashSource(allocator: std.mem.Allocator, io: std.Io, image_source: *source.ImageSource, options: PlanOptions) !FlashPlan {
-    const bytes = try readSourcePass(allocator, io, image_source, options.max_image_size);
-    defer allocator.free(bytes);
-
-    var analysis = try analyzeBytes(io, allocator, bytes);
+    var analysis = try analyzeSource(allocator, io, image_source, options.max_image_size);
     defer analysis.deinit(allocator);
 
-    image_source.metadata.image_size = bytes.len;
     const ranges = analysis.takeRanges() orelse return error.UnsupportedPartitionFilesystem;
     return .{
-        .image_size = bytes.len,
+        .image_size = analysis.info.image_size,
         .ranges = ranges,
     };
+}
+
+/// Analyzes a source through random access when it offers one, so memory
+/// stays proportional to filesystem metadata rather than image size. Sources
+/// that can only stream fall back to decoding into memory.
+fn analyzeSource(allocator: std.mem.Allocator, io: std.Io, image_source: *source.ImageSource, max_image_size: ?u64) !Analysis {
+    if (try image_source.openReader(io, max_image_size)) |opened| {
+        var file_reader = opened;
+        defer file_reader.close(io);
+        const r = file_reader.reader();
+
+        const analysis = try analyzeReader(io, allocator, &r);
+        image_source.metadata.image_size = r.size;
+        return analysis;
+    }
+
+    const bytes = try readSourcePass(allocator, io, image_source, max_image_size);
+    defer allocator.free(bytes);
+
+    const analysis = try analyzeBytes(io, allocator, bytes);
+    image_source.metadata.image_size = bytes.len;
+    return analysis;
 }
 
 /// Analyzes an in-memory image. Useful for tests and callers that already
@@ -518,6 +533,38 @@ test "analyzeBytes supports ISO9660 images end to end" {
 
     try std.testing.expectEqual(@as(usize, 1), analysis.ranges.?.len);
     try std.testing.expectEqualDeep(ByteRange{ .offset = 0, .length = image_size }, analysis.ranges.?[0]);
+}
+
+test "raw sources are analyzed without buffering the image" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const image_size: u64 = 1024 * 1024 * 1024;
+    {
+        var file = try tmp.dir.createFile(io, "large.iso", .{ .read = true });
+        defer file.close(io);
+        try file.setLength(io, image_size);
+        try file.writePositionalAll(io, &.{ 1, 'C', 'D', '0', '0', '1', 1 }, 16 * 2048);
+    }
+
+    const path = try tmp.dir.realPathFileAlloc(io, "large.iso", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    // Far smaller than the image: buffering it would fail with OutOfMemory.
+    var arena_buffer: [1024 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&arena_buffer);
+    const allocator = fixed.allocator();
+
+    var image_source = try source.openImageSourceFromPath(allocator, io, path, .{});
+    defer image_source.deinit(allocator);
+
+    const plan = try planImageFlashSource(allocator, io, &image_source, .{});
+    defer plan.deinit(allocator);
+    try std.testing.expectEqual(image_size, plan.image_size);
+    try std.testing.expectEqual(@as(?u64, image_size), image_source.metadata.image_size);
+
+    try std.testing.expectError(error.DecompressedImageTooLarge, planImageFlashSource(allocator, io, &image_source, .{ .max_image_size = image_size - 1 }));
 }
 
 test "planImageFlash rejects unsupported mbr partitions" {
