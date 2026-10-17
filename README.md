@@ -83,14 +83,14 @@ zig build -Doptimize=ReleaseFast
 ## Command-Line Interface
 
 ```text
-openetcher info [--json] [--spool-dir <dir>] <image>
-openetcher plan [--json] [--spool-dir <dir>] <image>
-openetcher disks [--json] [--all]
-openetcher flash [--force] [--spool-dir <dir>] <image> <device>
-openetcher flash [--force] [--spool-dir <dir>] <image> --disk-id <id>
+openetcher info [-h] [--json] [--spool-dir <dir>] <image>
+openetcher plan [-h] [--json] [--spool-dir <dir>] <image>
+openetcher disks [-h] [--json] [--all]
+openetcher flash [-h] [--force] [--spool-dir <dir>] <image> <device>
+openetcher flash [-h] [--force] [--spool-dir <dir>] <image> --disk-id <id>
 ```
 
-`--spool-dir` sets where compressed images are decoded; see [Compressed images](#compressed-images).
+`-h` prints byte counts in binary units such as `1.5 MiB` instead of plain numbers; JSON output always uses plain numbers. `--spool-dir` sets where compressed images are decoded; see [Compressed images](#compressed-images).
 
 ### `info`
 
@@ -104,6 +104,7 @@ openetcher info --json image.iso
 The text output can include:
 
 - `image_size`
+- `compression` and `encoded_size`, the size of the image file before decoding
 - `layout`
 - `filesystem`
 - `block_size`
@@ -451,7 +452,9 @@ Useful types include:
 
 ```text
 src/
-  main.zig                       CLI rendering, argument parsing, safety flow
+  main.zig                       CLI commands, error messages, safety flow
+  cli/args.zig                   Argument parsing generated from per-command argument structs
+  cli/output.zig                 JSON and text output generated from view structs; `Bytes`
   root.zig                       Public library module
   lib/
     flash.zig                    Single write engine: planned writing, sync, verification, progress
@@ -486,6 +489,7 @@ src/
 - Callers provide `std.Io` and allocators. There is no global library I/O state or global allocator.
 - Closed sets are tagged unions, not vtables. An `ImageSource` is raw, encoded, or spooled; a `Stream` reads a file or a decoder; the decoder is a union generated from the codec registry. Every library error set is concrete, so callers can switch on them exhaustively. The only interfaces left take caller code: `Observer`, which reports `ObserverFailed` the way `std.Io.Reader` reports `ReadFailed`. Progress is a `std.Progress.Node`, not a callback.
 - The CLI's error messages are checked at compile time. `writeUserError` in `main.zig` takes the exact union of the commands' error sets, and every member must have an entry in `error_texts`; entries naming errors no command returns fail the build too, except for a short list of platform-specific ones. Partition failure reasons are values (`Info.Reason`), formatted only when shown.
+- The CLI's arguments and output are generated from types. Each command's arguments are a struct that `cli/args.zig` parses by field type: `bool` fields are flags, `?[]const u8` fields are options, and positionals are declared by name. Output goes through view structs: `std.json.Stringify` writes them as JSON, and text output walks the same fields, so a field declared `Bytes` is scaled by `-h` wherever it appears. Each view must show every field of the library struct it copies, or the build fails.
 - Parser code whose overflow safety depends on validation done in another function turns on `@setRuntimeSafety(true)` (ext4 group and block arithmetic, FAT cluster math, `ByteRange.end`). A missed check on a hostile image then traps in every build mode instead of becoming undefined behavior in ReleaseFast. Hot paths and locally validated code stay at the build's mode.
 - One analyzer serves every input. `image.zig` analyzes any random-access `Reader`; open files wrap in a region source, decoded bytes wrap in a buffer source. There are no parallel probe pipelines.
 - Format drivers are resolved at compile time. Each filesystem, disk layout, and compression codec is a module exposing a fixed set of `pub` declarations, listed in a comptime tuple in `image/fs/driver.zig`, `image/layout/driver.zig`, or `image/compression/codec.zig`. Callers dispatch with `inline for`, so there are no vtables, and each registry checks its entries at compile time: missing declarations, wrong signatures, two drivers claiming one MBR type, overlapping codec magic, or a `Compression` tag without a codec all fail the build with a message naming the contract.

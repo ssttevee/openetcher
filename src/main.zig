@@ -2,6 +2,8 @@ const std = @import("std");
 
 const openetcher = @import("openetcher");
 
+const cli_args = @import("cli/args.zig");
+const output = @import("cli/output.zig");
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -13,203 +15,224 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
 
-    const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 2) {
+    const argv = try init.minimal.args.toSlice(arena);
+    const command = cli_args.parseCommand(Command, argv[1..]) catch {
         try writeUsage(stderr);
         try stderr.flush();
         std.process.exit(1);
-    }
+    };
 
-    const command = args[1];
-    if (std.mem.eql(u8, command, "info")) {
-        const parsed = parseOutputArgs(args[2..]) catch {
-            try writeUsage(stderr);
+    const context: Context = .{ .arena = arena, .io = io, .stdout = stdout, .stderr = stderr, .environ = init.environ_map };
+    const result = switch (command) {
+        .info => |args| info(context, args),
+        .plan => |args| plan(context, args),
+        .disks => |args| disks(context, args),
+        .flash => |args| flash(context, args),
+    };
+    result catch |err| switch (err) {
+        // With the terminal gone there is no one to tell.
+        error.WriteFailed => return err,
+        else => |command_error| {
+            try writeUserError(stderr, command_error);
             try stderr.flush();
             std.process.exit(1);
-        };
+        },
+    };
+    try stdout.flush();
+}
 
-        const image_path = parsed.image_path;
+const Command = union(enum) {
+    info: ImageArgs,
+    plan: ImageArgs,
+    disks: DisksArgs,
+    flash: FlashArgs,
+};
+
+/// Arguments of `info` and `plan`. See `cli/args.zig` for how fields map to
+/// the command line.
+const ImageArgs = struct {
+    humanize: bool = false,
+    json: bool = false,
+    spool_dir: ?[]const u8 = null,
+    image: []const u8,
+
+    pub const positionals: []const []const u8 = &.{"image"};
+    pub const flag_names = .{ .humanize = "-h" };
+};
+
+const DisksArgs = struct {
+    humanize: bool = false,
+    json: bool = false,
+    /// Include internal disks.
+    all: bool = false,
+
+    pub const flag_names = .{ .humanize = "-h" };
+};
+
+const FlashArgs = struct {
+    humanize: bool = false,
+    force: bool = false,
+    spool_dir: ?[]const u8 = null,
+    disk_id: ?[]const u8 = null,
+    image: []const u8,
+    device: ?[]const u8 = null,
+
+    pub const positionals: []const []const u8 = &.{ "image", "device" };
+    pub const flag_names = .{ .humanize = "-h" };
+
+    /// The target is a device path or a disk id, never both.
+    pub fn validate(self: FlashArgs) bool {
+        return (self.device == null) != (self.disk_id == null);
+    }
+};
+
+const usage =
+    \\usage:
+    \\  openetcher info [-h] [--json] [--spool-dir <dir>] <image>
+    \\  openetcher plan [-h] [--json] [--spool-dir <dir>] <image>
+    \\  openetcher disks [-h] [--json] [--all]
+    \\  openetcher flash [-h] [--force] [--spool-dir <dir>] <image> <device>
+    \\  openetcher flash [-h] [--force] [--spool-dir <dir>] <image> --disk-id <id>
+    \\
+    \\compressed images are decoded once into --spool-dir (default: $TMPDIR)
+    \\
+;
+
+fn writeUsage(writer: *std.Io.Writer) !void {
+    try writer.writeAll(usage);
+}
+
+/// What every command needs from `main`.
+const Context = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    environ: *const std.process.Environ.Map,
+
+    fn sourceOptions(self: Context, spool_dir: ?[]const u8, progress: std.Progress.Node) openetcher.SourceOptions {
+        return .{ .spool_dir = spool_dir orelse defaultSpoolDir(self.environ), .progress = progress };
+    }
+};
+
+/// What a command can fail with: a library error for `writeUserError`, or
+/// a failed write to the terminal.
+const RunError = CommandError || std.Io.Writer.Error;
+
+fn info(context: Context, args: ImageArgs) RunError!void {
+    var image_source, const image_info = probe: {
         // Probing spools compressed images, which can take minutes.
-        const progress = startProgress(io);
-        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map), .progress = progress }) catch |err| {
-            progress.end();
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer image_source.deinit();
-        var info = openetcher.probeImageSource(arena, io, &image_source, .{}) catch |err| {
-            progress.end();
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer info.deinit(arena);
+        const progress = startProgress(context.io);
+        errdefer progress.end();
+        var image_source = try openetcher.openImageSourceFromPath(context.arena, context.io, args.image, context.sourceOptions(args.spool_dir, progress));
+        errdefer image_source.deinit();
+        const image_info = try openetcher.probeImageSource(context.arena, context.io, &image_source, .{});
         progress.end();
-        if (parsed.json) {
-            try writeImageInfoJson(stdout, info);
-        } else {
-            try writeImageInfo(stdout, info, parsed.humanize);
-        }
-        try stdout.flush();
-        return;
+        break :probe .{ image_source, image_info };
+    };
+    defer image_source.deinit();
+    defer image_info.deinit(context.arena);
+
+    const info_view = try output.view(output.InfoView, context.arena, image_info);
+    if (args.json) {
+        try output.writeJson(context.stdout, info_view);
+    } else {
+        try output.writeInfoText(context.stdout, info_view, args.humanize);
     }
+}
 
-    if (std.mem.eql(u8, command, "plan")) {
-        const parsed = parseOutputArgs(args[2..]) catch {
-            try writeUsage(stderr);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-
-        const image_path = parsed.image_path;
+fn plan(context: Context, args: ImageArgs) RunError!void {
+    var image_source, const flash_plan = planned: {
         // Planning spools compressed images, which can take minutes.
-        const progress = startProgress(io);
-        var image_source = openetcher.openImageSourceFromPath(arena, io, image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map), .progress = progress }) catch |err| {
-            progress.end();
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer image_source.deinit();
-        const plan = openetcher.planImageFlashSource(arena, io, &image_source, .{}) catch |err| {
-            progress.end();
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer plan.deinit(arena);
+        const progress = startProgress(context.io);
+        errdefer progress.end();
+        var image_source = try openetcher.openImageSourceFromPath(context.arena, context.io, args.image, context.sourceOptions(args.spool_dir, progress));
+        errdefer image_source.deinit();
+        const flash_plan = try openetcher.planImageFlashSource(context.arena, context.io, &image_source, .{});
         progress.end();
-        if (parsed.json) {
-            try writeFlashPlanJson(stdout, plan);
-        } else {
-            try writeFlashPlan(stdout, plan, parsed.humanize);
+        break :planned .{ image_source, flash_plan };
+    };
+    defer image_source.deinit();
+    defer flash_plan.deinit(context.arena);
+
+    const plan_view = try output.PlanView.init(context.arena, flash_plan);
+    if (args.json) {
+        try output.writeJson(context.stdout, plan_view);
+    } else {
+        try output.writePlanText(context.stdout, plan_view, args.humanize);
+    }
+}
+
+fn disks(context: Context, args: DisksArgs) RunError!void {
+    const list = try openetcher.device_api.listCandidateDisks(context.arena, context.io, .{ .include_system = args.all });
+    defer list.deinit(context.arena);
+
+    const disk_views = try output.view([]const output.DiskView, context.arena, list.items);
+    if (args.json) {
+        try output.writeJson(context.stdout, disk_views);
+    } else {
+        try output.writeDisksText(context.stdout, disk_views, args.all, args.humanize);
+    }
+}
+
+fn flash(context: Context, args: FlashArgs) RunError!void {
+    const arena = context.arena;
+    const io = context.io;
+    const stdout = context.stdout;
+    const stderr = context.stderr;
+
+    const target_path = if (args.disk_id) |disk_id|
+        try openetcher.device_api.resolveDiskId(arena, io, disk_id, .{ .include_system = true })
+    else
+        args.device.?; // `FlashArgs.validate` requires one of the two.
+
+    if (!args.force) {
+        if (try openetcher.device_api.lookupDiskByPath(arena, io, target_path, .{ .include_system = true })) |candidate| {
+            defer candidate.deinit(arena);
+            if (candidate.protected) return error.ProtectedTargetRequiresForce;
         }
-        try stdout.flush();
-        return;
     }
 
-    if (std.mem.eql(u8, command, "disks")) {
-        const parsed = parseListArgs(args[2..]) catch {
-            try writeUsage(stderr);
-            try stderr.flush();
-            std.process.exit(1);
-        };
+    const target_info = try openetcher.device_api.probeTarget(arena, io, target_path);
+    defer target_info.deinit(arena);
 
-        const disks = openetcher.device_api.listCandidateDisks(arena, io, .{ .include_system = parsed.include_system }) catch |err| {
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer disks.deinit(arena);
-
-        if (parsed.json) {
-            try writeCandidateDisksJson(stdout, disks.items);
-        } else {
-            try writeCandidateDisks(stdout, disks.items, parsed.include_system, parsed.humanize);
-        }
-        try stdout.flush();
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "flash")) {
-        const parsed = parseFlashArgs(args[2..]) catch {
-            try writeUsage(stderr);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-
-        const target_path = switch (parsed.target) {
-            .path => |path| path,
-            .disk_id => |disk_id| openetcher.device_api.resolveDiskId(arena, io, disk_id, .{ .include_system = true }) catch |err| {
-                try writeUserError(stderr, err);
-                try stderr.flush();
-                std.process.exit(1);
-            },
-        };
-
-        if (!parsed.force) {
-            const disk = openetcher.device_api.lookupDiskByPath(arena, io, target_path, .{ .include_system = true }) catch |err| {
-                try writeUserError(stderr, err);
-                try stderr.flush();
-                std.process.exit(1);
-            };
-            if (disk) |candidate| {
-                defer candidate.deinit(arena);
-                if (candidate.protected) {
-                    try writeUserError(stderr, error.ProtectedTargetRequiresForce);
-                    try stderr.flush();
-                    std.process.exit(1);
-                }
-            }
-        }
-
-        const target_info = openetcher.device_api.probeTarget(arena, io, target_path) catch |err| {
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer target_info.deinit(arena);
-
-        if (!std.mem.eql(u8, target_info.requested_path, target_info.resolved_path)) {
-            try stderr.print("normalized target: {s} -> {s}\n", .{ target_info.requested_path, target_info.resolved_path });
-            try stderr.flush();
-        }
-
-        try stderr.print("preparing target: {s}\n", .{target_info.resolved_path});
+    if (!std.mem.eql(u8, target_info.requested_path, target_info.resolved_path)) {
+        try stderr.print("normalized target: {s} -> {s}\n", .{ target_info.requested_path, target_info.resolved_path });
         try stderr.flush();
-        openetcher.device_api.prepareTargetPath(arena, io, target_path) catch |err| {
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-
-        const progress = startProgress(io);
-        const start_time = std.Io.Clock.awake.now(io);
-        var image_source = openetcher.openImageSourceFromPath(arena, io, parsed.image_path, .{ .spool_dir = parsed.spool_dir orelse defaultSpoolDir(init.environ_map), .progress = progress }) catch |err| {
-            progress.end();
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer image_source.deinit();
-        const report = openetcher.flashSource(arena, io, &image_source, target_path, .{
-            .prepare_target = false,
-            .strategy = if (parsed.force) .force_full_streaming else .planned_sparse,
-            .progress = progress,
-        }) catch |err| {
-            progress.end();
-            try writeUserError(stderr, err);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        progress.end();
-
-        const elapsed = start_time.durationTo(std.Io.Clock.awake.now(io));
-        const elapsed_ns: u64 = @intCast(@max(elapsed.nanoseconds, 1));
-        const actual_bytes_per_second = bytesPerSecond(report.bytes_written, elapsed_ns);
-        const effective_bytes_per_second = bytesPerSecond(report.image_size, elapsed_ns);
-
-        try stdout.print("wrote ", .{});
-        try writeByteValue(stdout, report.bytes_written, parsed.humanize);
-        if (!parsed.humanize) try stdout.print(" bytes", .{});
-        try stdout.print(" across {} ranges, skipped ", .{report.range_count});
-        try writeByteValue(stdout, report.bytes_skipped, parsed.humanize);
-        if (!parsed.humanize) try stdout.print(" bytes", .{});
-        try stdout.writeByte('\n');
-        var actual_speed_buffer: [32]u8 = undefined;
-        var effective_speed_buffer: [32]u8 = undefined;
-        const actual_speed = try formatBytes(&actual_speed_buffer, actual_bytes_per_second);
-        const effective_speed = try formatBytes(&effective_speed_buffer, effective_bytes_per_second);
-        try stdout.print("actual throughput: {s}/s\n", .{actual_speed});
-        try stdout.print("effective throughput: {s}/s\n", .{effective_speed});
-        try stdout.flush();
-        return;
     }
 
-    try writeUsage(stderr);
+    try stderr.print("preparing target: {s}\n", .{target_info.resolved_path});
     try stderr.flush();
-    std.process.exit(1);
+    try openetcher.device_api.prepareTargetPath(arena, io, target_path);
+
+    const start_time = std.Io.Clock.awake.now(io);
+    const report = report: {
+        const progress = startProgress(io);
+        // Ending the display erases it, so an error message starts clean.
+        errdefer progress.end();
+        var image_source = try openetcher.openImageSourceFromPath(arena, io, args.image, context.sourceOptions(args.spool_dir, progress));
+        defer image_source.deinit();
+        const report = try openetcher.flashSource(arena, io, &image_source, target_path, .{
+            .prepare_target = false,
+            .strategy = if (args.force) .force_full_streaming else .planned_sparse,
+            .progress = progress,
+        });
+        progress.end();
+        break :report report;
+    };
+
+    const elapsed = start_time.durationTo(std.Io.Clock.awake.now(io));
+    const elapsed_ns: u64 = @intCast(@max(elapsed.nanoseconds, 1));
+    const actual_bytes_per_second = bytesPerSecond(report.bytes_written, elapsed_ns);
+    const effective_bytes_per_second = bytesPerSecond(report.image_size, elapsed_ns);
+
+    const written = output.Bytes.of(report.bytes_written).fmt(args.humanize);
+    const skipped = output.Bytes.of(report.bytes_skipped).fmt(args.humanize);
+    // Humanized counts carry their unit; plain ones need it spelled out.
+    const unit = if (args.humanize) "" else " bytes";
+    try stdout.print("wrote {f}{s} across {} ranges, skipped {f}{s}\n", .{ written, unit, report.range_count, skipped, unit });
+    try stdout.print("actual throughput: {f}/s\n", .{output.Bytes.of(actual_bytes_per_second).fmt(true)});
+    try stdout.print("effective throughput: {f}/s\n", .{output.Bytes.of(effective_bytes_per_second).fmt(true)});
 }
 
 /// Starts the progress display on stderr. It draws only when stderr is a
@@ -220,10 +243,6 @@ fn startProgress(io: std.Io) std.Progress.Node {
     return std.Progress.start(io, .{});
 }
 
-fn writeUsage(writer: *std.Io.Writer) !void {
-    try writer.print("usage:\n  openetcher info [-h] [--json] [--spool-dir <dir>] <image>\n  openetcher plan [-h] [--json] [--spool-dir <dir>] <image>\n  openetcher disks [-h] [--json] [--all]\n  openetcher flash [-h] [--force] [--spool-dir <dir>] <image> <device>\n  openetcher flash [-h] [--force] [--spool-dir <dir>] <image> --disk-id <id>\n\ncompressed images are decoded once into --spool-dir (default: $TMPDIR)\n", .{});
-}
-
 /// Directory for decoded copies of compressed images, from the usual
 /// temporary-directory variables. Null falls back to the library default.
 fn defaultSpoolDir(environ: *const std.process.Environ.Map) ?[]const u8 {
@@ -231,388 +250,6 @@ fn defaultSpoolDir(environ: *const std.process.Environ.Map) ?[]const u8 {
         if (environ.get(name)) |value| if (value.len != 0) return value;
     }
     return null;
-}
-
-const OutputArgs = struct {
-    image_path: []const u8,
-    json: bool = false,
-    humanize: bool = false,
-    spool_dir: ?[]const u8 = null,
-};
-
-fn parseOutputArgs(args: []const []const u8) !OutputArgs {
-    var image_path: ?[]const u8 = null;
-    var json = false;
-    var humanize = false;
-    var spool_dir: ?[]const u8 = null;
-    var index: usize = 0;
-
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--spool-dir")) {
-            if (spool_dir != null or index + 1 >= args.len) return error.InvalidArguments;
-            index += 1;
-            spool_dir = args[index];
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            if (json) return error.InvalidArguments;
-            json = true;
-        } else if (std.mem.eql(u8, arg, "-h")) {
-            if (humanize) return error.InvalidArguments;
-            humanize = true;
-        } else if (image_path == null) {
-            image_path = arg;
-        } else {
-            return error.InvalidArguments;
-        }
-    }
-
-    return .{
-        .image_path = image_path orelse return error.InvalidArguments,
-        .json = json,
-        .humanize = humanize,
-        .spool_dir = spool_dir,
-    };
-}
-
-const ListArgs = struct {
-    json: bool = false,
-    humanize: bool = false,
-    include_system: bool = false,
-};
-
-const FlashArgs = struct {
-    image_path: []const u8,
-    humanize: bool = false,
-    force: bool = false,
-    spool_dir: ?[]const u8 = null,
-    target: union(enum) {
-        path: []const u8,
-        disk_id: []const u8,
-    },
-};
-
-fn parseListArgs(args: []const []const u8) !ListArgs {
-    var parsed: ListArgs = .{};
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
-            if (parsed.json) return error.InvalidArguments;
-            parsed.json = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--all")) {
-            if (parsed.include_system) return error.InvalidArguments;
-            parsed.include_system = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-h")) {
-            if (parsed.humanize) return error.InvalidArguments;
-            parsed.humanize = true;
-            continue;
-        }
-        return error.InvalidArguments;
-    }
-    return parsed;
-}
-
-fn parseFlashArgs(args: []const []const u8) !FlashArgs {
-    var image_path: ?[]const u8 = null;
-    var device_path: ?[]const u8 = null;
-    var disk_id: ?[]const u8 = null;
-    var humanize = false;
-    var force = false;
-    var spool_dir: ?[]const u8 = null;
-    var index: usize = 0;
-
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "-h")) {
-            if (humanize) return error.InvalidArguments;
-            humanize = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--force")) {
-            if (force) return error.InvalidArguments;
-            force = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--spool-dir")) {
-            if (spool_dir != null or index + 1 >= args.len) return error.InvalidArguments;
-            index += 1;
-            spool_dir = args[index];
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--disk-id")) {
-            if (disk_id != null or index + 1 >= args.len) return error.InvalidArguments;
-            index += 1;
-            disk_id = args[index];
-            continue;
-        }
-        if (image_path == null) {
-            image_path = arg;
-        } else if (device_path == null) {
-            device_path = arg;
-        } else {
-            return error.InvalidArguments;
-        }
-    }
-
-    const image = image_path orelse return error.InvalidArguments;
-    if (disk_id) |id| {
-        if (device_path != null) return error.InvalidArguments;
-        return .{
-            .image_path = image,
-            .humanize = humanize,
-            .force = force,
-            .spool_dir = spool_dir,
-            .target = .{ .disk_id = id },
-        };
-    }
-    return .{
-        .image_path = image,
-        .humanize = humanize,
-        .force = force,
-        .spool_dir = spool_dir,
-        .target = .{ .path = device_path orelse return error.InvalidArguments },
-    };
-}
-
-fn writeImageInfo(writer: *std.Io.Writer, info: openetcher.ImageInfo, humanize: bool) !void {
-    try writeByteField(writer, "image_size: ", info.image_size, humanize);
-    try writer.print("layout: {s}\ncompression: {s}\n", .{ @tagName(info.layout), @tagName(info.compression) });
-    if (info.encoded_size) |encoded_size| {
-        try writeByteField(writer, "encoded_size: ", encoded_size, humanize);
-    }
-
-    if (info.filesystem) |filesystem| {
-        try writer.print("filesystem: {s}\n", .{@tagName(filesystem)});
-    }
-    if (info.block_size) |block_size| {
-        try writeByteField(writer, "block_size: ", block_size, humanize);
-    }
-    if (info.used_bytes) |used_bytes| {
-        try writeByteField(writer, "used_bytes: ", used_bytes, humanize);
-    }
-    if (info.skipped_bytes) |skipped_bytes| {
-        try writeByteField(writer, "skipped_bytes: ", skipped_bytes, humanize);
-    }
-    if (info.range_count) |range_count| {
-        try writer.print("range_count: {}\n", .{range_count});
-    }
-
-    if (info.partitions.len == 0) return;
-    try writer.print("partitions:\n", .{});
-    for (info.partitions) |partition| {
-        try writer.print("  {}: type=0x{x:0>2} filesystem={s} supported={} start=", .{
-            partition.index,
-            partition.partition_type,
-            @tagName(partition.filesystem),
-            partition.supported,
-        });
-        try writeByteValue(writer, partition.start_offset, humanize);
-        try writer.print(" size=", .{});
-        try writeByteValue(writer, partition.size, humanize);
-        try writer.writeByte('\n');
-        if (partition.reason) |reason| {
-            try writer.print("     reason={f}\n", .{reason});
-        }
-        if (partition.block_size) |block_size| {
-            try writeByteField(writer, "     block_size=", block_size, humanize);
-        }
-        if (partition.used_bytes) |used_bytes| {
-            try writeByteField(writer, "     used_bytes=", used_bytes, humanize);
-        }
-        if (partition.skipped_bytes) |skipped_bytes| {
-            try writeByteField(writer, "     skipped_bytes=", skipped_bytes, humanize);
-        }
-        if (partition.range_count) |range_count| {
-            try writer.print("     range_count={}\n", .{range_count});
-        }
-    }
-}
-
-fn writeByteField(writer: *std.Io.Writer, prefix: []const u8, value: u64, humanize: bool) !void {
-    try writer.print("{s}", .{prefix});
-    try writeByteValue(writer, value, humanize);
-    try writer.writeByte('\n');
-}
-
-fn writeByteValue(writer: *std.Io.Writer, value: u64, humanize: bool) !void {
-    if (!humanize) {
-        try writer.print("{}", .{value});
-        return;
-    }
-
-    var buffer: [32]u8 = undefined;
-    const formatted = try formatBytes(&buffer, value);
-    try writer.print("{s}", .{formatted});
-}
-
-fn writeImageInfoJson(writer: *std.Io.Writer, info: openetcher.ImageInfo) !void {
-    try writer.print("{{\n  \"image_size\": {},\n  \"compression\": ", .{info.image_size});
-    try std.json.Stringify.value(@tagName(info.compression), .{}, writer);
-    try writer.writeByte('\n');
-    if (info.encoded_size) |encoded_size| {
-        try writer.print("  ,\"encoded_size\": {}\n", .{encoded_size});
-    }
-    try writer.print("  ,\"layout\": ", .{});
-    try std.json.Stringify.value(@tagName(info.layout), .{}, writer);
-    try writer.writeByte('\n');
-
-    if (info.filesystem) |filesystem| {
-        try writer.print("  ,\"filesystem\": ", .{});
-        try std.json.Stringify.value(@tagName(filesystem), .{}, writer);
-        try writer.writeByte('\n');
-    }
-    if (info.block_size) |block_size| {
-        try writer.print("  ,\"block_size\": {}\n", .{block_size});
-    }
-    if (info.used_bytes) |used_bytes| {
-        try writer.print("  ,\"used_bytes\": {}\n", .{used_bytes});
-    }
-    if (info.skipped_bytes) |skipped_bytes| {
-        try writer.print("  ,\"skipped_bytes\": {}\n", .{skipped_bytes});
-    }
-    if (info.range_count) |range_count| {
-        try writer.print("  ,\"range_count\": {}\n", .{range_count});
-    }
-
-    try writer.print("  ,\"partitions\": [", .{});
-    for (info.partitions, 0..) |partition, index| {
-        if (index != 0) try writer.print(",", .{});
-        try writer.print("\n    {{\"index\": {}, \"partition_type\": {}, \"filesystem\": ", .{
-            partition.index,
-            partition.partition_type,
-        });
-        try std.json.Stringify.value(@tagName(partition.filesystem), .{}, writer);
-        try writer.print(", \"supported\": {}, \"start_offset\": {}, \"size\": {}", .{
-            partition.supported,
-            partition.start_offset,
-            partition.size,
-        });
-        if (partition.reason) |reason| {
-            try writer.print(", \"reason\": ", .{});
-            try std.json.Stringify.value(reason, .{}, writer);
-        }
-        if (partition.block_size) |block_size| {
-            try writer.print(", \"block_size\": {}", .{block_size});
-        }
-        if (partition.used_bytes) |used_bytes| {
-            try writer.print(", \"used_bytes\": {}", .{used_bytes});
-        }
-        if (partition.skipped_bytes) |skipped_bytes| {
-            try writer.print(", \"skipped_bytes\": {}", .{skipped_bytes});
-        }
-        if (partition.range_count) |range_count| {
-            try writer.print(", \"range_count\": {}", .{range_count});
-        }
-        try writer.print("}}", .{});
-    }
-    try writer.print("\n  ]\n}}\n", .{});
-}
-
-fn writeFlashPlan(writer: *std.Io.Writer, plan: openetcher.FlashPlan, humanize: bool) !void {
-    var planned_bytes: u64 = 0;
-    for (plan.ranges) |segment| planned_bytes += segment.length;
-
-    try writeByteField(writer, "image_size: ", plan.image_size, humanize);
-    try writeByteField(writer, "planned_bytes: ", planned_bytes, humanize);
-    try writeByteField(writer, "skipped_bytes: ", plan.image_size - planned_bytes, humanize);
-    try writer.print("range_count: {}\nranges:\n", .{plan.ranges.len});
-
-    for (plan.ranges, 0..) |segment, index| {
-        try writer.print("  {}: offset=", .{index});
-        try writeByteValue(writer, segment.offset, humanize);
-        try writer.print(" length=", .{});
-        try writeByteValue(writer, segment.length, humanize);
-        try writer.print(" end=", .{});
-        try writeByteValue(writer, segment.end(), humanize);
-        try writer.writeByte('\n');
-    }
-}
-
-fn writeFlashPlanJson(writer: *std.Io.Writer, plan: openetcher.FlashPlan) !void {
-    var planned_bytes: u64 = 0;
-    for (plan.ranges) |segment| planned_bytes += segment.length;
-
-    try writer.print("{{\n  \"image_size\": {},\n  \"planned_bytes\": {},\n  \"skipped_bytes\": {},\n  \"range_count\": {},\n  \"ranges\": [", .{
-        plan.image_size,
-        planned_bytes,
-        plan.image_size - planned_bytes,
-        plan.ranges.len,
-    });
-
-    for (plan.ranges, 0..) |segment, index| {
-        if (index != 0) try writer.print(",", .{});
-        try writer.print("\n    {{\"offset\": {}, \"length\": {}, \"end\": {}}}", .{
-            segment.offset,
-            segment.length,
-            segment.end(),
-        });
-    }
-
-    try writer.print("\n  ]\n}}\n", .{});
-}
-
-fn writeCandidateDisks(writer: *std.Io.Writer, disks: []const openetcher.DeviceCandidateDisk, include_system: bool, humanize: bool) !void {
-    if (disks.len == 0) {
-        if (include_system) {
-            try writer.print("no disks found\n", .{});
-        } else {
-            try writer.print("no candidate disks found\n", .{});
-        }
-        return;
-    }
-
-    for (disks, 0..) |disk, index| {
-        try writer.print("{}: {s}\n", .{ index, disk.device_path });
-        try writer.print("   id: {s}\n", .{disk.id});
-        try writer.print("   raw: {s}\n", .{disk.raw_path});
-        try writer.print("   description: {s}\n", .{disk.description});
-        try writeByteField(writer, "   size: ", disk.size, humanize);
-        try writer.print("   protected: {}\n", .{disk.protected});
-        try writer.print("   system: {}\n", .{disk.system});
-        try writer.print("   removable: {}\n", .{disk.removable});
-        if (disk.mount_points.len == 0) {
-            try writer.print("   mountpoints: none\n", .{});
-        } else {
-            try writer.print("   mountpoints:", .{});
-            for (disk.mount_points) |mount_point| {
-                try writer.print(" {s}", .{mount_point.path});
-            }
-            try writer.writeByte('\n');
-        }
-    }
-}
-
-fn writeCandidateDisksJson(writer: *std.Io.Writer, disks: []const openetcher.DeviceCandidateDisk) !void {
-    try writer.print("[", .{});
-    for (disks, 0..) |disk, index| {
-        if (index != 0) try writer.print(",", .{});
-        try writer.print("\n  {{\"id\": ", .{});
-        try std.json.Stringify.value(disk.id, .{}, writer);
-        try writer.print(", \"device\": ", .{});
-        try std.json.Stringify.value(disk.device_path, .{}, writer);
-        try writer.print(", \"raw\": ", .{});
-        try std.json.Stringify.value(disk.raw_path, .{}, writer);
-        try writer.print(", \"display_name\": ", .{});
-        try std.json.Stringify.value(disk.display_name, .{}, writer);
-        try writer.print(", \"description\": ", .{});
-        try std.json.Stringify.value(disk.description, .{}, writer);
-        try writer.print(", \"size\": {}, \"protected\": {}, \"system\": {}, \"removable\": {}, \"mountpoints\": [", .{
-            disk.size,
-            disk.protected,
-            disk.system,
-            disk.removable,
-        });
-        for (disk.mount_points, 0..) |mount_point, mount_index| {
-            if (mount_index != 0) try writer.print(",", .{});
-            try writer.print("{{\"path\": ", .{});
-            try std.json.Stringify.value(mount_point.path, .{}, writer);
-            try writer.print("}}", .{});
-        }
-        try writer.print("]}}", .{});
-    }
-    try writer.print("\n]\n", .{});
 }
 
 fn ErrorSetOf(comptime function: anytype) type {
@@ -805,30 +442,6 @@ fn bytesPerSecond(bytes: u64, elapsed_ns: u64) u64 {
     return @intCast((@as(u128, bytes) * std.time.ns_per_s) / elapsed_ns);
 }
 
-fn formatBytes(buffer: []u8, value: u64) ![]const u8 {
-    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB" };
-    var scaled = value;
-    var remainder: u64 = 0;
-    var unit_index: usize = 0;
-
-    while (scaled >= 1024 and unit_index + 1 < units.len) {
-        remainder = scaled % 1024;
-        scaled /= 1024;
-        unit_index += 1;
-    }
-
-    if (unit_index == 0 or remainder == 0) {
-        return std.fmt.bufPrint(buffer, "{} {s}", .{ scaled, units[unit_index] });
-    }
-
-    const decimal = (remainder * 10) / 1024;
-    if (decimal == 0) {
-        return std.fmt.bufPrint(buffer, "{} {s}", .{ scaled, units[unit_index] });
-    }
-
-    return std.fmt.bufPrint(buffer, "{}.{} {s}", .{ scaled, decimal, units[unit_index] });
-}
-
 test "writeUserError prints specific and grouped messages" {
     var buffer: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -839,4 +452,61 @@ test "writeUserError prints specific and grouped messages" {
             "the image is corrupt or truncated: InvalidExt4Superblock\n",
         writer.buffered(),
     );
+}
+
+test {
+    _ = cli_args;
+    _ = output;
+}
+
+test "commands parse their documented arguments" {
+    const parse = cli_args.parseCommand;
+    const shown = try parse(Command, &.{ "info", "-h", "image.img", "--spool-dir", "/tmp", "--json" });
+    try std.testing.expect(shown.info.humanize and shown.info.json);
+    try std.testing.expectEqualStrings("image.img", shown.info.image);
+    try std.testing.expectEqualStrings("/tmp", shown.info.spool_dir.?);
+
+    try std.testing.expectEqualStrings("a.img", (try parse(Command, &.{ "plan", "a.img" })).plan.image);
+    const listed = try parse(Command, &.{ "disks", "--all", "--json" });
+    try std.testing.expect(listed.disks.all and listed.disks.json and !listed.disks.humanize);
+
+    const by_path = try parse(Command, &.{ "flash", "--force", "a.img", "/dev/disk4" });
+    try std.testing.expect(by_path.flash.force);
+    try std.testing.expectEqualStrings("/dev/disk4", by_path.flash.device.?);
+    const by_id = try parse(Command, &.{ "flash", "a.img", "--disk-id", "macos-0123" });
+    try std.testing.expectEqualStrings("macos-0123", by_id.flash.disk_id.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), by_id.flash.device);
+}
+
+test "invalid command lines are rejected" {
+    const bad = [_][]const []const u8{
+        &.{},
+        &.{"bogus"},
+        &.{"info"},
+        &.{ "info", "--json" },
+        &.{ "info", "--json", "--json", "a.img" },
+        &.{ "info", "a.img", "b.img" },
+        &.{ "info", "--spool-dir" },
+        &.{ "plan", "-h", "-h", "a.img" },
+        &.{ "disks", "a.img" },
+        &.{ "disks", "--all", "--all" },
+        &.{ "disks", "--spool-dir", "/tmp" },
+        &.{ "flash", "a.img" },
+        &.{ "flash", "a.img", "/dev/disk4", "--disk-id", "macos-0123" },
+        &.{ "flash", "a.img", "/dev/disk4", "/dev/disk5" },
+        &.{ "flash", "a.img", "--disk-id" },
+        &.{ "flash", "--json", "a.img", "/dev/disk4" },
+    };
+    for (bad) |argv| try std.testing.expectError(error.InvalidArguments, cli_args.parseCommand(Command, argv));
+}
+
+test "usage shows every command and flag the parser accepts" {
+    inline for (comptime std.meta.fieldNames(Command), comptime std.meta.fieldTypes(Command)) |command, Args| {
+        try std.testing.expect(std.mem.indexOf(u8, usage, "openetcher " ++ command ++ " ") != null);
+        inline for (comptime std.meta.fieldNames(Args)) |field| {
+            if (comptime cli_args.isPositional(Args, field)) continue;
+            try std.testing.expect(std.mem.indexOf(u8, usage, " [" ++ comptime cli_args.flagName(Args, field)) != null or
+                std.mem.indexOf(u8, usage, " " ++ comptime cli_args.flagName(Args, field) ++ " <") != null);
+        }
+    }
 }
