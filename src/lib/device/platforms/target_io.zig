@@ -1,19 +1,20 @@
 //! Shared target-I/O backends.
 //!
-//! `posix_dispatcher` serves regular files plus POSIX raw devices with
-//! kernel-alignment handling; macOS and Linux use it. A future Windows
-//! backend supplies its own dispatcher with Win32 semantics.
+//! Each platform selects one namespace here as `target_io` at compile time.
+//! `posix` serves regular files plus POSIX raw devices with kernel-alignment
+//! handling; macOS and Linux use it. A future Windows backend adds its own
+//! namespace with Win32 semantics.
 
 const std = @import("std");
 
 const device = @import("../../device.zig");
 
-fn writePositional(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) anyerror!void {
+fn writePositional(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
     _ = allocator;
     try target.file.writePositionalAll(io, bytes, offset);
 }
 
-fn syncFile(io: std.Io, target: *device.OpenTarget) anyerror!void {
+fn syncFile(io: std.Io, target: *device.OpenTarget) !void {
     try target.file.sync(io);
 }
 
@@ -120,50 +121,38 @@ fn readDeviceAll(fd: std.posix.fd_t, buffer: []u8) !usize {
     return index;
 }
 
-const PosixDispatcher = struct {
-    fn writeAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) anyerror!void {
+/// Backend used by macOS and Linux: positional I/O for files,
+/// alignment-aware raw I/O for devices.
+pub const posix = struct {
+    pub fn writeAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
         if (!target.info.capabilities.isDevice()) return writePositional(allocator, io, target, bytes, offset);
         return writeAlignedDeviceChunk(allocator, target, bytes, offset);
     }
 
-    fn readAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64) anyerror!usize {
+    pub fn readAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64) !usize {
         if (!target.info.capabilities.isDevice()) return target.file.readPositionalAll(io, buffer, offset);
         return readAlignedDeviceChunk(allocator, target, io, buffer, offset);
     }
 
-    fn sync(io: std.Io, target: *device.OpenTarget) anyerror!void {
+    pub fn sync(io: std.Io, target: *device.OpenTarget) !void {
         return syncFile(io, target);
     }
 };
 
-const PositionalOnlyDispatcher = struct {
-    fn writeAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) anyerror!void {
+/// Backend used by platforms without raw-device support yet.
+pub const positional_only = struct {
+    pub fn writeAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, bytes: []const u8, offset: u64) !void {
         if (target.info.capabilities.isDevice()) return error.UnsupportedTargetType;
         return writePositional(allocator, io, target, bytes, offset);
     }
 
-    fn readAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64) anyerror!usize {
+    pub fn readAt(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget, buffer: []u8, offset: u64) !usize {
         _ = allocator;
         if (target.info.capabilities.isDevice()) return error.UnsupportedTargetType;
         return target.file.readPositionalAll(io, buffer, offset);
     }
 
-    fn sync(io: std.Io, target: *device.OpenTarget) anyerror!void {
+    pub fn sync(io: std.Io, target: *device.OpenTarget) !void {
         return syncFile(io, target);
     }
-};
-
-/// Dispatcher used by macOS and Linux: positional I/O for files,
-/// alignment-aware raw I/O for devices.
-pub const posix_dispatcher: device.TargetIo = .{
-    .write_at = PosixDispatcher.writeAt,
-    .read_at = PosixDispatcher.readAt,
-    .sync = PosixDispatcher.sync,
-};
-
-/// Dispatcher used by platforms without raw-device support yet.
-pub const positional_only_dispatcher: device.TargetIo = .{
-    .write_at = PositionalOnlyDispatcher.writeAt,
-    .read_at = PositionalOnlyDispatcher.readAt,
-    .sync = PositionalOnlyDispatcher.sync,
 };

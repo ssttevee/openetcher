@@ -49,7 +49,7 @@ pub const Stream = struct {
     translate_errors: bool = false,
     /// Optional forward jump for random-access sources. When present,
     /// `discardTo` seeks instead of reading through the skipped bytes.
-    seek_to_fn: ?*const fn (context: *anyopaque, position: u64) anyerror!void = null,
+    seek_to_fn: ?*const fn (context: *anyopaque, position: u64) std.Io.File.Reader.SeekError!void = null,
 
     pub fn read(self: *@This(), buffer: []u8) !usize {
         if (buffer.len == 0) return 0;
@@ -180,7 +180,7 @@ const FileStreamContext = struct {
         self.allocator.destroy(self);
     }
 
-    fn seekTo(context: *anyopaque, position: u64) anyerror!void {
+    fn seekTo(context: *anyopaque, position: u64) std.Io.File.Reader.SeekError!void {
         const self: *FileStreamContext = @ptrCast(@alignCast(context));
         try self.file_reader.seekTo(position);
     }
@@ -401,19 +401,18 @@ fn createSpool(source: *PathContext, io: std.Io, limit: ?u64) !Spool {
         const count = try stream.read(buffer);
         if (count == 0) break;
         const chunk = buffer[0..count];
-        if (!std.mem.allEqual(u8, chunk, 0)) spool.file.writePositionalAll(io, chunk, size) catch |err| return spoolWriteError(err);
+        if (!std.mem.allEqual(u8, chunk, 0)) spool.file.writePositionalAll(io, chunk, size) catch |err| return switch (err) {
+            error.NoSpaceLeft, error.DiskQuota, error.FileTooBig => error.SpoolDirectoryFull,
+            else => |other| other,
+        };
         size += count;
     }
-    spool.file.setLength(io, size) catch |err| return spoolWriteError(err);
+    spool.file.setLength(io, size) catch |err| return switch (err) {
+        error.FileTooBig => error.SpoolDirectoryFull,
+        else => |other| other,
+    };
     spool.size = size;
     return spool;
-}
-
-fn spoolWriteError(err: anyerror) anyerror {
-    return switch (err) {
-        error.NoSpaceLeft, error.DiskQuota, error.FileTooBig => error.SpoolDirectoryFull,
-        else => err,
-    };
 }
 
 fn createSpoolFile(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !Spool {

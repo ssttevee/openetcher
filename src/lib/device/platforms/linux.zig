@@ -33,4 +33,4 @@ pub fn lookupDiskByPath(allocator: std.mem.Allocator, io: std.Io, path: []const 
 
 const target_io_api = @import("target_io.zig");
 
-pub const target_io: device.TargetIo = target_io_api.posix_dispatcher;
+pub const target_io = target_io_api.posix;

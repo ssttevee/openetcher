@@ -9,20 +9,24 @@ const std = @import("std");
 /// are non-owning views and need no allocation; owning sources may supply an
 /// optional `deinit_fn`.
 pub const Reader = struct {
+    /// Every source reads from memory or a file, so this set is closed.
+    pub const ReadError = std.Io.File.ReadPositionalError || error{RangeOverflow};
+    pub const ReadExactError = ReadError || error{ImageTruncated};
+
     context: *anyopaque,
     /// Total readable length in bytes.
     size: u64,
-    read_at_fn: *const fn (context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize,
+    read_at_fn: *const fn (context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) ReadError!usize,
     deinit_fn: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator) void = null,
 
-    pub fn readAt(self: *const Reader, io: std.Io, buffer: []u8, offset: u64) !usize {
+    pub fn readAt(self: *const Reader, io: std.Io, buffer: []u8, offset: u64) ReadError!usize {
         if (buffer.len == 0) return 0;
         if (offset >= self.size) return 0;
         return self.read_at_fn(self.context, io, buffer, offset);
     }
 
     /// Reads the full buffer or fails with `ImageTruncated`.
-    pub fn readExactlyAt(self: *const Reader, io: std.Io, buffer: []u8, offset: u64) !void {
+    pub fn readExactlyAt(self: *const Reader, io: std.Io, buffer: []u8, offset: u64) ReadExactError!void {
         var completed: usize = 0;
         while (completed < buffer.len) {
             const count = try self.readAt(io, buffer[completed..], offset + completed);
@@ -31,19 +35,19 @@ pub const Reader = struct {
         }
     }
 
-    pub fn readU16LeAt(self: *const Reader, io: std.Io, offset: u64) !u16 {
+    pub fn readU16LeAt(self: *const Reader, io: std.Io, offset: u64) ReadExactError!u16 {
         var bytes: [2]u8 = undefined;
         try self.readExactlyAt(io, &bytes, offset);
         return std.mem.readInt(u16, &bytes, .little);
     }
 
-    pub fn readU32LeAt(self: *const Reader, io: std.Io, offset: u64) !u32 {
+    pub fn readU32LeAt(self: *const Reader, io: std.Io, offset: u64) ReadExactError!u32 {
         var bytes: [4]u8 = undefined;
         try self.readExactlyAt(io, &bytes, offset);
         return std.mem.readInt(u32, &bytes, .little);
     }
 
-    pub fn readU64LeAt(self: *const Reader, io: std.Io, offset: u64) !u64 {
+    pub fn readU64LeAt(self: *const Reader, io: std.Io, offset: u64) ReadExactError!u64 {
         var bytes: [8]u8 = undefined;
         try self.readExactlyAt(io, &bytes, offset);
         return std.mem.readInt(u64, &bytes, .little);
@@ -70,7 +74,7 @@ pub const Buffer = struct {
         };
     }
 
-    fn readAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize {
+    fn readAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) Reader.ReadError!usize {
         _ = io;
         const self: *Buffer = @ptrCast(@alignCast(context));
         if (offset >= self.bytes.len) return 0;
@@ -101,12 +105,12 @@ pub const FileRegion = struct {
         };
     }
 
-    fn readAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize {
+    fn readAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) Reader.ReadError!usize {
         const self: *FileRegion = @ptrCast(@alignCast(context));
         if (offset >= self.length) return 0;
         const remaining = self.length - offset;
         const clipped = if (buffer.len > remaining) buffer[0..@intCast(remaining)] else buffer;
-        const absolute_offset = try std.math.add(u64, self.base_offset, offset);
+        const absolute_offset = std.math.add(u64, self.base_offset, offset) catch return error.RangeOverflow;
         return self.file.readPositional(io, &.{clipped}, absolute_offset);
     }
 };
@@ -132,7 +136,7 @@ pub const Slice = struct {
         };
     }
 
-    fn readAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) anyerror!usize {
+    fn readAt(context: *anyopaque, io: std.Io, buffer: []u8, offset: u64) Reader.ReadError!usize {
         const self: *Slice = @ptrCast(@alignCast(context));
         if (offset >= self.length) return 0;
         const remaining = self.length - offset;

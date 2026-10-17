@@ -192,7 +192,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
                 const chunk_len: usize = @intCast(@min(remaining, buffer.len));
                 const count = try stream.read(buffer[0..chunk_len]);
                 if (count == 0) return error.UnexpectedEndOfImage;
-                try device.target_io.write_at(allocator, io, target, buffer[0..count], offset);
+                try device.target_io.writeAt(allocator, io, target, buffer[0..count], offset);
                 for (options.observers) |*observer| try root.deliverObserver(observer, offset, buffer[0..count]);
                 hasher.update(buffer[0..count]);
                 bytes_written += count;
@@ -217,7 +217,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
             const offset = logical_size;
             const next = std.math.add(u64, logical_size, count) catch return error.DecompressedImageTooLarge;
             if (target.info.capabilities.size < next) return error.DestinationTooSmall;
-            try device.target_io.write_at(allocator, io, target, buffer[0..count], offset);
+            try device.target_io.writeAt(allocator, io, target, buffer[0..count], offset);
             for (options.observers) |*observer| try root.deliverObserver(observer, offset, buffer[0..count]);
             hasher.update(buffer[0..count]);
             logical_size = next;
@@ -266,7 +266,7 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
         var offset = item.offset;
         while (remaining > 0) {
             const count: usize = @intCast(@min(remaining, buffer.len));
-            const actual = try device.target_io.read_at(allocator, io, target, buffer[0..count], offset);
+            const actual = try device.target_io.readAt(allocator, io, target, buffer[0..count], offset);
             if (actual != count) return error.VerificationFailed;
             hasher.update(buffer[0..count]);
             offset += count;
@@ -293,7 +293,7 @@ fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.St
             try stream.readExactly(buffer[0..count]);
             const destination_buffer = try allocator.alloc(u8, count);
             defer allocator.free(destination_buffer);
-            const actual = try device.target_io.read_at(allocator, io, target, destination_buffer, offset);
+            const actual = try device.target_io.readAt(allocator, io, target, destination_buffer, offset);
             if (actual != count or !std.mem.eql(u8, buffer[0..count], destination_buffer)) return error.VerificationFailed;
             offset += count;
             remaining -= count;
@@ -385,7 +385,7 @@ const FileStreamContext = struct {
         self.allocator.destroy(self);
     }
 
-    fn seekTo(context: *anyopaque, position: u64) anyerror!void {
+    fn seekTo(context: *anyopaque, position: u64) std.Io.File.Reader.SeekError!void {
         const self: *FileStreamContext = @ptrCast(@alignCast(context));
         try self.file_reader.seekTo(position);
     }
@@ -442,7 +442,7 @@ test "aligned device chunk reads go through the platform dispatcher" {
         },
     };
     var actual: [513]u8 = undefined;
-    const count = try device.target_io.read_at(std.testing.allocator, io, &target, &actual, 3);
+    const count = try device.target_io.readAt(std.testing.allocator, io, &target, &actual, 3);
 
     try std.testing.expectEqual(actual.len, count);
     try std.testing.expectEqualSlices(u8, contents[3..][0..actual.len], &actual);

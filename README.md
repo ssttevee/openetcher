@@ -468,9 +468,9 @@ src/
 - Library-first: the CLI delegates probing, planning, and flashing to the public module.
 - Callers provide `std.Io` and allocators. There is no global library I/O state or global allocator.
 - One analyzer serves every input. `image.zig` analyzes any random-access `Reader`; open files wrap in a region source, decoded bytes wrap in a buffer source. There are no parallel probe pipelines.
-- Format drivers register themselves. A filesystem module exposes `pub const driver` and joins `image/fs/driver.zig`. A disk layout exposes a driver under `image/layout/driver.zig`. A compression codec exposes `pub const codec` and joins `image/compression/codec.zig`.
+- Format drivers are resolved at compile time. Each filesystem, disk layout, and compression codec is a module exposing a fixed set of `pub` declarations, listed in a comptime tuple in `image/fs/driver.zig`, `image/layout/driver.zig`, or `image/compression/codec.zig`. Callers dispatch with `inline for`, so there are no vtables, and each registry checks its entries at compile time: missing declarations, wrong signatures, two drivers claiming one MBR type, overlapping codec magic, or a `Compression` tag without a codec all fail the build with a message naming the contract.
 - Detection precedence lives in one documented place per registry. The whole-image chain is ISO9660, then partitioned layouts, then raw ext4.
-- Target I/O lives in the platform backend. The flash engine calls only `TargetIo.write_at`, `read_at`, and `sync`; alignment padding and syscall strategy belong to macOS/Linux shared POSIX code, not the engine.
+- Target I/O lives in the platform backend. The flash engine calls only `target_io.writeAt`, `readAt`, and `sync`, resolved at compile time; alignment padding and syscall strategy belong to macOS/Linux shared POSIX code, not the engine.
 - File-handle APIs use `std.Io.File` values. Path variants are named with a `FromPath` suffix.
 - Platform code lives under `src/lib/device/platforms/` and is selected at compile time using `@import("builtin").target.os.tag`.
 - The image layer fails hard when an unsupported non-empty partition would make a sparse plan unsafe.
@@ -480,9 +480,9 @@ src/
 
 | Goal | Work required |
 | --- | --- |
-| New filesystem | One module under `image/fs/` exposing `driver` (`detect`, `probe_region`, `collect_ranges`, optional `mbr_types`), one line in `fs/driver.zig`, tests beside the module |
-| New disk layout such as GPT | One module under `image/layout/` exposing `driver` (`detect`, `collect_spans`) plus one assembly branch in `image.zig`, one line in `layout/driver.zig` |
-| New compression codec | One module under `image/compression/` exposing `codec` (`magic`, `open`), one line in `compression/codec.zig` |
+| New filesystem | One module under `image/fs/` exposing `name`, `unrecognized`, `detect`, `probeRegion`, `collectRanges`, and optionally `mbr_types` or `raw_layout` with `filesystem` and `blockSize`; one line in `fs/driver.zig`; tests beside the module |
+| New disk layout such as GPT | One module under `image/layout/` exposing `layout`, `detect`, and `collectSpans`; one line in `layout/driver.zig` and one tag in `Info.Layout` |
+| New compression codec | One module under `image/compression/` exposing `id`, `magic`, and `open`; one line in `compression/codec.zig` and one tag in `Compression` |
 | New platform | One backend under `device/platforms/` implementing the seven device functions plus a `target_io` dispatcher, one line in the OS switch in `device.zig` |
 
 ### Range Normalization
