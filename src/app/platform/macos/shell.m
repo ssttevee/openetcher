@@ -107,6 +107,8 @@ static BOOL confirmQuit(void) {
     if (!reason) return YES;
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleWarning;
+    // an unbundled executable has no icon of its own, so AppKit would show a folder
+    alert.icon = [NSImage imageWithSystemSymbolName:@"exclamationmark.triangle.fill" accessibilityDescription:nil];
     alert.messageText = @"Quit while flashing?";
     alert.informativeText = [NSString stringWithUTF8String:reason];
     [alert addButtonWithTitle:@"Keep Flashing"];
