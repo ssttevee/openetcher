@@ -35,22 +35,11 @@ pub const Reader = struct {
         }
     }
 
-    pub fn readU16LeAt(self: *const Reader, io: std.Io, offset: u64) ReadExactError!u16 {
-        var bytes: [2]u8 = undefined;
+    /// Reads one little-endian integer of type `T` at `offset`.
+    pub fn readIntLeAt(self: *const Reader, comptime T: type, io: std.Io, offset: u64) ReadExactError!T {
+        var bytes: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
         try self.readExactlyAt(io, &bytes, offset);
-        return std.mem.readInt(u16, &bytes, .little);
-    }
-
-    pub fn readU32LeAt(self: *const Reader, io: std.Io, offset: u64) ReadExactError!u32 {
-        var bytes: [4]u8 = undefined;
-        try self.readExactlyAt(io, &bytes, offset);
-        return std.mem.readInt(u32, &bytes, .little);
-    }
-
-    pub fn readU64LeAt(self: *const Reader, io: std.Io, offset: u64) ReadExactError!u64 {
-        var bytes: [8]u8 = undefined;
-        try self.readExactlyAt(io, &bytes, offset);
-        return std.mem.readInt(u64, &bytes, .little);
+        return std.mem.readInt(T, &bytes, .little);
     }
 
     pub fn deinit(self: *const Reader, allocator: std.mem.Allocator) void {
@@ -204,7 +193,8 @@ test "reader helpers decode little-endian integers" {
     const r = source.reader();
     const io = std.testing.io;
 
-    try std.testing.expectEqual(@as(u16, 0x1234), try r.readU16LeAt(io, 0));
-    try std.testing.expectEqual(@as(u32, 0x56781234), try r.readU32LeAt(io, 0));
-    try std.testing.expectEqual(@as(u64, 0xbeef000056781234), try r.readU64LeAt(io, 0));
+    try std.testing.expectEqual(@as(u16, 0x1234), try r.readIntLeAt(u16, io, 0));
+    try std.testing.expectEqual(@as(u32, 0x56781234), try r.readIntLeAt(u32, io, 0));
+    try std.testing.expectEqual(@as(u64, 0xbeef000056781234), try r.readIntLeAt(u64, io, 0));
+    try std.testing.expectError(error.ImageTruncated, r.readIntLeAt(u64, io, 1));
 }

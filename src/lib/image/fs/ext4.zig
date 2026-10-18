@@ -235,7 +235,7 @@ const GroupDescriptor = struct {
 pub fn detect(io: std.Io, r: *const Reader) bool {
     const magic_offset = superblock_offset + @offsetOf(OnDisk.Superblock, "magic");
     if (r.size < magic_offset + 2) return false;
-    const magic = r.readU16LeAt(io, magic_offset) catch return false;
+    const magic = r.readIntLeAt(u16, io, magic_offset) catch return false;
     return magic == ext4_magic;
 }
 

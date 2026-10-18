@@ -47,7 +47,7 @@ const Superblock = struct {
 /// Reader-core API. All offsets and ranges use reader coordinates.
 pub fn detect(io: std.Io, r: *const Reader) bool {
     if (r.size < superblock_size) return false;
-    const magic = r.readU32LeAt(io, 0) catch return false;
+    const magic = r.readIntLeAt(u32, io, 0) catch return false;
     return magic == squashfs_magic;
 }
 
