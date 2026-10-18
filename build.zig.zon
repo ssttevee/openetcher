@@ -4,6 +4,10 @@
     .fingerprint = 0xedfaf8588bd16018,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        // Only the macOS GUI uses this.
+        .fabrum = .{
+            .path = "../zig-layout",
+        },
     },
     .paths = .{
         "build.zig",
