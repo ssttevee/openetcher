@@ -197,12 +197,11 @@ fn spoolDir(env: *const std.process.Environ.Map) ?[]const u8 {
 /// `viewport <width> <height>`, then `text <x> <y> <width> <height> <text>`.
 fn writeLayout(comptime Text: type, writer: *Io.Writer, context: *const fabrum.layout.Context, viewport: fabrum.Vec2) Io.Writer.Error!void {
     try writer.print("viewport\t{d}\t{d}\n", .{ viewport.x, viewport.y });
-    for (context.units.items) |unit| {
-        if (unit.data != .content) continue;
-        const text = Text.asTextContent(unit.data.content) orelse continue;
-        const box = unit.bbox;
+    var texts: app.testing.TextIterator(Text) = .init(context);
+    while (texts.next()) |found| {
+        const box = found.unit.bbox;
         try writer.print("text\t{d:.1}\t{d:.1}\t{d:.1}\t{d:.1}\t", .{ box.x, box.y, box.w, box.h });
-        for (text.text) |byte| try writer.writeByte(if (byte == '\n' or byte == '\t') ' ' else byte);
+        for (found.content.text) |byte| try writer.writeByte(if (byte == '\n' or byte == '\t') ' ' else byte);
         try writer.writeByte('\n');
     }
 }
@@ -271,8 +270,8 @@ const Script = struct {
         if (std.mem.startsWith(u8, step, "click=")) return self.click(step["click=".len..], true);
         if (std.mem.startsWith(u8, step, "hover=")) return self.click(step["hover=".len..], false);
         if (std.mem.startsWith(u8, step, "nsclick=")) {
-            const unit = findText(gui.runtime.context(), step["nsclick=".len..]) orelse return error.NoSuchText;
-            return shell.synthesizeClick(unit.bbox.x + unit.bbox.w / 2, unit.bbox.y + unit.bbox.h / 2);
+            const point = app.testing.center(try findText(gui, step["nsclick=".len..]));
+            return shell.synthesizeClick(point.x, point.y);
         }
         if (std.mem.startsWith(u8, step, "snapshot=")) {
             var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -293,23 +292,17 @@ const Script = struct {
 
     fn click(self: *Script, label: []const u8, press: bool) !void {
         const gui = self.gui;
-        const unit = findText(gui.runtime.context(), label) orelse return error.NoSuchText;
-        const x = unit.bbox.x + unit.bbox.w / 2;
-        const y = unit.bbox.y + unit.bbox.h / 2;
-        Gui.mouse(gui, x, y, 0, 0, 0);
+        const point = app.testing.center(try findText(gui, label));
+        Gui.mouse(gui, point.x, point.y, 0, 0, 0);
         if (press) {
-            Gui.mouse(gui, x, y, 1, 0, 0);
-            Gui.mouse(gui, x, y, 0, 0, 0);
+            Gui.mouse(gui, point.x, point.y, 1, 0, 0);
+            Gui.mouse(gui, point.x, point.y, 0, 0, 0);
         }
     }
 
-    fn findText(context: *fabrum.layout.Context, label: []const u8) ?*const fabrum.layout.Unit {
-        for (context.units.items) |*unit| {
-            if (unit.data != .content) continue;
-            const text = Quartz.content.Text.asTextContent(unit.data.content) orelse continue;
-            if (std.mem.eql(u8, text.text, label)) return unit;
-        }
-        return null;
+    /// The text `label` in the last frame, as the tests find it.
+    fn findText(gui: *Gui, label: []const u8) error{NoSuchText}!*const fabrum.layout.Unit {
+        return app.testing.findText(Runtime.Text, gui.runtime.context(), label) orelse error.NoSuchText;
     }
 };
 

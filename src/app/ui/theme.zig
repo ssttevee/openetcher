@@ -1,7 +1,8 @@
 //! Colors, type and the small widgets every screen shares: buttons, links,
 //! badges and icons. Widgets are view helpers rather than components, since
 //! they keep no state of their own and need no keys of their own; their
-//! events are whatever `app.Action` the caller passes.
+//! events are whatever `app.Action` the caller passes, such as one from
+//! `ui.messages(App).bind(.tag)`.
 const std = @import("std");
 
 const fabrum = @import("fabrum");

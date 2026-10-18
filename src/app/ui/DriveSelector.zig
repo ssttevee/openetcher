@@ -101,6 +101,7 @@ pub fn view(ui: *app.Ui, state: *const State, props: Props) !void {
 
     try table(ui, state, props);
 
+    const on = ui.messages(DriveSelector);
     var hidden: usize = 0;
     for (props.drives) |drive| {
         if (drive.system) hidden += 1;
@@ -113,12 +114,12 @@ pub fn view(ui: *app.Ui, state: *const State, props: Props) !void {
             try ui.fmt("Hide {d} system {s}", .{ hidden, if (hidden == 1) "drive" else "drives" })
         else
             try ui.fmt("Show {d} hidden", .{hidden});
-        try theme.link(ui, "hidden", label, try ui.bind(DriveSelector, .toggle_hidden), theme.card_muted);
+        try theme.link(ui, "hidden", label, on.bind(.toggle_hidden), theme.card_muted);
     }
     ui.spacer();
     try theme.button(ui, "cancel", "Cancel", .{ .on_click = props.on_cancel, .kind = .secondary, .height = 36 });
     try theme.button(ui, "select", "Select", .{
-        .on_click = if (selectedIndex(state, props) != null) try ui.bind(DriveSelector, .select) else null,
+        .on_click = if (selectedIndex(state, props) != null) on.bind(.select) else null,
         .height = 36,
     });
 }
@@ -173,7 +174,7 @@ const Row = struct {
             .layout = .{ .sizing = .{ .width = .grow(.{}) }, .padding = .xy(12, 10), .child_gap = 12, .child_alignment = .center_left },
             .background_color = if (props.selected) theme.card_selected else if (hovered) theme.card_hover else .transparent,
             .corner_radius = .uniform(8),
-            .on_click = if (props.enabled) try ui.bind(DriveSelector, .{ .choose = key(drive.path) }) else null,
+            .on_click = if (props.enabled) ui.messages(DriveSelector).bind(.{ .choose = key(drive.path) }) else null,
         });
         defer ui.close();
 

@@ -226,19 +226,20 @@ pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
 
     try header(ui);
 
+    const on = ui.messages(App);
     switch (state.flash) {
-        .finished => |outcome| try ui.child(Finish, {}, .{
+        .finished => |outcome| try ui.one(Finish, .{
             .outcome = outcome,
             .image_name = if (state.image) |image| image.name() else "",
             .drive_name = if (state.target) |target| target.name else "",
-            .on_again = try ui.bind(App, .flash_another),
+            .on_again = on.bind(.flash_another),
         }),
         else => try stepsRow(ui, state),
     }
 
     switch (state.dialog) {
         .none => {},
-        .drives => try ui.child(DriveSelector, {}, .{
+        .drives => try ui.one(DriveSelector, .{
             .drives = switch (state.drives) {
                 .listed => |list| list.items,
                 else => &.{},
@@ -250,15 +251,15 @@ pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
             },
             .image_size = if (state.image) |image| image.size() else null,
             .current = if (state.target) |target| target.path else null,
-            .on_cancel = try ui.bind(App, .close_drives),
-            .on_select = ui.handler(App, .select_drive),
-            .on_refresh = try ui.bind(App, .refresh_drives),
+            .on_cancel = on.bind(.close_drives),
+            .on_select = on.handler(.select_drive),
+            .on_refresh = on.bind(.refresh_drives),
         }),
-        .confirm => if (state.target) |*target| try ui.child(ConfirmDialog, {}, .{
+        .confirm => if (state.target) |*target| try ui.one(ConfirmDialog, .{
             .drive = target,
             .image_name = if (state.image) |image| image.name() else "",
-            .on_confirm = try ui.bind(App, .confirm_flash),
-            .on_cancel = try ui.bind(App, .cancel_confirm),
+            .on_confirm = on.bind(.confirm_flash),
+            .on_cancel = on.bind(.cancel_confirm),
         }),
     }
 }
@@ -277,29 +278,30 @@ fn stepsRow(ui: *app.Ui, state: *const State) !void {
     try ui.open(null, .{ .layout = .{ .child_alignment = .top_center } });
     defer ui.close();
 
+    const on = ui.messages(App);
     const image_size = if (state.image) |image| image.size() else null;
-    try ui.child(steps.ImageStep, {}, .{
+    try ui.one(steps.ImageStep, .{
         .image = if (state.image) |*image| image else null,
         .locked = state.flashing(),
-        .on_pick = try ui.bind(App, .pick_image),
-        .on_remove = try ui.bind(App, .remove_image),
+        .on_pick = on.bind(.pick_image),
+        .on_remove = on.bind(.remove_image),
     });
     try steps.connector(ui, image_size != null);
-    try ui.child(steps.TargetStep, {}, .{
+    try ui.one(steps.TargetStep, .{
         .target = if (state.target) |*target| target else null,
         .enabled = state.image != null,
         .locked = state.flashing(),
         .image_size = image_size,
-        .on_open = try ui.bind(App, .open_drives),
+        .on_open = on.bind(.open_drives),
     });
     try steps.connector(ui, state.ready() or state.flashing());
-    try ui.child(steps.FlashStep, {}, .{
+    try ui.one(steps.FlashStep, .{
         .ready = state.ready(),
         .running = switch (state.flash) {
             .running => |*running| running,
             else => null,
         },
-        .on_flash = try ui.bind(App, .request_flash),
-        .on_cancel = try ui.bind(App, .cancel_flash),
+        .on_flash = on.bind(.request_flash),
+        .on_cancel = on.bind(.cancel_flash),
     });
 }
