@@ -9,6 +9,7 @@ The command-line tool is a thin layer over the `openetcher` library. The current
 - [Requirements](#requirements)
 - [Build and Test](#build-and-test)
 - [Command-Line Interface](#command-line-interface)
+- [macOS GUI](#macos-gui)
 - [Image Support and Planning](#image-support-and-planning)
 - [Disk Discovery and Safety](#disk-discovery-and-safety)
 - [Flashing Behavior](#flashing-behavior)
@@ -189,6 +190,26 @@ While it works, the CLI draws progress on stderr for decoding a compressed image
 - effective throughput: full image size divided by the same elapsed time
 
 Target preparation is explicitly logged and excluded from throughput timing. On macOS preparation unmounts the target whole disk through `diskutil unmountDisk`.
+
+## macOS GUI
+
+On macOS, `zig build` also builds `openetcher-gui`, a window in the style of balena Etcher: choose an image, choose a target drive, flash. Run it with:
+
+```sh
+zig build gui
+```
+
+It needs the [fabrum](../zig-layout) UI framework and its [Quartz renderer](../zig-fabrum-renderer-quartz) checked out next to this repository; they are path dependencies in `build.zig.zon`. Other platforms build without them.
+
+- The image picker offers `.img`, `.iso`, `.raw`, `.bin`, and images compressed with gzip, xz, zstd or bzip2. A compressed image is decoded into the spool when it is chosen, with its progress shown.
+- The target list comes from `listCandidateDisks` with system disks included but hidden until asked for; drives too small for the image can't be chosen. Writing to a drive asks for confirmation first, with a stronger warning for a system drive.
+- While flashing, the progress bar shows the write and then the verification, with speed and time left. Cancel cancels the flash through `std.Io`, which leaves the target synced.
+- The GUI reads progress from the library's `std.Progress` nodes in-process: it starts `std.Progress` with a pipe as its progress parent and decodes the packets itself (`src/app/progress.zig`).
+- Writing to a disk needs the same rights as the CLI. Without them the flash fails with a permission error.
+
+The interface is in `src/app/ui/` as fabrum.app components, tested without a window by `zig build test`. `src/app/platform/macos/` is the AppKit window, and `src/app/services.zig` runs library calls on background tasks.
+
+Debug builds take two environment variables for development: `OPENETCHER_GUI_FILE_TARGETS`, colon-separated regular files offered as targets, which also refuses writing to anything else; and `OPENETCHER_GUI_SCRIPT`, steps that drive the window and save snapshots of it (see `src/app/main.zig`).
 
 ## Image Support and Planning
 
