@@ -241,7 +241,6 @@ pub const Services = struct {
     pub const VTable = struct {
         /// Lets the user choose an image file. Posts the path, owned by the
         /// message, or null if the user canceled.
-        pickImage: *const fn (ctx: *anyopaque, on_picked: app.Handler(?[]u8)) void,
         /// Opens and probes the image at `path` in the background,
         /// replacing any image loaded before. `path` is only borrowed for
         /// the call.
@@ -256,10 +255,6 @@ pub const Services = struct {
         /// Asks the running flash to stop. It still reports how it ended.
         cancelFlash: *const fn (ctx: *anyopaque) void,
     };
-
-    pub fn pickImage(self: Services, on_picked: app.Handler(?[]u8)) void {
-        self.vtable.pickImage(self.ctx, on_picked);
-    }
 
     pub fn loadImage(self: Services, id: u32, path: []const u8, handlers: ImageHandlers) void {
         self.vtable.loadImage(self.ctx, id, path, handlers);
@@ -281,6 +276,11 @@ pub const Services = struct {
         self.vtable.cancelFlash(self.ctx);
     }
 };
+
+/// File types offered by the image chooser: raw and ISO images, plain or
+/// compressed with a codec the library decodes. Detection itself is by
+/// content, so this only narrows the list.
+pub const image_extensions: []const []const u8 = &.{ "img", "iso", "raw", "bin", "gz", "xz", "zst", "bz2" };
 
 pub const Icon = enum { image, drive, flash, done, failed, warning };
 

@@ -4,7 +4,10 @@
 //! The steps and dialogs are child components whose buttons fire the app's
 //! messages. Work that takes time or touches the system goes through the
 //! `model.Services` provided to the runtime, whose answers come back as
-//! messages.
+//! messages. The image is chosen with the platform's own file chooser
+//! (`Update.openFile`), and while a flash runs, closing the window or
+//! quitting is held for the platform's own question (`ui.guardClose`,
+//! `Update.confirm`).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -80,8 +83,9 @@ pub const State = struct {
 
 pub const Msg = union(enum) {
     pick_image,
-    /// Owned by the message.
-    image_picked: ?[]u8,
+    /// The chooser's answer: a path the message borrows, or null if the
+    /// user cancelled.
+    image_picked: ?[]const u8,
     image_progress: model.ImageProgress,
     image_loaded: model.ImageLoad,
     remove_image,
@@ -101,10 +105,13 @@ pub const Msg = union(enum) {
     flash_done: model.FlashOutcome,
     cancel_flash,
     flash_another,
+    /// The window's close button or quitting, while a flash runs.
+    close_requested: app.platform.CloseReason,
+    /// The answer: 0 keeps flashing, 1 quits.
+    quit_answered: ?usize,
 
     pub fn deinit(self: *Msg, gpa: Allocator) void {
         switch (self.*) {
-            .image_picked => |path| if (path) |owned| gpa.free(owned),
             .drives_listed => |listing| listing.deinit(gpa),
             else => {},
         }
@@ -113,14 +120,15 @@ pub const Msg = union(enum) {
 
 pub const Props = struct {};
 
-pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) void {
+pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) !void {
     const gpa = ctx.gpa;
     const services = ctx.use(model.Services);
     switch (msg) {
-        .pick_image => if (!state.flashing()) services.pickImage(ctx.handler(.image_picked)),
+        .pick_image => if (!state.flashing()) try ctx.openFile(.{ .message = "Choose an image to flash", .extensions = model.image_extensions }, ctx.handler(.image_picked)),
         .image_picked => |picked| {
-            const path = picked orelse return;
-            if (state.flashing()) return gpa.free(path);
+            const borrowed = picked orelse return;
+            if (state.flashing()) return;
+            const path = try gpa.dupe(u8, borrowed);
             if (state.image) |old| gpa.free(old.path);
             const id = state.next_image_id;
             state.next_image_id +%= 1;
@@ -206,6 +214,13 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) void {
             state.flash = .idle;
             state.setTarget(gpa, null);
         },
+        .close_requested => try ctx.confirm(.{
+            .title = "Quit while flashing?",
+            .text = "Quitting stops the flash and leaves the target partly written.",
+            .buttons = &.{ "Keep Flashing", "Quit" },
+            .kind = .warning,
+        }, ctx.handler(.quit_answered)),
+        .quit_answered => |button| if (button == 1) try ctx.quit(),
     }
 }
 
@@ -227,6 +242,8 @@ pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
     try header(ui);
 
     const on = ui.messages(App);
+    // closing or quitting mid-flash asks first
+    if (state.flashing()) ui.guardClose(on.handler(.close_requested));
     switch (state.flash) {
         .finished => |outcome| try ui.one(Finish, .{
             .outcome = outcome,

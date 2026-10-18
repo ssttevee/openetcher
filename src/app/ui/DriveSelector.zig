@@ -43,11 +43,11 @@ pub const Props = struct {
     on_refresh: app.Action,
 };
 
-pub fn update(state: *State, msg: Msg, ctx: *app.Update(DriveSelector)) void {
+pub fn update(state: *State, msg: Msg, ctx: *app.Update(DriveSelector)) !void {
     switch (msg) {
         .choose => |chosen| state.chosen = chosen,
         .toggle_hidden => state.show_hidden = !state.show_hidden,
-        .select => if (selectedIndex(state, ctx.props.*)) |index| ctx.emit(ctx.props.on_select, index),
+        .select => if (selectedIndex(state, ctx.props.*)) |index| try ctx.emit(ctx.props.on_select, index),
     }
 }
 

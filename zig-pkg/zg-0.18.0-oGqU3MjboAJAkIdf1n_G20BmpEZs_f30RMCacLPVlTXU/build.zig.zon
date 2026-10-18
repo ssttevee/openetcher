@@ -1,0 +1,26 @@
+.{
+    .name = .zg,
+    .version = "0.18.0",
+    .dependencies = .{
+        .unicoder = .{
+            .url = "https://github.com/mnemnion/unicoder/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "unicoder-0.2.0-f6uOBUVtAgBvyehq1ESMc6OANLcLDmzejkJ1rMAQ9Azt",
+        },
+    },
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x47df7778dc946aa0,
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "codegen",
+        "data",
+        "LICENSE",
+        "README.md",
+        "NEWS.md",
+        "CONTRIBUTORS.md",
+        "src",
+        "unicode_license",
+        "UNICODE_VERSION.txt",
+    },
+}

@@ -204,15 +204,15 @@ On macOS, `zig build` also builds `openetcher-gui`, a window in the style of bal
 zig build gui
 ```
 
-It needs the [fabrum](../zig-layout) UI framework and its [Quartz renderer](../zig-fabrum-renderer-quartz) checked out next to this repository; they are path dependencies in `build.zig.zon`. Other platforms build without them.
+It needs the [fabrum](../zig-layout) UI framework checked out next to this repository; it is a path dependency in `build.zig.zon`. Its AppKit platform brings the window, the file chooser, the dialogs and the Quartz canvas. Other platforms build without it.
 
-- The image picker offers `.img`, `.iso`, `.raw`, `.bin`, and images compressed with gzip, xz, zstd or bzip2. A compressed image is decoded into the spool when it is chosen, with its progress shown.
+- The image chooser (the system's open panel) offers `.img`, `.iso`, `.raw`, `.bin`, and images compressed with gzip, xz, zstd or bzip2. A compressed image is decoded into the spool when it is chosen, with its progress shown.
 - The target list comes from `listCandidateDisks` with system disks included but hidden until asked for; drives too small for the image can't be chosen. Writing to a drive asks for confirmation first, with a stronger warning for a system drive.
-- While flashing, the progress bar shows the write and then the verification, with speed and time left. Cancel cancels the flash through `std.Io`, which leaves the target synced.
+- While flashing, the progress bar shows the write and then the verification, with speed and time left. Cancel cancels the flash through `std.Io`, which leaves the target synced. Closing the window or quitting mid-flash asks first.
 - The GUI reads progress from the library's `std.Progress` nodes in-process: it starts `std.Progress` with a pipe as its progress parent and decodes the packets itself (`src/app/progress.zig`).
 - Writing to a disk needs the same rights as the CLI. Without them the flash fails with a permission error.
 
-The interface is in `src/app/ui/` as fabrum.app components, tested without a window by `zig build test`. `src/app/platform/macos/` is the AppKit window, and `src/app/services.zig` runs library calls on background tasks.
+The interface is in `src/app/ui/` as fabrum.app components, drawn in Etcher's own look on fabrum's canvas and tested without a window by `zig build test` (the file chooser and the quit dialog answered through fabrum's fake services). `src/app/main.zig` runs it in fabrum's AppKit window, and `src/app/services.zig` runs library calls on background tasks.
 
 Debug builds take two environment variables for development: `OPENETCHER_GUI_FILE_TARGETS`, colon-separated regular files offered as targets, which also refuses writing to anything else; and `OPENETCHER_GUI_SCRIPT`, steps that drive the window and save snapshots of it (see `src/app/main.zig`).
 

@@ -1,0 +1,1 @@
+This software is compatible with Unicode version 18.0.0

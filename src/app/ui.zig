@@ -1,9 +1,10 @@
 //! The OpenEtcher interface: fabrum.app components over a plain model.
 //!
-//! Nothing here touches the window, the renderer or the disk. The shell in
+//! Nothing here touches the window, the renderer or the disk. The GUI in
 //! `main.zig` provides `model.Services` and `model.Icons` to the runtime as
 //! root values; the tests below provide fakes and drive the interface with
-//! `app.testing.Harness`, clicking as a user would.
+//! `app.testing.Harness`, clicking as a user would, and answering the
+//! platform's file chooser and dialogs through its fake services.
 const std = @import("std");
 
 const fabrum = @import("fabrum");
@@ -28,7 +29,6 @@ const Harness = app.testing.Harness(.{}, App);
 /// Records what the interface asked for, so tests can answer as the real
 /// services would.
 const FakeServices = struct {
-    picked: ?app.Handler(?[]u8) = null,
     loads: std.ArrayList(struct { id: u32, path: []const u8 }) = .empty,
     loaded: ?model.ImageHandlers = null,
     unloads: usize = 0,
@@ -48,7 +48,6 @@ const FakeServices = struct {
 
     fn services(self: *FakeServices) model.Services {
         return .{ .ctx = self, .vtable = &.{
-            .pickImage = pickImage,
             .loadImage = loadImage,
             .unloadImage = unloadImage,
             .listDrives = listDrives,
@@ -66,10 +65,6 @@ const FakeServices = struct {
 
     fn get(ctx: *anyopaque) *FakeServices {
         return @ptrCast(@alignCast(ctx));
-    }
-
-    fn pickImage(ctx: *anyopaque, on_picked: app.Handler(?[]u8)) void {
-        get(ctx).picked = on_picked;
     }
 
     fn loadImage(ctx: *anyopaque, id: u32, path: []const u8, handlers: model.ImageHandlers) void {
@@ -113,10 +108,10 @@ const fake_icons: model.Icons = .{ .ctx = undefined, .make = struct {
     }
 }.make };
 
-/// Chooses an image in the file picker and has it load as `size` bytes.
+/// Chooses an image in the file chooser and has it load as `size` bytes.
 fn chooseImage(h: *Harness, fake: *FakeServices, path: []const u8, size: u64) !void {
     try h.click("Flash from file");
-    try h.post(fake.picked.?, @as(?[]u8, try testing.allocator.dupe(u8, path)));
+    try h.chooseFile(path);
     const id = fake.loads.getLast().id;
     try h.post(fake.loaded.?.loaded, model.ImageLoad{ .id = id, .result = .{ .ready = .{ .size = size, .file_size = size, .layout = "mbr" } } });
 }
@@ -147,7 +142,10 @@ test "choosing an image loads it and enables the target step" {
     try testing.expectEqual(0, fake.lists);
 
     try h.click("Flash from file");
-    try h.post(fake.picked.?, @as(?[]u8, try testing.allocator.dupe(u8, "/images/raspios.img.xz")));
+    // the platform's chooser, offering image files
+    try testing.expectEqualStrings("Choose an image to flash", h.tree.file_requests.items[0].message);
+    try testing.expectEqualStrings("xz", h.tree.file_requests.items[0].extensions[5]);
+    try h.chooseFile("/images/raspios.img.xz");
     try testing.expectEqual(1, fake.loads.items.len);
     try testing.expectEqualStrings("/images/raspios.img.xz", fake.loads.items[0].path);
     try h.expectText("raspios.img.xz");
@@ -176,15 +174,15 @@ test "canceling the file picker or a stale load changes nothing" {
     try h.frame();
 
     try h.click("Flash from file");
-    try h.post(fake.picked.?, @as(?[]u8, null));
+    try h.chooseFile(null);
     try testing.expectEqual(null, h.state().image);
 
     try h.click("Flash from file");
-    try h.post(fake.picked.?, @as(?[]u8, try testing.allocator.dupe(u8, "/images/first.img")));
+    try h.chooseFile("/images/first.img");
     try h.click("Remove");
     try testing.expectEqual(1, fake.unloads);
     try h.click("Flash from file");
-    try h.post(fake.picked.?, @as(?[]u8, try testing.allocator.dupe(u8, "/images/second.iso")));
+    try h.chooseFile("/images/second.iso");
     // the first image's result arrives after the second was chosen
     try h.post(fake.loaded.?.loaded, model.ImageLoad{ .id = fake.loads.items[0].id, .result = .{ .failed = error.InvalidImage } });
     try testing.expect(h.state().image.?.status == .loading);
@@ -340,6 +338,39 @@ test "canceling a flash asks the services once and shows how it ended" {
     try h.click("Select target");
     try h.post(fake.listed.?, model.DriveListing{ .failed = error.DiskListFailed });
     try h.expectText("Listing drives failed.");
+}
+
+test "closing or quitting while flashing asks first, in the platform's dialog" {
+    var fake: FakeServices = .{};
+    defer fake.deinit();
+    var h = try fake.harness();
+    defer h.deinit();
+    try h.frame();
+
+    // nothing running: closing goes ahead
+    try testing.expect(try h.requestClose(.quit));
+    try chooseImage(&h, &fake, "/images/os.img", 1000);
+    try h.click("Select target");
+    try answerDrives(&h, &fake, &.{file_target});
+    try h.click("target.img");
+    try h.click("Select");
+    try h.click("Flash!");
+
+    // mid-flash: held for the question; Keep Flashing keeps it
+    try testing.expect(!try h.requestClose(.quit));
+    try testing.expectEqualStrings("Quit while flashing?", h.tree.dialogs.items[0].title);
+    try testing.expectEqual(2, h.tree.dialogs.items[0].buttons.len);
+    try h.answerDialog(0);
+    try testing.expectEqual(0, h.tree.quits);
+    try testing.expect(h.state().flashing());
+    // the window's close button asks the same; Quit quits without asking again
+    try testing.expect(!try h.requestClose(.window));
+    try h.answerDialog(1);
+    try testing.expectEqual(1, h.tree.quits);
+
+    // once the flash is over, nothing holds closing
+    try h.post(fake.flash.?.done, @as(model.FlashOutcome, .canceled));
+    try testing.expect(try h.requestClose(.quit));
 }
 
 test "a failed flash shows why" {

@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 
-    // The GUI renders with Quartz, so it only exists on macOS.
+    // The GUI runs on fabrum's AppKit platform, so it only exists on macOS.
     if (target.result.os.tag == .macos) {
         addGui(b, target, optimize, openetcher_mod, test_step);
     }
@@ -57,8 +57,10 @@ fn addGui(
     openetcher_mod: *std.Build.Module,
     test_step: *std.Build.Step,
 ) void {
+    // fabrum's native platform on macOS is AppKit, with Quartz as its
+    // canvas: the window, the file chooser, the dialogs and the renderer
+    // all come with it
     const fabrum_dep = b.dependency("fabrum", .{ .target = target, .optimize = optimize });
-    const quartz_dep = b.dependency("fabrum_renderer_quartz", .{ .target = target, .optimize = optimize });
     const fabrum_mod = fabrum_dep.module("fabrum");
 
     const gui_mod = b.createModule(.{
@@ -68,17 +70,8 @@ fn addGui(
         .imports = &.{
             .{ .name = "openetcher", .module = openetcher_mod },
             .{ .name = "fabrum", .module = fabrum_mod },
-            .{ .name = "fabrum-renderer-quartz", .module = quartz_dep.module("fabrum-renderer-quartz") },
         },
     });
-    gui_mod.addCSourceFiles(.{
-        .root = b.path("src/app/platform/macos"),
-        .files = &.{"shell.m"},
-        .language = .objective_c,
-        .flags = &.{"-fobjc-arc"},
-    });
-    gui_mod.linkFramework("AppKit", .{});
-    gui_mod.linkFramework("UniformTypeIdentifiers", .{});
 
     const gui = b.addExecutable(.{
         .name = "openetcher-gui",

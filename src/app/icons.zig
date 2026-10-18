@@ -7,8 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const fabrum = @import("fabrum");
-const Quartz = @import("fabrum-renderer-quartz");
-const Picture = Quartz.content.Picture;
+const Picture = fabrum.render.Quartz.content.Picture;
 
 const model = @import("ui.zig").model;
 

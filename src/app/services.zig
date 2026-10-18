@@ -1,6 +1,7 @@
 //! The interface's `model.Services`, done with the openetcher library on
 //! background tasks. Results and progress come back to the runtime as
-//! posted messages.
+//! posted messages. (The image chooser is the platform's own, asked for
+//! by the interface through fabrum.)
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -15,17 +16,6 @@ const progress = @import("progress.zig");
 
 const Services = @This();
 
-/// Shows a file picker; the platform shell implements it.
-pub const Picker = struct {
-    ctx: ?*anyopaque = null,
-    choose: *const fn (ctx: ?*anyopaque, extensions: []const [*:0]const u8, services: *Services) void,
-};
-
-/// File types offered by the picker: raw and ISO images, plain or
-/// compressed with a codec the library decodes. Detection itself is by
-/// content, so this only narrows the list.
-pub const image_extensions = [_][*:0]const u8{ "img", "iso", "raw", "bin", "gz", "xz", "zst", "bz2" };
-
 pub const Options = struct {
     /// Where compressed images are decoded; null uses the library default.
     spool_dir: ?[]const u8 = null,
@@ -38,16 +28,12 @@ pub const Options = struct {
 gpa: Allocator,
 io: Io,
 poster: app.Poster,
-picker: Picker,
 options: Options,
 monitor: progress.Monitor = undefined,
 /// Loading and listing, which may still run at exit.
 tasks: Io.Group = .init,
 /// The flash, kept apart so that canceling it leaves the other tasks be.
 flash_group: Io.Group = .init,
-
-/// Main thread only.
-pick_handler: ?app.Handler(?[]u8) = null,
 
 /// Guards everything below, which background tasks share.
 mutex: Io.Mutex = .init,
@@ -99,7 +85,6 @@ pub fn flashing(self: *Services) bool {
 
 pub fn interface(self: *Services) model.Services {
     return .{ .ctx = self, .vtable = &.{
-        .pickImage = pickImage,
         .loadImage = loadImage,
         .unloadImage = unloadImage,
         .listDrives = listDrives,
@@ -124,22 +109,6 @@ fn lock(self: *Services) void {
 
 fn unlock(self: *Services) void {
     self.mutex.unlock(self.io);
-}
-
-// Picking
-
-fn pickImage(ctx: *anyopaque, on_picked: app.Handler(?[]u8)) void {
-    const self = get(ctx);
-    self.pick_handler = on_picked;
-    self.picker.choose(self.picker.ctx, &image_extensions, self);
-}
-
-/// Called by the picker on the main thread with the chosen path, or null.
-pub fn picked(self: *Services, path: ?[]const u8) void {
-    const handler = self.pick_handler orelse return;
-    self.pick_handler = null;
-    const owned: ?[]u8 = if (path) |p| self.gpa.dupe(u8, p) catch null else null;
-    self.post(handler, owned);
 }
 
 // Loading
