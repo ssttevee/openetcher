@@ -11,7 +11,12 @@
 //!   `click=<label>` and `hover=<label>` move the pointer to the text
 //!   `label` (clicking it), `nsclick=<label>` clicks it with AppKit events
 //!   sent through the window, `wait=<ms>` pauses, `snapshot=<path>` saves the
-//!   window's content as a PNG, and `quit` quits.
+//!   window's content as a PNG (`snapshot2x=` at two pixels per point,
+//!   whatever the screen's scale), and `quit` quits as the menu item would.
+//! - `OPENETCHER_GUI_LAYOUT_FILE`: after every frame, the viewport size and
+//!   the bounds of every text, in points from the top left of the window's
+//!   content, are written to this file, so tests driving the window with
+//!   real input can find what to click.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -38,6 +43,8 @@ const Gui = struct {
     icons_interface: ui.model.Icons,
     /// Set by a script's `image=` step: the next pick answers with it.
     scripted_pick: ?[]const u8 = null,
+    /// From `OPENETCHER_GUI_LAYOUT_FILE`, in debug builds.
+    layout_file: ?[]const u8 = null,
 
     fn props(self: *Gui) ui.App.Props {
         return .{ .services = &self.services_interface, .icons = &self.icons_interface };
@@ -52,7 +59,24 @@ const Gui = struct {
         const quartz_cg: *Quartz.CGContext = @ptrCast(cg);
         quartz_cg.flipCanvas(height);
         self.renderer.render(&commands, quartz_cg) catch |err| std.log.err("render failed: {t}", .{err});
+        if (self.layout_file) |path| {
+            self.saveLayout(path, .init(@floatCast(width), @floatCast(height))) catch |err| std.log.err("saving the layout failed: {t}", .{err});
+        }
         self.afterInput();
+    }
+
+    /// Replaces the file at `path` with the layout of the last frame.
+    fn saveLayout(self: *Gui, path: []const u8, viewport: fabrum.Vec2) !void {
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        try writeLayout(Quartz.content.Text, &out.writer, self.runtime.context(), viewport);
+
+        // readers never see a half-written file
+        var temp_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const temp = try std.fmt.bufPrint(&temp_buffer, "{s}.tmp", .{path});
+        const cwd = Io.Dir.cwd();
+        try cwd.writeFile(self.io, .{ .sub_path = temp, .data = out.written() });
+        try cwd.rename(temp, cwd, path, self.io);
     }
 
     fn mouse(ctx: *anyopaque, x: f64, y: f64, buttons: c_uint, scroll_x: f64, scroll_y: f64) callconv(.c) void {
@@ -112,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
     } else &.{};
 
     var gui: Gui = .{
+        .layout_file = if (builtin.mode == .debug) env.get("OPENETCHER_GUI_LAYOUT_FILE") else null,
         .gpa = gpa,
         .io = io,
         .runtime = undefined,
@@ -168,6 +193,45 @@ fn spoolDir(env: *const std.process.Environ.Map) ?[]const u8 {
     return null;
 }
 
+/// Writes the viewport size and the bounds of every text in `context`, one
+/// tab-separated line each, in points from the top left of the viewport:
+/// `viewport <width> <height>`, then `text <x> <y> <width> <height> <text>`.
+fn writeLayout(comptime Text: type, writer: *Io.Writer, context: *const fabrum.layout.Context, viewport: fabrum.Vec2) Io.Writer.Error!void {
+    try writer.print("viewport\t{d}\t{d}\n", .{ viewport.x, viewport.y });
+    for (context.units.items) |unit| {
+        if (unit.data != .content) continue;
+        const text = Text.asTextContent(unit.data.content) orelse continue;
+        const box = unit.bbox;
+        try writer.print("text\t{d:.1}\t{d:.1}\t{d:.1}\t{d:.1}\t", .{ box.x, box.y, box.w, box.h });
+        for (text.text) |byte| try writer.writeByte(if (byte == '\n' or byte == '\t') ' ' else byte);
+        try writer.writeByte('\n');
+    }
+}
+
+test writeLayout {
+    const TestRuntime = app.Runtime(.{});
+    const Label = struct {
+        pub const State = struct {};
+        pub const Msg = union(enum) {};
+        pub const Props = struct {};
+        pub fn update(_: *State, _: Msg, _: *app.Update(@This())) void {}
+        pub fn view(scope: *app.Scope(@This()), _: *const State, _: Props) !void {
+            try scope.open(null, .{ .layout = .{ .padding = .init(10, 0, 20, 0) } });
+            defer scope.close();
+            try scope.text("Flash!\tnow", .{ .font_size = 10, .line_height = 1 });
+        }
+    };
+
+    var runtime: TestRuntime = try .init(std.testing.allocator, .{ .io = std.testing.io });
+    defer runtime.deinit();
+    _ = try runtime.frame(Label, .{}, .init(800, 480));
+
+    var buffer: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try writeLayout(TestRuntime.Text, &writer, runtime.context(), .init(800, 480));
+    try std.testing.expectEqualStrings("viewport\t800\t480\ntext\t10.0\t20.0\t58.0\t10.0\tFlash! now\n", writer.buffered());
+}
+
 /// Drives the interface from `OPENETCHER_GUI_SCRIPT` in debug builds, with
 /// the same pointer events a user's clicks make.
 const Script = struct {
@@ -218,8 +282,17 @@ const Script = struct {
             var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
             return shell.snapshot(try std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{step["snapshot=".len..]}, 0));
         }
-        if (std.mem.eql(u8, step, "quit")) return shell.quit();
+        if (std.mem.startsWith(u8, step, "snapshot2x=")) {
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            return shell.snapshotScaled(try std.fmt.bufPrintSentinel(&path_buffer, "{s}", .{step["snapshot2x=".len..]}, 0), 2);
+        }
+        // quitting may show an alert, whose modal loop must not hold up the script
+        if (std.mem.eql(u8, step, "quit")) return shell.runOnMain(quitLater, null);
         return error.UnknownStep;
+    }
+
+    fn quitLater(_: ?*anyopaque) callconv(.c) void {
+        shell.quit();
     }
 
     fn click(self: *Script, label: []const u8, press: bool) !void {

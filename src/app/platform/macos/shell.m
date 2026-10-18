@@ -297,3 +297,25 @@ void fabrum_shell_synthesize_click(double x, double y) {
         }
     }
 }
+
+// Like fabrum_shell_snapshot, but at `scale` pixels per point whatever the
+// screen's scale, to check how the content renders on another display.
+bool fabrum_shell_snapshot_scaled(const char *path, double scale) {
+    NSView *view = shared_view;
+    NSSize size = view.bounds.size;
+    NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+                                                                       pixelsWide:(NSInteger)(size.width * scale)
+                                                                       pixelsHigh:(NSInteger)(size.height * scale)
+                                                                    bitsPerSample:8
+                                                                  samplesPerPixel:4
+                                                                         hasAlpha:YES
+                                                                         isPlanar:NO
+                                                                   colorSpaceName:NSDeviceRGBColorSpace
+                                                                      bytesPerRow:0
+                                                                     bitsPerPixel:0];
+    if (!bitmap) return false;
+    bitmap.size = size;
+    [view cacheDisplayInRect:view.bounds toBitmapImageRep:bitmap];
+    NSData *png = [bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+    return [png writeToFile:[NSString stringWithUTF8String:path] atomically:YES];
+}

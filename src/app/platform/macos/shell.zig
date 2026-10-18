@@ -46,6 +46,7 @@ extern fn fabrum_shell_run(options: COptions, host: Host) callconv(.c) noreturn;
 extern fn fabrum_shell_request_frame() callconv(.c) void;
 extern fn fabrum_shell_set_cursor(cursor: c_int) callconv(.c) void;
 extern fn fabrum_shell_quit() callconv(.c) void;
+extern fn fabrum_shell_snapshot_scaled(path: [*:0]const u8, scale: f64) callconv(.c) bool;
 extern fn fabrum_shell_synthesize_click(x: f64, y: f64) callconv(.c) void;
 extern fn fabrum_shell_snapshot(path: [*:0]const u8) callconv(.c) bool;
 extern fn fabrum_shell_run_on_main(callback: *const fn (ctx: ?*anyopaque) callconv(.c) void, ctx: ?*anyopaque) callconv(.c) void;
@@ -121,4 +122,10 @@ pub fn quit() void {
 /// For tests. Main thread only.
 pub fn synthesizeClick(x: f64, y: f64) void {
     fabrum_shell_synthesize_click(x, y);
+}
+
+/// Like `snapshot`, at `scale` pixels per point whatever the screen's
+/// scale. Main thread only.
+pub fn snapshotScaled(path: [:0]const u8, scale: f64) error{SnapshotFailed}!void {
+    if (!fabrum_shell_snapshot_scaled(path, scale)) return error.SnapshotFailed;
 }
