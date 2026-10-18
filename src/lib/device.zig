@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const contract = @import("contract.zig");
+const discovery = @import("device/discovery.zig");
 
 pub const TargetKind = enum {
     regular_file,
@@ -88,52 +89,90 @@ pub const OpenTarget = struct {
     }
 };
 
+/// Which disks `listCandidateDisks` returns. The defaults match what Etcher
+/// offers as targets: removable and external disks.
 pub const ListOptions = struct {
+    /// Include system disks: internal fixed disks, and on Windows the disks
+    /// holding the system folders.
     include_system: bool = false,
+    /// Include virtual disks: disk images, RAM disks, and on macOS the APFS
+    /// containers synthesized on top of a physical disk.
+    include_virtual: bool = false,
+
+    /// Every disk the platform reports, for resolving a user's choice.
+    pub const everything: ListOptions = .{ .include_system = true, .include_virtual = true };
 };
 
 pub const MountPoint = struct {
     path: []const u8,
+    /// The volume name, when the platform reports one.
+    label: ?[]const u8 = null,
 };
 
+pub const PartitionTable = enum { mbr, gpt };
+
+/// A whole disk as discovered by the platform, with the fields Etcher's
+/// drivelist reports.
 pub const CandidateDisk = struct {
+    /// Stable identifier for `--disk-id`, hashed from where the disk attaches
+    /// and what it is.
     id: []const u8,
+    /// The disk's node in the OS's block layer.
     device_path: []const u8,
+    /// The node for unbuffered I/O: `/dev/rdiskN` on macOS, otherwise the
+    /// same as `device_path`.
     raw_path: []const u8,
+    /// What to call the disk: its mount points on Windows, else its path.
     display_name: []const u8,
     description: []const u8,
+    /// The transport, as the platform names it, such as "USB" or "SATA".
+    bus_type: []const u8,
+    /// Where the disk attaches: the IOKit bus path on macOS, the
+    /// `/dev/disk/by-path` link on Linux, the device interface path on
+    /// Windows. Null when the platform does not say.
+    location: ?[]const u8,
     size: u64,
+    /// Physical sector size.
+    block_size: u32,
+    logical_block_size: u32,
+    partition_table: ?PartitionTable,
+    /// Whether `flash` refuses the disk without `--force`: a system disk, or
+    /// one holding the root filesystem.
     protected: bool,
     system: bool,
     removable: bool,
-    mount_points: []MountPoint,
-
-    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        allocator.free(self.id);
-        allocator.free(self.device_path);
-        allocator.free(self.raw_path);
-        allocator.free(self.display_name);
-        allocator.free(self.description);
-        for (self.mount_points) |mount_point| allocator.free(mount_point.path);
-        allocator.free(self.mount_points);
-    }
+    read_only: bool,
+    virtual: bool,
+    /// An SD or MMC card.
+    card: bool,
+    usb: bool,
+    /// Attached through SCSI, SATA, ATA, IDE, or PCI rather than USB or a card
+    /// reader.
+    scsi: bool,
+    /// A RAID set. Only Windows reports these, through the adapter's bus
+    /// type, as drivelist does; `listCandidateDisks` never lists them.
+    raid: bool,
+    mount_points: []const MountPoint,
 };
 
+/// Disks with the arena that holds every string and slice in them.
 pub const CandidateDiskList = struct {
-    items: []CandidateDisk,
+    arena: std.heap.ArenaAllocator.State,
+    items: []const CandidateDisk,
 
     pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        for (self.items) |item| item.deinit(allocator);
-        allocator.free(self.items);
+        self.arena.promote(allocator).deinit();
     }
 };
 
-pub const ResolveDiskIdOptions = struct {
-    include_system: bool = true,
-};
+/// One disk with the arena that holds it.
+pub const OwnedCandidateDisk = struct {
+    arena: std.heap.ArenaAllocator.State,
+    disk: CandidateDisk,
 
-pub const LookupDiskOptions = struct {
-    include_system: bool = true,
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        self.arena.promote(allocator).deinit();
+    }
 };
 
 const platform = switch (builtin.target.os.tag) {
@@ -157,9 +196,10 @@ fn validatePlatform(comptime P: type) void {
     contract.expectFn(P, "openTarget", &.{ Allocator, Io, []const u8 }, OpenTarget);
     contract.expectFn(P, "prepareTargetPath", &.{ Allocator, Io, []const u8 }, void);
     contract.expectFn(P, "prepareTarget", &.{ Allocator, Io, *OpenTarget }, void);
-    contract.expectFn(P, "listCandidateDisks", &.{ Allocator, Io, ListOptions }, CandidateDiskList);
-    contract.expectFn(P, "resolveDiskId", &.{ Allocator, Io, []const u8, ResolveDiskIdOptions }, []u8);
-    contract.expectFn(P, "lookupDiskByPath", &.{ Allocator, Io, []const u8, LookupDiskOptions }, ?CandidateDisk);
+    // Every whole disk, allocated in an arena the caller frees wholesale.
+    contract.expectFn(P, "enumerateDisks", &.{ Allocator, Io }, []CandidateDisk);
+    // The whole disk holding the partition at a path, or the path itself.
+    contract.expectFn(P, "wholeDiskPath", &.{ Allocator, Io, []const u8 }, []const u8);
 
     contract.expectDecls(P, "device backend", &.{"target_io"});
     const T = P.target_io;
@@ -174,9 +214,6 @@ pub const probeTarget = platform.probeTarget;
 pub const openTarget = platform.openTarget;
 pub const prepareTargetPath = platform.prepareTargetPath;
 pub const prepareTarget = platform.prepareTarget;
-pub const listCandidateDisks = platform.listCandidateDisks;
-pub const resolveDiskId = platform.resolveDiskId;
-pub const lookupDiskByPath = platform.lookupDiskByPath;
 /// Platform-provided target operations, chosen at compile time. The flash
 /// engine calls only `writeAt`, `readAt`, and `sync`; alignment, padding, and
 /// syscall strategy live in each platform backend. Callers supply every
@@ -185,3 +222,58 @@ pub const lookupDiskByPath = platform.lookupDiskByPath;
 /// through the caller's `std.Io` with its own offset, so transfers are
 /// cancelable and calls for disjoint chunks may run concurrently.
 pub const target_io = platform.target_io;
+
+const EnumerateError = contract.ErrorSetOf(platform.enumerateDisks);
+
+/// The disks `options` selects, filtered as Etcher's scanner filters
+/// drivelist's output.
+pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: ListOptions) EnumerateError!CandidateDiskList {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const disks = try platform.enumerateDisks(arena.allocator(), io);
+
+    // Filter in place: the arena owns the slice either way.
+    var kept: usize = 0;
+    for (disks) |disk| {
+        if (!discovery.isListed(disk, options)) continue;
+        disks[kept] = disk;
+        kept += 1;
+    }
+    return .{ .arena = arena.state, .items = disks[0..kept] };
+}
+
+/// The disk listed with `disk_id`. Callers get the whole disk rather than
+/// just its path so that they can check it, such as for `protected`,
+/// against the same scan that matched the id.
+pub fn resolveDiskId(allocator: std.mem.Allocator, io: std.Io, disk_id: []const u8, options: ListOptions) (EnumerateError || error{ UnknownDiskId, AmbiguousDiskId })!OwnedCandidateDisk {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const disks = try platform.enumerateDisks(arena.allocator(), io);
+
+    var match: ?CandidateDisk = null;
+    for (disks) |disk| {
+        if (!discovery.isListed(disk, options) or !std.mem.eql(u8, disk.id, disk_id)) continue;
+        if (match != null) return error.AmbiguousDiskId;
+        match = disk;
+    }
+    return .{ .arena = arena.state, .disk = match orelse return error.UnknownDiskId };
+}
+
+/// The disk at `path`, or the disk holding the partition at `path`; null
+/// when `path` is not a listed disk, such as a regular file.
+pub fn lookupDiskByPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: ListOptions) EnumerateError!?OwnedCandidateDisk {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const disks = try platform.enumerateDisks(arena.allocator(), io);
+    // Some backends' `wholeDiskPath` cannot fail; coercing to an error
+    // union lets one `try` serve them all.
+    const whole_path = try @as(EnumerateError![]const u8, platform.wholeDiskPath(arena.allocator(), io, path));
+
+    for (disks) |disk| {
+        if (discovery.isListed(disk, options) and discovery.hasPath(disk, whole_path)) {
+            return .{ .arena = arena.state, .disk = disk };
+        }
+    }
+    arena.deinit();
+    return null;
+}

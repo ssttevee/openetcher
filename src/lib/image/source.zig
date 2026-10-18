@@ -400,7 +400,7 @@ fn createSpoolFile(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) !S
     while (true) : (attempt += 1) {
         var id: [8]u8 = undefined;
         io.random(&id);
-        const path = try std.fmt.allocPrint(allocator, "{s}{c}openetcher-{x:0>16}.spool", .{ dir, std.fs.path.sep, std.mem.readInt(u64, &id, .little) });
+        const path = try std.fmt.allocPrint(allocator, "{s}{c}openetcher-{x:0>16}.spool", .{ dir, std.Io.Dir.path.sep, std.mem.readInt(u64, &id, .little) });
         const file = std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true }) catch |err| {
             allocator.free(path);
             switch (err) {

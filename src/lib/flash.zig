@@ -718,7 +718,7 @@ test "full streaming decodes compressed sources without spooling" {
     defer allocator.free(target_path);
     const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_path);
-    const missing_spool_dir = try std.fs.path.join(allocator, &.{ tmp_path, "missing" });
+    const missing_spool_dir = try std.Io.Dir.path.join(allocator, &.{ tmp_path, "missing" });
     defer allocator.free(missing_spool_dir);
 
     // Planning needs random access and so a spool, which cannot be created.

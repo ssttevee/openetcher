@@ -63,7 +63,7 @@ const ImageArgs = struct {
 const DisksArgs = struct {
     humanize: bool = false,
     json: bool = false,
-    /// Include internal disks.
+    /// Include system and virtual disks.
     all: bool = false,
 
     pub const flag_names = .{ .humanize = "-h" };
@@ -164,7 +164,7 @@ fn plan(context: Context, args: ImageArgs) RunError!void {
 }
 
 fn disks(context: Context, args: DisksArgs) RunError!void {
-    const list = try openetcher.device_api.listCandidateDisks(context.arena, context.io, .{ .include_system = args.all });
+    const list = try openetcher.device_api.listCandidateDisks(context.arena, context.io, if (args.all) .everything else .{});
     defer list.deinit(context.arena);
 
     const disk_views = try output.view([]const output.DiskView, context.arena, list.items);
@@ -181,16 +181,20 @@ fn flash(context: Context, args: FlashArgs) RunError!void {
     const stdout = context.stdout;
     const stderr = context.stderr;
 
-    const target_path = if (args.disk_id) |disk_id|
-        try openetcher.device_api.resolveDiskId(arena, io, disk_id, .{ .include_system = true })
-    else
-        args.device.?; // `FlashArgs.validate` requires one of the two.
+    // A disk id resolves to its disk, whose path the rest of the command
+    // uses, so it lives until the command returns.
+    const chosen = if (args.disk_id) |disk_id| try openetcher.device_api.resolveDiskId(arena, io, disk_id, .everything) else null;
+    defer if (chosen) |owned| owned.deinit(arena);
+    // `FlashArgs.validate` requires a disk id or a device path.
+    const target_path = if (chosen) |owned| owned.disk.device_path else args.device.?;
 
     if (!args.force) {
-        if (try openetcher.device_api.lookupDiskByPath(arena, io, target_path, .{ .include_system = true })) |candidate| {
+        const protected = if (chosen) |owned| owned.disk.protected else protected: {
+            const candidate = try openetcher.device_api.lookupDiskByPath(arena, io, target_path, .everything) orelse break :protected false;
             defer candidate.deinit(arena);
-            if (candidate.protected) return error.ProtectedTargetRequiresForce;
-        }
+            break :protected candidate.disk.protected;
+        };
+        if (protected) return error.ProtectedTargetRequiresForce;
     }
 
     const target_info = try openetcher.device_api.probeTarget(arena, io, target_path);
@@ -295,7 +299,7 @@ const error_texts = [_]ErrorText{
     .{ .errors = error{DestinationTooSmall}, .text = "the target is smaller than the image" },
     .{ .errors = error{UnalignedTargetOffset}, .text = "the image's write plan starts a range inside a sector of the target, which the device cannot write" },
     .{ .errors = error{VerificationFailed}, .text = "verification failed: the target does not read back what was written" },
-    .{ .errors = error{DiskListFailed}, .text = "listing disks failed: `diskutil` reported an error" },
+    .{ .errors = error{DiskListFailed}, .text = "listing disks failed: the system's disk service did not respond" },
     .{ .errors = error{UnmountFailed}, .text = "could not unmount the target disk; close anything using it and retry" },
     .{ .errors = error{ AccessDenied, PermissionDenied }, .text = "permission denied; writing to a disk usually needs administrator rights" },
     .{ .errors = error{FileNotFound}, .text = "file not found" },
@@ -342,7 +346,6 @@ const error_texts = [_]ErrorText{
             NotOpenForReading,
             NotOpenForWriting,
             WouldBlock,
-            Timeout,
             OperationUnsupported,
             FileLocksUnsupported,
             FileSystem,
@@ -353,13 +356,13 @@ const error_texts = [_]ErrorText{
         .show_name = true,
     },
     .{
-        .errors = error{ OutOfMemory, SystemResources, ProcessFdQuotaExceeded, SystemFdQuotaExceeded, ResourceLimitReached, ConcurrencyUnavailable },
+        .errors = error{ OutOfMemory, SystemResources, ProcessFdQuotaExceeded, SystemFdQuotaExceeded, ResourceLimitReached },
         .text = "out of system resources",
         .show_name = true,
     },
     .{
-        .errors = error{ InvalidExe, InvalidBatchScriptArg, InvalidUserId, InvalidProcessGroupId, InvalidName, ProcessAlreadyExec, StreamTooLong },
-        .text = "a helper command (`bzip2` or `diskutil`) could not run",
+        .errors = error{ InvalidExe, InvalidBatchScriptArg, InvalidUserId, InvalidProcessGroupId, InvalidName, ProcessAlreadyExec },
+        .text = "the `bzip2` command could not run",
         .show_name = true,
     },
     .{ .errors = error{Canceled}, .text = "canceled" },
@@ -375,14 +378,11 @@ const error_texts = [_]ErrorText{
 /// other entry must be a member of `CommandError`, so stale or misspelled
 /// entries fail the build too.
 const platform_specific_errors = error{
-    // macOS disk discovery, which runs `diskutil`.
+    // Disk discovery and unmounting.
     UnknownDiskId,
     AmbiguousDiskId,
     DiskListFailed,
     UnmountFailed,
-    Timeout,
-    ConcurrencyUnavailable,
-    StreamTooLong,
     // Raw-device I/O in the POSIX backend.
     InvalidDeviceRead,
     ScratchBufferTooSmall,

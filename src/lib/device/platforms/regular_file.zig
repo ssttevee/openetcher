@@ -38,18 +38,6 @@ pub fn prepareTargetPath(_: std.mem.Allocator, _: std.Io, _: []const u8) !void {
 
 pub fn prepareTarget(_: std.mem.Allocator, _: std.Io, _: *device.OpenTarget) !void {}
 
-pub fn listCandidateDisks(allocator: std.mem.Allocator, _: std.Io, _: device.ListOptions) !device.CandidateDiskList {
-    return .{ .items = try allocator.alloc(device.CandidateDisk, 0) };
-}
-
-pub fn resolveDiskId(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.ResolveDiskIdOptions) ![]u8 {
-    return error.UnsupportedTargetType;
-}
-
-pub fn lookupDiskByPath(_: std.mem.Allocator, _: std.Io, _: []const u8, _: device.LookupDiskOptions) !?device.CandidateDisk {
-    return null;
-}
-
 const target_io_api = @import("target_io.zig");
 
 pub const target_io = target_io_api.positional_only;

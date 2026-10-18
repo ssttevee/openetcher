@@ -54,8 +54,9 @@ pub const flashToPathFromPath = flash.flashToPathFromPath;
 pub const DeviceMountPoint = device.MountPoint;
 pub const DeviceCandidateDisk = device.CandidateDisk;
 pub const DeviceCandidateDiskList = device.CandidateDiskList;
+pub const DeviceOwnedCandidateDisk = device.OwnedCandidateDisk;
+pub const DevicePartitionTable = device.PartitionTable;
 pub const DeviceListOptions = device.ListOptions;
-pub const DeviceResolveDiskIdOptions = device.ResolveDiskIdOptions;
 pub const device_api = device;
 
 test {
@@ -72,6 +73,7 @@ test {
         @import("lib/flash.zig"),
         @import("lib/fault_io.zig"),
         @import("lib/device.zig"),
+        @import("lib/device/discovery.zig"),
         @import("lib/image.zig"),
         @import("lib/image/source.zig"),
         @import("lib/image/reader.zig"),

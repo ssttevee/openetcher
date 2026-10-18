@@ -110,10 +110,21 @@ pub const DiskView = struct {
     raw: []const u8,
     display_name: []const u8,
     description: []const u8,
+    bus_type: []const u8,
+    location: ?[]const u8,
     size: Bytes,
+    block_size: Bytes,
+    logical_block_size: Bytes,
+    partition_table: ?openetcher.DevicePartitionTable,
     protected: bool,
     system: bool,
     removable: bool,
+    read_only: bool,
+    virtual: bool,
+    card: bool,
+    usb: bool,
+    scsi: bool,
+    raid: bool,
     mountpoints: []const openetcher.DeviceMountPoint,
 
     pub const source_names = .{ .device = "device_path", .raw = "raw_path", .mountpoints = "mount_points" };
@@ -243,7 +254,10 @@ pub fn writeDisksText(writer: *Writer, disks: []const DiskView, all: bool, human
         try writeFields(writer, disk, humanize, .{ .prefix = "   ", .skip = &.{ "device", "display_name", "mountpoints" } });
         try writer.writeAll("   mountpoints:");
         if (disk.mountpoints.len == 0) try writer.writeAll(" none");
-        for (disk.mountpoints) |mount_point| try writer.print(" {s}", .{mount_point.path});
+        for (disk.mountpoints) |mount_point| {
+            try writer.print(" {s}", .{mount_point.path});
+            if (mount_point.label) |text| try writer.print(" ({s})", .{text});
+        }
         try writer.writeByte('\n');
     }
 }

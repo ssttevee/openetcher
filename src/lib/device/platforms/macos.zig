@@ -1,441 +1,412 @@
+//! macOS backend. Disks are discovered and unmounted through DiskArbitration,
+//! the way Etcher does through drivelist and mountutils, and raw devices are
+//! sized with the disk ioctls, so nothing runs `diskutil`.
+
 const std = @import("std");
 
-const regular_file = @import("regular_file.zig");
 const device = @import("../../device.zig");
+const discovery = @import("../discovery.zig");
+const da = @import("macos/disk_arbitration.zig");
+const posix_device = @import("posix_device.zig");
+const target_io_api = @import("target_io.zig");
 
-const ListDisk = struct {
-    id: []const u8,
-    device_path: []const u8,
-    raw_path: []const u8,
-    description: []const u8,
-    size: u64,
-    protected: bool,
-    system: bool,
-    removable: bool,
-    mount_points: []device.MountPoint,
+pub const target_io = target_io_api.posix;
 
-    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-        allocator.free(self.id);
-        allocator.free(self.device_path);
-        allocator.free(self.raw_path);
-        allocator.free(self.description);
-        for (self.mount_points) |mount_point| allocator.free(mount_point.path);
-        allocator.free(self.mount_points);
+const backend = posix_device.Backend(struct {
+    pub const accepts_character_devices = true;
+    pub const geometry = diskGeometry;
+    pub const resolvedPath = rawDevicePath;
+    pub const unmountDiskAt = unmountDisk;
+});
+
+pub const probeTarget = backend.probeTarget;
+pub const openTarget = backend.openTarget;
+pub const prepareTargetPath = backend.prepareTargetPath;
+pub const prepareTarget = backend.prepareTarget;
+
+pub fn enumerateDisks(arena: std.mem.Allocator, io: std.Io) discovery.ListError![]device.CandidateDisk {
+    const session = da.DASessionCreate(null) orelse return error.DiskListFailed;
+    defer da.CFRelease(session);
+    return (try scan(arena, io, session)).items(.disk);
+}
+
+/// The whole disk holding `path`, after following symlinks, so that a link
+/// to a disk is matched, and refused when protected, as the disk itself.
+pub fn wholeDiskPath(arena: std.mem.Allocator, io: std.Io, path: []const u8) error{ Canceled, OutOfMemory }![]const u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    return arena.dupe(u8, wholeDiskOf(try canonicalPath(io, path, &buffer)));
+}
+
+/// `path` with symlinks resolved, in `buffer`; `path` itself when it does
+/// not resolve, as for a node that has gone away.
+fn canonicalPath(io: std.Io, path: []const u8, buffer: *[std.Io.Dir.max_path_bytes]u8) error{Canceled}![]const u8 {
+    const len = std.Io.Dir.cwd().realPathFile(io, path, buffer) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return path,
+    };
+    return buffer[0..len];
+}
+
+/// For a disk node, `/dev/diskN` or `/dev/rdiskN` with any partition suffix,
+/// the node of the whole disk; any other path unchanged.
+fn wholeDiskOf(path: []const u8) []const u8 {
+    const prefix = if (std.mem.startsWith(u8, path, "/dev/r")) "/dev/r" else "/dev/";
+    const name = std.mem.cutPrefix(u8, path, prefix) orelse return path;
+    const parent = parentName(name) orelse return path;
+    return path[0 .. prefix.len + parent.len];
+}
+
+/// The node to write for the device at `path`: for a disk node, or a link
+/// to one, the unbuffered `/dev/rdisk` node.
+fn rawDevicePath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) error{ Canceled, OutOfMemory }![]u8 {
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const canonical = try canonicalPath(io, path, &buffer);
+    const name = std.mem.cutPrefix(u8, canonical, "/dev/") orelse return allocator.dupe(u8, canonical);
+    if (parentName(name) == null) return allocator.dupe(u8, canonical);
+    return rawNodePath(allocator, name);
+}
+
+/// `/dev/rdiskN` for the BSD name `diskN`: the unbuffered node, which is
+/// much faster for whole-disk writes.
+fn rawNodePath(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(allocator, "/dev/r{s}", .{name});
+}
+
+/// `_IOR('d', nr, T)` from `<sys/disk.h>`.
+fn diskIoctl(comptime nr: u8, comptime T: type) c_int {
+    const ioc_out: u32 = 0x40000000;
+    return @bitCast(ioc_out | (@as(u32, @sizeOf(T)) << 16) | (@as(u32, 'd') << 8) | nr);
+}
+
+const DKIOCGETBLOCKSIZE = diskIoctl(24, u32);
+const DKIOCGETBLOCKCOUNT = diskIoctl(25, u64);
+
+fn diskGeometry(fd: std.posix.fd_t) ?posix_device.Geometry {
+    var block_size: u32 = 0;
+    var block_count: u64 = 0;
+    if (std.c.ioctl(fd, DKIOCGETBLOCKSIZE, &block_size) != 0) return null;
+    if (std.c.ioctl(fd, DKIOCGETBLOCKCOUNT, &block_count) != 0) return null;
+    if (block_size == 0 or !std.math.isPowerOfTwo(block_size)) return null;
+    const size = std.math.mul(u64, block_count, block_size) catch return null;
+    return .{ .size = size, .block_size = block_size };
+}
+
+/// A whole disk as DiskArbitration describes it. `scan` returns these as a
+/// `MultiArrayList`, so the disks are contiguous and `enumerateDisks` can
+/// return them without copying.
+const Whole = struct {
+    name: [:0]const u8,
+    disk: device.CandidateDisk,
+    /// The index of the physical disk this APFS container's volumes were
+    /// credited to, as drivelist's `handleApfs` does.
+    folded_into: ?usize,
+};
+
+/// A whole disk while `scan` collects its volumes.
+const Pending = struct {
+    name: [:0]const u8,
+    unit: u32,
+    description: da.Description,
+    location: ?[]const u8,
+    media_name: []const u8,
+    protocol: []const u8,
+    mount_points: std.ArrayList(device.MountPoint) = .empty,
+    folded_into: ?usize = null,
+
+    fn lessThan(_: void, a: Pending, b: Pending) bool {
+        return a.unit < b.unit;
+    }
+
+    /// An APFS container, which appears as a whole disk of its own on top
+    /// of the physical disk holding it.
+    fn isApfsContainer(self: Pending) bool {
+        return std.mem.eql(u8, self.media_name, "AppleAPFSMedia");
+    }
+
+    fn isVirtual(self: Pending) bool {
+        return std.mem.eql(u8, self.protocol, "Virtual Interface");
+    }
+
+    /// Adds the volume DiskArbitration reports mounted on `node`, if any.
+    fn addVolume(self: *Pending, arena: std.mem.Allocator, node: da.Dictionary) std.mem.Allocator.Error!void {
+        const path = try node.path(arena, da.kDADiskDescriptionVolumePathKey) orelse return;
+        try self.mount_points.append(arena, .{
+            .path = path,
+            .label = try node.string(arena, da.kDADiskDescriptionVolumeNameKey),
+        });
     }
 };
 
-pub fn probeTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !device.TargetInfo {
-    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false }) catch {
-        return regular_file.probeTarget(allocator, io, path);
-    };
-    defer file.close(io);
+/// A partition or APFS volume node, such as `disk3s1s1`.
+const Partition = struct {
+    name: [:0]const u8,
+    /// Its whole disk, such as `disk3`.
+    whole: []const u8,
+};
 
-    const stat = try file.stat(io);
-    if (stat.kind == .file) return regular_file.probeTarget(allocator, io, path);
-    if (stat.kind != .block_device and stat.kind != .character_device) return error.UnsupportedTargetType;
-
-    const resolved_path = try resolveDevicePath(allocator, path);
-    errdefer allocator.free(resolved_path);
-
-    const size = (try macosDiskSize(allocator, io, resolved_path)) orelse return error.UnsupportedTargetType;
-    const kind = if (stat.kind == .block_device) device.TargetKind.block_device else device.TargetKind.character_device;
-
-    return .{
-        .requested_path = path,
-        .resolved_path = resolved_path,
-        .capabilities = .{
-            .kind = kind,
-            .size = size,
-            .read_alignment = 512,
-            .write_alignment = 512,
-            .optimal_io_size = 1024 * 1024,
-            .access_pattern = .positional,
-            .supports_verify_reads = true,
-        },
-    };
-}
-
-pub fn openTarget(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !device.OpenTarget {
-    const info = try probeTarget(allocator, io, path);
-    errdefer info.deinit(allocator);
-
-    return .{
-        .file = try std.Io.Dir.cwd().openFile(io, info.resolved_path, .{ .mode = .read_write, .allow_directory = false }),
-        .info = info,
-    };
-}
-
-pub fn prepareTargetPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const info = try probeTarget(allocator, io, path);
-    defer info.deinit(allocator);
-    if (!info.capabilities.isDevice()) return;
-    try unmountDisk(allocator, io, info.resolved_path);
-}
-
-pub fn prepareTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.OpenTarget) !void {
-    if (!target.info.capabilities.isDevice()) return;
-    try unmountDisk(allocator, io, target.info.resolved_path);
-}
-
-pub fn listCandidateDisks(allocator: std.mem.Allocator, io: std.Io, options: device.ListOptions) !device.CandidateDiskList {
-    const argv: []const []const u8 = if (options.include_system)
-        &.{ "diskutil", "list", "physical" }
-    else
-        &.{ "diskutil", "list", "external", "physical" };
-
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv,
-        .stdout_limit = .limited(1024 * 64),
-        .stderr_limit = .limited(16 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.DiskListFailed,
-        else => return error.DiskListFailed,
-    }
-
-    var identifiers: std.ArrayList([]const u8) = .empty;
-    defer identifiers.deinit(allocator);
-    try parseDiskIdentifiers(allocator, &identifiers, result.stdout);
-
-    var disks: std.ArrayList(device.CandidateDisk) = .empty;
-    errdefer {
-        for (disks.items) |disk| disk.deinit(allocator);
-        disks.deinit(allocator);
-    }
-
-    for (identifiers.items) |identifier| {
-        defer allocator.free(identifier);
-
-        const disk = try queryDisk(allocator, io, identifier);
-        errdefer disk.deinit(allocator);
-        if (!options.include_system and disk.system) {
-            disk.deinit(allocator);
-            continue;
+/// Every whole disk with its mount points, in unit order. Drivelist learns
+/// the disk names from DiskArbitration's appeared callbacks within a fixed
+/// 50 ms window; reading them from `/dev` finds the same disks without
+/// depending on timing.
+fn scan(arena: std.mem.Allocator, io: std.Io, session: da.DASessionRef) discovery.ListError!std.MultiArrayList(Whole).Slice {
+    var pending: std.ArrayList(Pending) = .empty;
+    defer for (pending.items) |whole| whole.description.release();
+    var partitions: std.ArrayList(Partition) = .empty;
+    {
+        var dev = std.Io.Dir.openDirAbsolute(io, "/dev", .{ .iterate = true }) catch |err| return discovery.listFailure(err);
+        defer dev.close(io);
+        var entries = dev.iterate();
+        while (entries.next(io) catch |err| return discovery.listFailure(err)) |entry| {
+            const whole_name = parentName(entry.name) orelse continue;
+            const name = try arena.dupeSentinel(u8, entry.name, 0);
+            if (whole_name.len != name.len) {
+                try partitions.append(arena, .{ .name = name, .whole = name[0..whole_name.len] });
+                continue;
+            }
+            const unit = std.fmt.parseInt(u32, name["disk".len..], 10) catch continue;
+            const description = copyDescription(session, name) orelse continue;
+            // Until it is in `pending`, whose items the outer defer releases.
+            errdefer description.release();
+            const fields = description.dictionary;
+            try pending.append(arena, .{
+                .name = name,
+                .unit = unit,
+                .description = description,
+                .location = try fields.string(arena, da.kDADiskDescriptionBusPathKey),
+                .media_name = try fields.string(arena, da.kDADiskDescriptionMediaNameKey) orelse "",
+                .protocol = try fields.string(arena, da.kDADiskDescriptionDeviceProtocolKey) orelse "",
+            });
         }
+    }
+    std.mem.sort(Pending, pending.items, {}, Pending.lessThan);
 
-        try disks.append(allocator, .{
-            .id = disk.id,
-            .device_path = disk.device_path,
-            .raw_path = disk.raw_path,
-            .display_name = try allocator.dupe(u8, disk.device_path),
-            .description = disk.description,
-            .size = disk.size,
-            .protected = disk.protected,
-            .system = disk.system,
-            .removable = disk.removable,
-            .mount_points = disk.mount_points,
+    // A volume can sit on the whole disk itself or on any partition of it,
+    // including APFS snapshots such as `disk3s1s1`.
+    for (pending.items) |*whole| try whole.addVolume(arena, whole.description.dictionary);
+    for (partitions.items) |partition| {
+        const owner = for (pending.items) |*whole| {
+            if (std.mem.eql(u8, whole.name, partition.whole)) break whole;
+        } else continue;
+        const description = copyDescription(session, partition.name) orelse continue;
+        defer description.release();
+        try owner.addVolume(arena, description.dictionary);
+    }
+
+    // An APFS container's volumes belong to the physical disk behind it,
+    // which drivelist finds by a shared bus path.
+    for (pending.items) |*container| {
+        if (!container.isApfsContainer()) continue;
+        const location = container.location orelse continue;
+        for (pending.items, 0..) |*physical, index| {
+            if (physical.isApfsContainer() or physical.isVirtual()) continue;
+            if (!std.mem.eql(u8, physical.location orelse continue, location)) continue;
+            try physical.mount_points.appendSlice(arena, container.mount_points.items);
+            container.folded_into = index;
+            break;
+        }
+    }
+
+    // One key for every disk's icon lookup, rather than one per disk.
+    const icon_file_key = da.CFStringCreateWithCString(null, "IOBundleResourceFile", da.kCFStringEncodingUTF8) orelse return error.OutOfMemory;
+    defer da.CFRelease(icon_file_key);
+
+    var wholes: std.MultiArrayList(Whole) = .empty;
+    try wholes.ensureTotalCapacity(arena, pending.items.len);
+    for (pending.items) |source| {
+        wholes.appendAssumeCapacity(.{
+            .name = source.name,
+            .folded_into = source.folded_into,
+            .disk = try describe(arena, source, icon_file_key),
         });
     }
-
-    return .{ .items = try disks.toOwnedSlice(allocator) };
+    return wholes.slice();
 }
 
-pub fn resolveDiskId(allocator: std.mem.Allocator, io: std.Io, disk_id: []const u8, options: device.ResolveDiskIdOptions) ![]u8 {
-    const disks = try listCandidateDisks(allocator, io, .{ .include_system = options.include_system });
-    defer disks.deinit(allocator);
-
-    var match: ?[]const u8 = null;
-    for (disks.items) |disk| {
-        if (!std.mem.eql(u8, disk.id, disk_id)) continue;
-        if (match != null) return error.AmbiguousDiskId;
-        match = disk.device_path;
-    }
-
-    const resolved = match orelse return error.UnknownDiskId;
-    return allocator.dupe(u8, resolved);
+fn copyDescription(session: da.DASessionRef, name: [:0]const u8) ?da.Description {
+    const disk = da.DADiskCreateFromBSDName(null, session, name) orelse return null;
+    defer da.CFRelease(disk);
+    return da.Description.copy(disk);
 }
 
-pub fn lookupDiskByPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options: device.LookupDiskOptions) !?device.CandidateDisk {
-    const disks = try listCandidateDisks(allocator, io, .{ .include_system = options.include_system });
-    defer disks.deinit(allocator);
+const partition_tables: std.StaticStringMap(device.PartitionTable) = .initComptime(.{
+    .{ "GUID_partition_scheme", .gpt },
+    .{ "FDisk_partition_scheme", .mbr },
+});
 
-    const canonical_path = canonicalDiskPath(allocator, path) catch return null;
-    defer allocator.free(canonical_path);
+/// Protocols drivelist counts as SCSI: anything wired in rather than USB
+/// or a card reader.
+const scsi_protocols: std.StaticStringMap(void) = .initComptime(.{
+    .{"SATA"}, .{"SCSI"}, .{"ATA"}, .{"IDE"}, .{"PCI"},
+});
 
-    const raw_path = if (std.mem.startsWith(u8, canonical_path, "/dev/disk"))
-        try std.fmt.allocPrint(allocator, "/dev/r{s}", .{canonical_path[5..]})
-    else
-        try allocator.dupe(u8, canonical_path);
-    defer allocator.free(raw_path);
+/// Drivelist's `CreateDeviceDescriptorFromDiskDescription`.
+fn describe(arena: std.mem.Allocator, whole: Pending, icon_file_key: da.CFStringRef) std.mem.Allocator.Error!device.CandidateDisk {
+    const fields = whole.description.dictionary;
+    const size = fields.number(da.kDADiskDescriptionMediaSizeKey) orelse 0;
+    const block_size: u32 = std.math.cast(u32, fields.number(da.kDADiskDescriptionMediaBlockSizeKey) orelse 512) orelse 512;
+    const removable = fields.boolean(da.kDADiskDescriptionMediaRemovableKey);
+    const system = fields.boolean(da.kDADiskDescriptionDeviceInternalKey) and !removable;
+    const content = try fields.string(arena, da.kDADiskDescriptionMediaContentKey) orelse "";
+    const media_path = try fields.string(arena, da.kDADiskDescriptionMediaPathKey) orelse whole.name;
+    const device_path = try std.fmt.allocPrint(arena, "/dev/{s}", .{whole.name});
+    const mount_points = whole.mount_points.items;
 
-    for (disks.items) |disk| {
-        if (!std.mem.eql(u8, disk.device_path, canonical_path) and !std.mem.eql(u8, disk.raw_path, raw_path)) continue;
-
-        return .{
-            .id = try allocator.dupe(u8, disk.id),
-            .device_path = try allocator.dupe(u8, disk.device_path),
-            .raw_path = try allocator.dupe(u8, disk.raw_path),
-            .display_name = try allocator.dupe(u8, disk.display_name),
-            .description = try allocator.dupe(u8, disk.description),
-            .size = disk.size,
-            .protected = disk.protected,
-            .system = disk.system,
-            .removable = disk.removable,
-            .mount_points = try dupMountPoints(allocator, disk.mount_points),
-        };
-    }
-
-    return null;
+    return .{
+        .id = try discovery.diskId(arena, "macos", &.{ whole.protocol, whole.media_name, media_path }, size),
+        .device_path = device_path,
+        .raw_path = try rawNodePath(arena, whole.name),
+        .display_name = try discovery.displayName(arena, device_path, mount_points),
+        .description = whole.media_name,
+        .bus_type = whole.protocol,
+        .location = whole.location,
+        .size = size,
+        .block_size = block_size,
+        .logical_block_size = block_size,
+        .partition_table = partition_tables.get(content),
+        .protected = discovery.isProtected(system, mount_points),
+        .system = system,
+        .removable = removable or fields.boolean(da.kDADiskDescriptionMediaEjectableKey),
+        .read_only = !fields.boolean(da.kDADiskDescriptionMediaWritableKey),
+        .virtual = whole.isVirtual() or whole.folded_into != null,
+        .card = try isCard(arena, fields, icon_file_key),
+        .usb = std.mem.eql(u8, whole.protocol, "USB"),
+        .scsi = scsi_protocols.has(whole.protocol),
+        // Drivelist reports RAID only through Windows bus types.
+        .raid = false,
+        .mount_points = mount_points,
+    };
 }
 
-fn resolveDevicePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (!std.mem.startsWith(u8, path, "/dev/disk")) return allocator.dupe(u8, path);
-    return std.fmt.allocPrint(allocator, "/dev/r{s}", .{path[5..]});
+/// Built-in SD readers give their media the SD card icon. External readers
+/// use the generic removable icon, so drivelist cannot tell them from other
+/// USB disks, and neither can this.
+fn isCard(arena: std.mem.Allocator, fields: da.Dictionary, icon_file_key: da.CFStringRef) std.mem.Allocator.Error!bool {
+    const icon = fields.dictionary(da.kDADiskDescriptionMediaIconKey) orelse return false;
+    const file = try icon.string(arena, icon_file_key) orelse return false;
+    return std.mem.eql(u8, file, "SD.icns");
 }
 
-fn macosDiskSize(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?u64 {
-    if (!std.mem.startsWith(u8, path, "/dev/")) return null;
-
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "diskutil", "info", path },
-        .stdout_limit = .limited(1024 * 64),
-        .stderr_limit = .limited(0),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) return null,
-        else => return null,
-    }
-
-    return parseDiskutilSize(result.stdout);
+/// For a BSD disk name, `diskN` for itself or any partition or snapshot of
+/// it (`diskNsM`, `diskNsMsK`); null for other names.
+fn parentName(name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, "disk")) return null;
+    const end = std.mem.indexOfNonePos(u8, name, 4, "0123456789") orelse name.len;
+    if (end == 4) return null;
+    if (end != name.len and name[end] != 's') return null;
+    return name[0..end];
 }
 
+/// Unmounts every volume on the disk at `path`, including the volumes of APFS
+/// containers synthesized on it, with DiskArbitration's whole-disk forced
+/// unmount, as mountutils does for Etcher.
 fn unmountDisk(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const whole_disk_path = canonicalDiskPath(allocator, path) catch return error.UnmountFailed;
-    defer allocator.free(whole_disk_path);
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "diskutil", "unmountDisk", whole_disk_path },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    // Only a node in /dev names a disk. Anything else, such as a file that
+    // merely shares a disk's name, must not select one to force-unmount.
+    const whole_path = try wholeDiskPath(arena, io, path);
+    const node = std.mem.cutPrefix(u8, whole_path, "/dev/") orelse return error.UnmountFailed;
+    const name = if (std.mem.startsWith(u8, node, "rdisk")) node[1..] else node;
 
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.UnmountFailed,
+    const session = da.DASessionCreate(null) orelse return error.UnmountFailed;
+    defer da.CFRelease(session);
+    const wholes = try scan(arena, io, session);
+    const names = wholes.items(.name);
+    const target = for (names, 0..) |whole_name, index| {
+        if (std.mem.eql(u8, whole_name, name)) break index;
+    } else return error.UnmountFailed;
+
+    for (names, wholes.items(.folded_into)) |whole_name, folded_into| {
+        if (folded_into == target) try unmountWhole(io, session, whole_name);
+    }
+    try unmountWhole(io, session, names[target]);
+}
+
+fn onUnmounted(_: da.DADiskRef, dissenter: ?da.DADissenterRef, context: ?*anyopaque) callconv(.c) void {
+    const status: *?da.DAReturn = @ptrCast(@alignCast(context.?));
+    status.* = if (dissenter) |d| da.DADissenterGetStatus(d) else .success;
+    da.CFRunLoopStop(da.CFRunLoopGetCurrent());
+}
+
+/// How long to wait for DiskArbitration to report on an unmount, which waits
+/// for every volume's filesystem to flush.
+const unmount_timeout_seconds = 30;
+
+fn unmountWhole(io: std.Io, session: da.DASessionRef, name: [:0]const u8) error{ UnmountFailed, AccessDenied, Canceled }!void {
+    const disk = da.DADiskCreateFromBSDName(null, session, name) orelse return error.UnmountFailed;
+    defer da.CFRelease(disk);
+
+    const run_loop = da.CFRunLoopGetCurrent();
+    da.DASessionScheduleWithRunLoop(session, run_loop, da.kCFRunLoopDefaultMode);
+    // Unscheduling also keeps a callback that arrives after a cancelation
+    // from writing to `status` once this frame is gone: callbacks are only
+    // delivered while the session is scheduled.
+    defer da.DASessionUnscheduleFromRunLoop(session, run_loop, da.kCFRunLoopDefaultMode);
+
+    var status: ?da.DAReturn = null;
+    da.DADiskUnmount(disk, da.kDADiskUnmountOptionWhole | da.kDADiskUnmountOptionForce, onUnmounted, &status);
+    // The callback can run before the loop does, so check before each turn;
+    // a turn ends at the callback's stop or after half a second. A cancel
+    // stops the wait, though not the unmount DiskArbitration has started.
+    var turns: usize = 0;
+    while (status == null and turns < unmount_timeout_seconds * 2) : (turns += 1) {
+        try io.checkCancel();
+        _ = da.CFRunLoopRunInMode(da.kCFRunLoopDefaultMode, 0.5, 0);
+    }
+
+    switch (status orelse return error.UnmountFailed) {
+        .success, .not_mounted => {},
+        .not_permitted, .not_privileged => return error.AccessDenied,
         else => return error.UnmountFailed,
     }
 }
 
-fn canonicalDiskPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.mem.startsWith(u8, path, "/dev/rdisk")) {
-        return std.fmt.allocPrint(allocator, "/dev/disk{s}", .{path[10..]});
-    }
-    if (std.mem.startsWith(u8, path, "/dev/disk")) {
-        return allocator.dupe(u8, path);
-    }
-    return error.UnsupportedTargetType;
+test "parentName maps partitions and snapshots to their whole disk" {
+    try std.testing.expectEqualStrings("disk3", parentName("disk3").?);
+    try std.testing.expectEqualStrings("disk3", parentName("disk3s1s1").?);
+    try std.testing.expectEqualStrings("disk12", parentName("disk12s2").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), parentName("diskutil"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parentName("disk"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parentName("rdisk3"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parentName("disk3x"));
 }
 
-fn parseDiskutilSize(output: []const u8) ?u64 {
-    const marker = "Disk Size:";
-    const marker_index = std.mem.indexOf(u8, output, marker) orelse return null;
-    const tail = output[marker_index + marker.len ..];
-    const open_paren = std.mem.indexOfScalar(u8, tail, '(') orelse return null;
-    const after_open = tail[open_paren + 1 ..];
-    const close_paren = std.mem.indexOfScalar(u8, after_open, ')') orelse return null;
-    const paren_text = after_open[0..close_paren];
-    const space_index = std.mem.indexOfScalar(u8, paren_text, ' ') orelse return null;
-    const bytes_text = std.mem.trim(u8, paren_text[0..space_index], " ");
-    return std.fmt.parseInt(u64, bytes_text, 10) catch null;
+test "wholeDiskPath strips partition suffixes from either node" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    // Nodes that do not exist keep their path and still lose the suffix.
+    try std.testing.expectEqualStrings("/dev/disk999", try wholeDiskPath(arena.allocator(), io, "/dev/disk999s1"));
+    try std.testing.expectEqualStrings("/dev/rdisk999", try wholeDiskPath(arena.allocator(), io, "/dev/rdisk999s2s1"));
+    try std.testing.expectEqualStrings("/dev/rdisk999", try wholeDiskPath(arena.allocator(), io, "/dev/rdisk999"));
+    try std.testing.expectEqualStrings("image.img", try wholeDiskPath(arena.allocator(), io, "image.img"));
+    try std.testing.expectEqualStrings("/dev/diskutil", wholeDiskOf("/dev/diskutil"));
 }
 
-fn parseDiskIdentifiers(allocator: std.mem.Allocator, identifiers: *std.ArrayList([]const u8), output: []const u8) !void {
-    var lines = std.mem.tokenizeScalar(u8, output, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, trimmed, "/dev/disk")) continue;
-        const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
-        try identifiers.append(allocator, try allocator.dupe(u8, trimmed[0..end]));
-    }
+test "a symlink to a disk resolves to the disk" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Every Mac has disk0, and resolving a link to it needs no access to it.
+    try tmp.dir.symLink(io, "/dev/disk0", "disk", .{});
+    try tmp.dir.symLink(io, "/dev/rdisk0", "raw", .{});
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const link = try std.Io.Dir.path.join(arena.allocator(), &.{ dir_path, "disk" });
+    const raw_link = try std.Io.Dir.path.join(arena.allocator(), &.{ dir_path, "raw" });
+
+    try std.testing.expectEqualStrings("/dev/disk0", try wholeDiskPath(arena.allocator(), io, link));
+    try std.testing.expectEqualStrings("/dev/rdisk0", try wholeDiskPath(arena.allocator(), io, raw_link));
+    try std.testing.expectEqualStrings("/dev/rdisk0", try rawDevicePath(arena.allocator(), io, link));
+    try std.testing.expectEqualStrings("/dev/rdisk0", try rawDevicePath(arena.allocator(), io, raw_link));
 }
 
-fn queryDisk(allocator: std.mem.Allocator, io: std.Io, device_path: []const u8) !ListDisk {
-    const result = try std.process.run(allocator, io, .{
-        .argv = &.{ "diskutil", "info", device_path },
-        .stdout_limit = .limited(1024 * 64),
-        .stderr_limit = .limited(16 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.DiskListFailed,
-        else => return error.DiskListFailed,
-    }
-
-    return parseDiskInfo(allocator, device_path, result.stdout);
+test "disk ioctl numbers match <sys/disk.h>" {
+    try std.testing.expectEqual(@as(c_int, 0x40046418), DKIOCGETBLOCKSIZE);
+    try std.testing.expectEqual(@as(c_int, 0x40086419), DKIOCGETBLOCKCOUNT);
 }
-
-fn parseDiskInfo(allocator: std.mem.Allocator, fallback_device_path: []const u8, output: []const u8) !ListDisk {
-    const device_path = try allocator.dupe(u8, fieldValue(output, "Device Node:") orelse fallback_device_path);
-    errdefer allocator.free(device_path);
-
-    const raw_path = if (std.mem.startsWith(u8, device_path, "/dev/disk"))
-        try std.fmt.allocPrint(allocator, "/dev/r{s}", .{device_path[5..]})
-    else
-        try allocator.dupe(u8, device_path);
-    errdefer allocator.free(raw_path);
-
-    const description = try allocator.dupe(u8, fieldValue(output, "Device / Media Name:") orelse fieldValue(output, "Media Name:") orelse "unknown");
-    errdefer allocator.free(description);
-
-    const size = parseDiskutilSize(output) orelse return error.DiskListFailed;
-    const location = fieldValue(output, "Device Location:") orelse "Unknown";
-    const removable_media = fieldValue(output, "Removable Media:") orelse "Unknown";
-    const os_installable = fieldValue(output, "OS Can Be Installed:") orelse "No";
-    const protocol = fieldValue(output, "Protocol:") orelse "Unknown";
-    const media_name = fieldValue(output, "Media Name:") orelse description;
-    const tree_path = fieldValue(output, "DeviceTreePath:") orelse fieldValue(output, "Device Tree Path:") orelse "unknown-path";
-
-    var mount_points: std.ArrayList(device.MountPoint) = .empty;
-    errdefer {
-        for (mount_points.items) |mount_point| allocator.free(mount_point.path);
-        mount_points.deinit(allocator);
-    }
-
-    const disk_id = try makeDiskId(allocator, protocol, media_name, size, tree_path);
-    errdefer allocator.free(disk_id);
-
-    if (fieldValue(output, "Mount Point:")) |mount_point| {
-        if (!std.mem.eql(u8, mount_point, "Not applicable (no file system)") and mount_point.len != 0) {
-            try mount_points.append(allocator, .{ .path = try allocator.dupe(u8, mount_point) });
-        }
-    }
-
-    return .{
-        .id = disk_id,
-        .device_path = device_path,
-        .raw_path = raw_path,
-        .description = description,
-        .size = size,
-        .protected = std.mem.eql(u8, location, "Internal") or std.mem.eql(u8, os_installable, "Yes"),
-        .system = std.mem.eql(u8, location, "Internal") or std.mem.eql(u8, os_installable, "Yes"),
-        .removable = std.mem.eql(u8, removable_media, "Removable"),
-        .mount_points = try mount_points.toOwnedSlice(allocator),
-    };
-}
-
-fn fieldValue(output: []const u8, label: []const u8) ?[]const u8 {
-    const marker_index = std.mem.indexOf(u8, output, label) orelse return null;
-    const tail = output[marker_index + label.len ..];
-    const newline_index = std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len;
-    return std.mem.trim(u8, tail[0..newline_index], " \t\r");
-}
-
-fn makeDiskId(allocator: std.mem.Allocator, protocol: []const u8, media_name: []const u8, size: u64, tree_path: []const u8) ![]u8 {
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(protocol);
-    hasher.update("\n");
-    hasher.update(media_name);
-    hasher.update("\n");
-    hasher.update(tree_path);
-    hasher.update("\n");
-
-    var size_buffer: [20]u8 = undefined;
-    const size_text = try std.fmt.bufPrint(&size_buffer, "{}", .{size});
-    hasher.update(size_text);
-
-    return std.fmt.allocPrint(allocator, "macos-{x}", .{hasher.final()});
-}
-
-fn dupMountPoints(allocator: std.mem.Allocator, mount_points: []const device.MountPoint) ![]device.MountPoint {
-    var duplicate = try allocator.alloc(device.MountPoint, mount_points.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (duplicate[0..initialized]) |mount_point| {
-            allocator.free(mount_point.path);
-        }
-        allocator.free(duplicate);
-    }
-
-    for (mount_points, 0..) |mount_point, index| {
-        duplicate[index] = .{ .path = try allocator.dupe(u8, mount_point.path) };
-        initialized += 1;
-    }
-
-    return duplicate;
-}
-
-test "parseDiskutilSize reads byte count" {
-    const sample =
-        "   Disk Size:                 63.9 GB (63864569856 Bytes) (exactly 124735488 512-Byte-Units)\n";
-
-    try std.testing.expectEqual(@as(?u64, 63864569856), parseDiskutilSize(sample));
-}
-
-test "parseDiskIdentifiers finds whole disks" {
-    const sample =
-        "/dev/disk0 (internal, physical):\n" ++
-        "   #: TYPE NAME SIZE IDENTIFIER\n" ++
-        "/dev/disk3 (external, physical):\n";
-
-    var list: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (list.items) |item| std.testing.allocator.free(item);
-        list.deinit(std.testing.allocator);
-    }
-
-    try parseDiskIdentifiers(std.testing.allocator, &list, sample);
-    try std.testing.expectEqual(@as(usize, 2), list.items.len);
-    try std.testing.expectEqualStrings("/dev/disk0", list.items[0]);
-    try std.testing.expectEqualStrings("/dev/disk3", list.items[1]);
-}
-
-test "parseDiskInfo marks internal disks as system" {
-    const sample =
-        "   Device Node:               /dev/disk0\n" ++
-        "   Device / Media Name:       APPLE SSD AP1024R\n" ++
-        "   Media Name:                APPLE SSD AP1024R\n" ++
-        "   Protocol:                  Apple Fabric\n" ++
-        "   DeviceTreePath:            IODeviceTree:/internal/ssd0\n" ++
-        "   OS Can Be Installed:       No\n" ++
-        "   Disk Size:                 1.0 TB (1000555581440 Bytes) (exactly 1954210120 512-Byte-Units)\n" ++
-        "   Device Location:           Internal\n" ++
-        "   Removable Media:           Fixed\n";
-
-    const disk = try parseDiskInfo(std.testing.allocator, "/dev/disk0", sample);
-    defer disk.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("/dev/disk0", disk.device_path);
-    try std.testing.expectEqualStrings("/dev/rdisk0", disk.raw_path);
-    try std.testing.expectEqualStrings("APPLE SSD AP1024R", disk.description);
-    try std.testing.expect(std.mem.startsWith(u8, disk.id, "macos-"));
-    try std.testing.expectEqual(@as(u64, 1000555581440), disk.size);
-    try std.testing.expect(disk.system);
-    try std.testing.expect(!disk.removable);
-    try std.testing.expectEqual(@as(usize, 0), disk.mount_points.len);
-}
-
-test "parseDiskInfo keeps external mounted disks" {
-    const sample =
-        "   Device Node:               /dev/disk4\n" ++
-        "   Device / Media Name:       USB Flash Disk\n" ++
-        "   Media Name:                USB Flash Disk\n" ++
-        "   Protocol:                  USB\n" ++
-        "   DeviceTreePath:            IODeviceTree:/arm-io/usb/path-1\n" ++
-        "   Mount Point:               /Volumes/UNTITLED\n" ++
-        "   OS Can Be Installed:       No\n" ++
-        "   Disk Size:                 31.9 GB (31914983424 Bytes) (exactly 62333952 512-Byte-Units)\n" ++
-        "   Device Location:           External\n" ++
-        "   Removable Media:           Removable\n";
-
-    const disk = try parseDiskInfo(std.testing.allocator, "/dev/disk4", sample);
-    defer disk.deinit(std.testing.allocator);
-
-    try std.testing.expect(!disk.system);
-    try std.testing.expect(disk.removable);
-    try std.testing.expect(std.mem.startsWith(u8, disk.id, "macos-"));
-    try std.testing.expectEqual(@as(usize, 1), disk.mount_points.len);
-    try std.testing.expectEqualStrings("/Volumes/UNTITLED", disk.mount_points[0].path);
-}
-
-const target_io_api = @import("target_io.zig");
-
-pub const target_io = target_io_api.posix;

@@ -2,7 +2,7 @@
 
 `openetcher` is a Zig library and command-line tool for flashing disk images. It plans writes from the image layout before writing, so supported filesystem images can skip unused regions while preserving the image's required on-disk structure.
 
-The command-line tool is a thin layer over the `openetcher` library. The current real-device implementation targets macOS; the core planning and flashing library is platform-neutral.
+The command-line tool is a thin layer over the `openetcher` library. Disk discovery works on macOS, Linux, and Windows; flashing physical disks works on macOS and Linux. The core planning and flashing library is platform-neutral.
 
 ## Contents
 
@@ -21,8 +21,8 @@ The command-line tool is a thin layer over the `openetcher` library. The current
 ## Requirements
 
 - Zig `0.17.0`
-- macOS for physical disk discovery and flashing
-- `diskutil` on macOS, used for device discovery, sizing, and unmounting
+- macOS or Linux for flashing physical disks; Windows for listing them
+- On macOS, the DiskArbitration and CoreFoundation frameworks from the SDK, which the build links. Cross-building for another macOS architecture finds the SDK with `xcrun`
 
 The project has no third-party library dependencies.
 
@@ -145,22 +145,27 @@ openetcher disks --all
 openetcher disks --all --json
 ```
 
-On macOS, the default command lists external physical disks only. `--all` includes internal physical disks as well.
+By default the list holds what Etcher offers as targets: disks that are neither system disks nor virtual. `--all` adds system disks (internal fixed disks) and virtual disks (disk images, RAM disks, and on macOS the APFS containers synthesized on a physical disk).
 
-Each entry has:
+Each entry has the fields Etcher's drivelist reports:
 
-- `id`: best-effort macOS disk identifier accepted by `flash --disk-id`
-- `device`: normal device node, for example `/dev/disk4`
-- `raw`: raw device node, for example `/dev/rdisk4`
-- `display_name`
-- `description`
-- `size`: bytes
-- `protected`: whether the disk is classified as protected by the current macOS backend
-- `system`: whether the disk is classified as a system disk
-- `removable`
-- `mountpoints`
+- `id`: disk identifier accepted by `flash --disk-id`, such as `macos-…`, `linux-…`, or `windows-…`
+- `device`: device node, for example `/dev/disk4`, `/dev/sdb`, or `\\.\PhysicalDrive2`
+- `raw`: node for unbuffered I/O, for example `/dev/rdisk4`; the same as `device` on Linux and Windows
+- `display_name`: the drive letters of a Windows disk with volumes, otherwise `device`
+- `description`: the media name, or on Linux the label, vendor, model, and mounted partitions
+- `bus_type`: the transport, such as `USB`, `SATA`, `NVME`, or `Apple Fabric`
+- `location`: where the disk attaches: the IOKit bus path on macOS, the `/dev/disk/by-path` link on Linux, the device interface path on Windows; absent when unknown
+- `size`, `block_size` (physical sector), `logical_block_size`: bytes
+- `partition_table`: `mbr` or `gpt`; absent when unknown
+- `protected`: whether `flash` refuses the disk without `--force`
+- `system`, `removable`, `read_only`, `virtual`
+- `card`: an SD or MMC card
+- `usb`, `scsi`: the attachment, as drivelist classifies it
+- `raid`: a RAID set, which only Windows reports, from the adapter's bus type; never listed
+- `mountpoints`: each with `path` and, when known, `label`
 
-The generated macOS `id` is not a native `/dev/disk/by-id` equivalent. It is a best-effort identifier derived from disk metadata: protocol, media name, size, and device-tree path. It can be more stable than a `diskN` number across rediscovery, but it is not a hardware serial number and should not be assumed globally unique or permanent.
+The `id` hashes facts that identify the disk and stay put when it is replugged into the same port or the machine reboots: the transport, the media name or vendor and model, the size, and the hardware location (the IOKit media path on macOS, the udev serial and `/dev/disk/by-path` link on Linux, the device interface path on Windows). It is more stable than a `diskN` or `sdX` name, which the OS hands out in discovery order, but it is not a hardware serial number.
 
 ### `flash`
 
@@ -188,7 +193,7 @@ While it works, the CLI draws progress on stderr for decoding a compressed image
 - actual throughput: planned bytes divided by flash-plus-verify elapsed time
 - effective throughput: full image size divided by the same elapsed time
 
-Target preparation is explicitly logged and excluded from throughput timing. On macOS preparation unmounts the target whole disk through `diskutil unmountDisk`.
+Target preparation is explicitly logged and excluded from throughput timing. Preparation unmounts every volume on the target disk, as Etcher's mountutils does: on macOS with a forced whole-disk unmount through DiskArbitration, including the volumes of APFS containers synthesized on the disk, and on Linux with `umount2` on each mount of the disk or its partitions, escalating from an expiring unmount to a lazy detach to a forced unmount.
 
 ## Image Support and Planning
 
@@ -229,23 +234,17 @@ For ISO9660, planned bytes equal image size and skipped bytes are zero.
 
 ## Disk Discovery and Safety
 
-### macOS Candidate Filtering
+### Discovery
 
-`openetcher disks` runs:
+Discovery follows Etcher, which lists disks with drivelist and filters them in etcher-sdk's scanner. Each backend calls the operating system directly rather than running a helper command:
 
-```text
-diskutil list external physical
-```
+- macOS reads the whole-disk names from `/dev` and describes each disk through DiskArbitration, the same `DADiskCopyDescription` fields drivelist reads. Mount points come from each partition's DiskArbitration volume path. An APFS container's volumes are credited to the physical disk with the same bus path, and the container is marked virtual, as drivelist's `handleApfs` does. Drivelist collects disk names from DiskArbitration callbacks within a fixed 50 ms window; reading `/dev` finds the same disks without that race.
+- Linux reads `/sys/block`, `/proc/self/mountinfo`, udev's `/dev/disk/by-label` and `/dev/disk/by-path` links, and udev's database: the sources `lsblk` reads when drivelist runs it. Loop devices, optical drives, and RAM disks are left out, and drivelist's rules decide the flags: a disk is removable when the kernel says so, when it sits on a hot-pluggable bus such as USB, or when it is virtual; it is a system disk when it is neither removable nor virtual.
+- Windows enumerates disk interfaces with SetupAPI and queries each physical drive with `DeviceIoControl` for its number, geometry, partition style, adapter bus, and sector sizes, as drivelist does. Drive letters are matched to disks by device number. A disk is a system disk when it is fixed and on the SCSI or IDE enumerator, or when it holds the Windows, profile, or program folders.
 
-`openetcher disks --all` runs:
+Like Etcher, the list never includes RAID members or disks that report no size.
 
-```text
-diskutil list physical
-```
-
-The backend gathers additional fields with `diskutil info`.
-
-The current macOS backend marks a disk protected when it is internal or when macOS reports it as OS-installable. That classification is also used for the `system` field.
+On macOS a disk is a system disk when DiskArbitration reports it internal and not removable.
 
 ### Protected System Disks
 
@@ -259,13 +258,13 @@ openetcher flash image.img /dev/disk0
 openetcher flash --force image.img /dev/disk0
 ```
 
-The same guard applies when a system disk is selected with `--disk-id`.
+The same guard applies when a system disk is selected with `--disk-id`, and when the target is a partition of a protected disk, such as `/dev/disk0s2` or `/dev/sda1`. A disk holding the root filesystem is protected even when the platform calls it removable, as when the system booted from a USB disk.
 
 `--force` only bypasses the project's protected-disk gate. It does not bypass OS permissions, device locking, unmount failures, or target-size checks. Writing a disk is destructive; confirm the selected device and its size before running `flash`.
 
 ### Direct Device Paths
 
-Direct device paths are supported in addition to discovered ids. The macOS backend normalizes `/dev/diskN` to `/dev/rdiskN` for I/O, while `diskutil` continues to be used with the normal `/dev/diskN` form for whole-disk operations.
+Direct device paths are supported in addition to discovered ids. The macOS backend normalizes `/dev/diskN` to `/dev/rdiskN` for I/O. Device size and sector size come from the disk ioctls (`DKIOCGETBLOCKCOUNT` and `DKIOCGETBLOCKSIZE` on macOS, `BLKGETSIZE64` and `BLKSSZGET` on Linux), and writes are aligned to the sector size. On Linux, links such as `/dev/disk/by-id/...` resolve to their device for the protection check.
 
 Regular files can be used as targets. They are useful for tests and development and are not classified as protected disks.
 
@@ -276,7 +275,7 @@ The flash implementation operates in these stages:
 1. Build an image flash plan.
 2. Check target safety in the CLI.
 3. Probe the target and confirm it is large enough for the full image.
-4. Prepare the target. On macOS, this unmounts the whole disk.
+4. Prepare the target: unmount every volume on the disk.
 5. Write each planned range in chunks.
 6. Sync the target.
 7. Verify each planned range against the source image, unless verification is disabled through the library API.
@@ -297,7 +296,7 @@ Writing is pipelined with `std.Io`. The source is read and decompressed into a r
 
 The digest is a SHA-256 over the SHA-256 of each chunk, so chunks hash in parallel on separate cores instead of one hash stream limiting the whole flash. SHA-256 beat BLAKE3 from `std.crypto` by about 1.5 times per core on Apple silicon, which has SHA-2 instructions.
 
-Default chunk size is 1 MiB. For a device target the chunk size is rounded up to the backend's write alignment, so every chunk starts on a sector boundary; a plan with a range that starts inside a sector fails with `UnalignedTargetOffset` before anything is written. The macOS backend uses 512-byte device alignment and zero-pads a non-aligned final chunk.
+Default chunk size is 1 MiB. For a device target the chunk size is rounded up to the backend's write alignment, so every chunk starts on a sector boundary; a plan with a range that starts inside a sector fails with `UnalignedTargetOffset` before anything is written. The macOS and Linux backends align device I/O to the disk's sector size and zero-pad a non-aligned final chunk.
 
 All target I/O, for regular files and raw devices alike, is positional I/O through the caller's `std.Io`. It works under any `Io` implementation, can be canceled, and carries its own offset, so concurrent writes never contend for a shared file position.
 
@@ -438,24 +437,29 @@ const device = openetcher.device_api;
 const disks = try device.listCandidateDisks(allocator, io, .{});
 defer disks.deinit(allocator);
 
-const device_path = try device.resolveDiskId(
+const chosen = try device.resolveDiskId(
     allocator,
     io,
     "macos-0123456789abcdef",
-    .{},
+    .everything,
 );
-defer allocator.free(device_path);
+defer chosen.deinit(allocator);
+if (chosen.disk.protected) return error.ProtectedDisk;
+const device_path = chosen.disk.device_path;
 ```
+
+`ListOptions` selects disks the way Etcher does: `.{}` leaves out system and virtual disks, `include_system` and `include_virtual` add them, and `.everything` includes both, which is what resolving a user's choice wants. `resolveDiskId` returns the whole disk with that id, so its path and its `protected` flag come from the same scan. `lookupDiskByPath` returns the disk at a device path, a symlink to one, or the partition of one.
 
 Useful types include:
 
 - `DeviceCandidateDisk`
 - `DeviceCandidateDiskList`
+- `DeviceOwnedCandidateDisk`
 - `DeviceListOptions`
-- `DeviceResolveDiskIdOptions`
 - `DeviceMountPoint`
+- `DevicePartitionTable`
 
-`CandidateDisk` values own their strings and mount-point data; use `deinit(allocator)` when retaining an individually returned value. `CandidateDiskList.deinit(allocator)` releases all entries.
+`CandidateDiskList` and the `OwnedCandidateDisk` that `resolveDiskId` and `lookupDiskByPath` return each hold an arena with every string and slice of their disks; `deinit(allocator)` frees it all at once. A `CandidateDisk` itself owns nothing.
 
 ## Architecture
 
@@ -473,7 +477,8 @@ src/
     range.zig                    Byte-range normalization and merging
     scan.zig                     SIMD zero detection and word-at-a-time bitmap run scanning
     device.zig                   Device abstraction, comptime platform selection, target I/O contract
-    device/platforms/            macOS backend, Linux/Windows placeholders, shared target-I/O backends
+    device/discovery.zig         Etcher's disk filtering, naming, and id rules, shared by every backend
+    device/platforms/            macOS (DiskArbitration), Linux (sysfs), and Windows (SetupAPI) backends; target operations shared by macOS and Linux; shared target-I/O backends
     image/reader.zig             Random-access Reader plus file-region, buffer, and slice sources
     image/ondisk.zig             Little-endian extern struct decoding and compile-time layout checks
     image/fuzz.zig               Fuzz harness over the whole analyzer
@@ -517,7 +522,7 @@ src/
 | New filesystem | One module under `image/fs/` exposing `name`, `unrecognized`, `detect`, `probeRegion` (returning an `Info.Probe`), `collectRanges`, and optionally `mbr_types` or `raw_layout` with `filesystem` and `blockSize`; one line in `fs/driver.zig`; tests beside the module |
 | New disk layout such as GPT | One module under `image/layout/` exposing `layout`, `detect`, and `collectSpans`; one line in `layout/driver.zig` and one tag in `Info.Layout` |
 | New compression codec | One module under `image/compression/` exposing `id`, `magic`, a `State` type, and `init`, `reader`, and `deinit` over it; one line in `compression/codec.zig` and one tag in `Compression`. `codec.Decoder` gains a variant automatically |
-| New platform | One backend under `device/platforms/` implementing the seven device functions plus a `target_io` dispatcher, one line in the OS switch in `device.zig`. `device.zig` checks the backend against this contract at compile time |
+| New platform | One backend under `device/platforms/` implementing the four target functions, `enumerateDisks`, and `wholeDiskPath`, plus a `target_io` dispatcher, one line in the OS switch in `device.zig`. `device.zig` checks the backend against this contract at compile time and does the filtering, id resolution, and path lookup itself |
 
 ### Range Normalization
 
@@ -538,12 +543,12 @@ Each filesystem ships one parser that serves both open-file and in-memory inputs
 | --- | --- | --- | --- |
 | Image probing and planning | Yes | Yes | Yes |
 | Flashing to regular files | Yes | Yes | Yes |
-| Physical-disk discovery | Yes | No | No |
-| Physical-disk preparation | Yes | No | No |
-| Physical-disk flashing | Yes | No | No |
-| Disk ids | Best effort | No | No |
+| Physical-disk discovery | Yes | Yes | Yes |
+| Physical-disk preparation (unmount) | Yes | Yes | No |
+| Physical-disk flashing | Yes | Yes | No |
+| Disk ids | Yes | Yes | Yes |
 
-Linux and Windows device backends currently delegate to the regular-file backend. They are architecture placeholders, not real physical-device implementations.
+Windows lists disks but opens only regular-file targets: raw `\\.\PhysicalDriveN` writes, which need volume locking and dismounting first, are not implemented.
 
 ## Limitations
 
@@ -552,7 +557,7 @@ Linux and Windows device backends currently delegate to the regular-file backend
 - Unsupported non-empty MBR partition filesystems fail planning.
 - ISO support is ISO9660 signature detection and full-image writing; UDF-specific detection and optimization are not implemented.
 - SquashFS planning currently uses its declared used extent rather than a block-level allocation map.
-- macOS disk ids are synthetic best-effort ids, not durable hardware serial identifiers.
+- Disk ids are hashes of disk metadata, not hardware serial numbers; two identical disks in ports that share a location can collide, which `--disk-id` reports as ambiguous.
 - Candidate-disk protection is a safety layer, not a replacement for manual target verification.
 - The CLI does not prompt for confirmation; protected system disks require `--force`, and other disks can still be destructive targets.
 - macOS raw-device access uses `authopen` when direct access is denied. Authorization requires an interactive graphical login session and may not work over SSH or in other headless environments.
