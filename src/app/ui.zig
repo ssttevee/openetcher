@@ -1,8 +1,9 @@
 //! The OpenEtcher interface: fabrum.app components over a plain model.
 //!
 //! Nothing here touches the window, the renderer or the disk. The shell in
-//! `main.zig` provides `model.Services` and `model.Icons`; the tests below
-//! provide fakes and drive the interface by clicking, as a user would.
+//! `main.zig` provides `model.Services` and `model.Icons` to the runtime as
+//! root values; the tests below provide fakes and drive the interface by
+//! clicking, as a user would.
 const std = @import("std");
 
 const fabrum = @import("fabrum");
@@ -109,7 +110,10 @@ const Harness = struct {
 
     /// Must not move after `init`.
     fn init(self: *Harness) !void {
-        self.* = .{ .rt = try .init(testing.allocator, .{ .io = testing.io }) };
+        self.* = .{ .rt = try .init(testing.allocator, .{
+            .io = testing.io,
+            .provide = &.{ .of(&self.services), .of(&fake_icons) },
+        }) };
         self.services = self.fake.services();
         try self.frame();
     }
@@ -120,7 +124,7 @@ const Harness = struct {
     }
 
     fn frame(self: *Harness) !void {
-        _ = try self.rt.frame(App, .{ .services = &self.services, .icons = &fake_icons }, .init(800, 480));
+        _ = try self.rt.frame(App, .{}, .init(800, 480));
     }
 
     fn state(self: *Harness) *App.State {
@@ -390,4 +394,21 @@ test "a failed flash shows why" {
     try h.post(h.fake.flash.?.done, model.FlashOutcome{ .failed = error.AccessDenied });
     try testing.expect(h.has("Flash Failed"));
     try testing.expect(h.has(model.describeError(error.AccessDenied)));
+}
+
+test "a relisting that reorders the drives keeps the picked one" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+
+    try h.pickImage("/images/os.img", 1000);
+    try h.click("Select target");
+    try h.listDrives(&.{ sd_card, file_target });
+    try h.click("target.img");
+
+    // rows follow their drive's path, not their place in the list
+    try h.click("Refresh");
+    try h.listDrives(&.{ file_target, sd_card });
+    try h.click("Select");
+    try testing.expectEqualStrings("/tmp/target.img", h.state().target.?.path);
 }

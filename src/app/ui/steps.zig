@@ -1,6 +1,9 @@
 //! The three steps across the main screen: choose an image, choose a target,
 //! flash. Each is a circular icon over a pill button, with what was chosen
 //! below it.
+//!
+//! The steps are stateless: their buttons fire whatever actions the app
+//! passes in.
 const std = @import("std");
 
 const fabrum = @import("fabrum");
@@ -21,7 +24,7 @@ const button_height = 44;
 
 /// Opens a step's column and draws its icon in a circle, ringed once the
 /// step is done; close it with `ui.close()`.
-fn open(comptime C: type, ui: *app.Scope(C), icons: *const model.Icons, icon: model.Icon, color: Color, done: bool) !void {
+fn open(ui: *app.Ui, icon: model.Icon, color: Color, done: bool) !void {
     // a fixed height keeps the row still as details come and go
     try ui.open(null, .{
         .layout = .{ .sizing = .fixedXY(width, height), .axis = .y, .child_alignment = .top_center, .child_gap = 6 },
@@ -33,22 +36,30 @@ fn open(comptime C: type, ui: *app.Scope(C), icons: *const model.Icons, icon: mo
         .corner_radius = .uniform(icon_size / 2),
         .border = .{ .color = if (done) theme.accent else .transparent, .widths = .outside(2) },
     });
-    try theme.icon(C, ui, try icons.content(ui.arena(), icon, color), 34);
+    try theme.icon(ui, icon, color, 34);
     ui.close();
     ui.close();
 }
 
-/// A wrapped, centered line under a step's button.
-fn caption(comptime C: type, ui: *app.Scope(C), text: []const u8, style: layout.text.Style) !void {
+/// What a step has chosen, in place of its button, shortened in the
+/// middle.
+fn chosen(ui: *app.Ui, name: []const u8) !void {
+    try ui.open(null, .{ .layout = .{ .sizing = .{ .height = .fixed(button_height) }, .child_alignment = .center } });
+    defer ui.close();
+    var buffer: [64]u8 = undefined;
+    try ui.text(format.middle(&buffer, name, 24), theme.font(.label, theme.text).with(.{ .wrap_mode = .none }));
+}
+
+/// A wrapped, centered line under a step's button, formatted as with
+/// `ui.print`.
+fn caption(ui: *app.Ui, style: layout.text.Style, comptime fmt: []const u8, args: anytype) !void {
     try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .fixed(width) }, .child_alignment = .top_center } });
     defer ui.close();
-    var centered = style;
-    centered.alignment = .center;
-    try ui.text(text, centered);
+    try ui.print(style.with(.{ .alignment = .center }), fmt, args);
 }
 
 /// The thin line joining two steps, level with their icons' centers.
-pub fn connector(comptime C: type, ui: *app.Scope(C), done: bool) !void {
+pub fn connector(ui: *app.Ui, done: bool) !void {
     try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .fixed(connector_width) }, .padding = .init(0, 0, icon_size / 2 - 1, 0) } });
     defer ui.close();
     try ui.open(null, .{
@@ -61,164 +72,114 @@ pub fn connector(comptime C: type, ui: *app.Scope(C), done: bool) !void {
 
 /// Step 1: the image.
 pub const ImageStep = struct {
-    pub const State = struct {};
-    pub const Msg = union(enum) { pick, remove };
     pub const Props = struct {
         image: ?*const model.Image,
         /// Whether the image can be changed: not while flashing.
         locked: bool = false,
-        icons: *const model.Icons,
-        on_pick: app.Handler(void),
-        on_remove: app.Handler(void),
+        on_pick: app.Action,
+        on_remove: app.Action,
     };
 
-    pub fn update(_: *State, msg: Msg, ctx: *app.Update(ImageStep)) void {
-        switch (msg) {
-            .pick => ctx.emit(ctx.props.on_pick, {}),
-            .remove => ctx.emit(ctx.props.on_remove, {}),
-        }
-    }
-
-    pub fn view(ui: *app.Scope(ImageStep), _: *const State, props: Props) !void {
-        try open(ImageStep, ui, props.icons, .image, if (props.locked) theme.faint else theme.text, if (props.image) |image| image.status == .ready else false);
+    pub fn view(ui: *app.Ui, props: Props) !void {
+        try open(ui, .image, if (props.locked) theme.faint else theme.text, if (props.image) |image| image.status == .ready else false);
         defer ui.close();
 
         const image = props.image orelse {
-            try theme.button(ImageStep, ui, "pick", "Flash from file", .{ .on_click = .pick, .width = button_width, .height = button_height });
-            return;
+            return theme.button(ui, "pick", "Flash from file", .{ .on_click = props.on_pick, .width = button_width, .height = button_height });
         };
 
-        var name_buffer: [64]u8 = undefined;
-        var name_style = theme.font(.label, theme.text);
-        name_style.wrap_mode = .none;
-        try ui.open(null, .{ .layout = .{ .sizing = .{ .height = .fixed(button_height) }, .child_alignment = .center } });
-        try ui.text(try ui.arena().dupe(u8, format.middle(&name_buffer, image.name(), 24)), name_style);
-        ui.close();
-
+        try chosen(ui, image.name());
+        const details_style = theme.font(.small, theme.muted);
         switch (image.status) {
-            .loading => |loading| try caption(ImageStep, ui, if (loading.total > 0)
-                try ui.fmt("Decompressing\u{2026} {d}%", .{@min(100, loading.decoded * 100 / loading.total)})
+            .loading => |loading| if (loading.total > 0)
+                try caption(ui, details_style, "Decompressing\u{2026} {d}%", .{@min(100, loading.decoded * 100 / loading.total)})
             else
-                "Reading image\u{2026}", theme.font(.small, theme.muted)),
-            .ready => |details| {
-                var size_buffer: [32]u8 = undefined;
-                const size = format.bytes(&size_buffer, details.size);
-                try caption(ImageStep, ui, if (details.compression) |compression|
-                    try ui.fmt("{s} \u{00b7} {s}", .{ size, compression })
-                else
-                    try ui.arena().dupe(u8, size), theme.font(.small, theme.muted));
-            },
-            .failed => |err| try caption(ImageStep, ui, model.describeError(err), theme.font(.small, theme.danger)),
+                try caption(ui, details_style, "Reading image\u{2026}", .{}),
+            .ready => |details| if (details.compression) |compression|
+                try caption(ui, details_style, "{f} \u{00b7} {s}", .{ format.bytes(details.size), compression })
+            else
+                try caption(ui, details_style, "{f}", .{format.bytes(details.size)}),
+            .failed => |err| try caption(ui, theme.font(.small, theme.danger), "{s}", .{model.describeError(err)}),
         }
-        if (!props.locked) try theme.link(ImageStep, ui, "remove", "Remove", .remove, theme.accent);
+        if (!props.locked) try theme.link(ui, "remove", "Remove", props.on_remove, theme.accent);
     }
 };
 
 /// Step 2: the drive to write to.
 pub const TargetStep = struct {
-    pub const State = struct {};
-    pub const Msg = union(enum) { open };
     pub const Props = struct {
         target: ?*const model.Drive,
         /// Whether an image has been chosen, which comes first.
         enabled: bool,
         locked: bool = false,
         image_size: ?u64 = null,
-        icons: *const model.Icons,
-        on_open: app.Handler(void),
+        on_open: app.Action,
     };
 
-    pub fn update(_: *State, msg: Msg, ctx: *app.Update(TargetStep)) void {
-        switch (msg) {
-            .open => ctx.emit(ctx.props.on_open, {}),
-        }
-    }
-
-    pub fn view(ui: *app.Scope(TargetStep), _: *const State, props: Props) !void {
-        try open(TargetStep, ui, props.icons, .drive, if (props.enabled and !props.locked) theme.text else theme.faint, props.target != null);
+    pub fn view(ui: *app.Ui, props: Props) !void {
+        try open(ui, .drive, if (props.enabled and !props.locked) theme.text else theme.faint, props.target != null);
         defer ui.close();
 
         const drive = props.target orelse {
-            try theme.button(TargetStep, ui, "open", "Select target", .{
-                .on_click = if (props.enabled) .open else null,
+            return theme.button(ui, "open", "Select target", .{
+                .on_click = if (props.enabled) props.on_open else null,
                 .width = button_width,
                 .height = button_height,
             });
-            return;
         };
 
-        var name_buffer: [64]u8 = undefined;
-        var name_style = theme.font(.label, theme.text);
-        name_style.wrap_mode = .none;
-        try ui.open(null, .{ .layout = .{ .sizing = .{ .height = .fixed(button_height) }, .child_alignment = .center } });
-        try ui.text(try ui.arena().dupe(u8, format.middle(&name_buffer, drive.name, 24)), name_style);
-        ui.close();
-
-        var size_buffer: [32]u8 = undefined;
-        try caption(TargetStep, ui, try ui.arena().dupe(u8, format.bytes(&size_buffer, drive.size)), theme.font(.small, theme.muted));
+        try chosen(ui, drive.name);
+        try caption(ui, theme.font(.small, theme.muted), "{f}", .{format.bytes(drive.size)});
         if (props.image_size) |size| {
-            if (drive.size < size) try caption(TargetStep, ui, "Too small for this image", theme.font(.small, theme.danger));
+            if (drive.size < size) try caption(ui, theme.font(.small, theme.danger), "Too small for this image", .{});
         }
-        if (drive.system) try caption(TargetStep, ui, "System drive", theme.font(.small, theme.danger));
-        if (!props.locked) try theme.link(TargetStep, ui, "change", "Change", .open, theme.accent);
+        if (drive.system) try caption(ui, theme.font(.small, theme.danger), "System drive", .{});
+        if (!props.locked) try theme.link(ui, "change", "Change", props.on_open, theme.accent);
     }
 };
 
 /// Step 3: the flash button, which becomes a progress bar while flashing.
 pub const FlashStep = struct {
-    pub const State = struct {};
-    pub const Msg = union(enum) { flash, cancel };
     pub const Props = struct {
         /// Whether everything is chosen and fits.
         ready: bool,
         running: ?*const model.Running = null,
-        icons: *const model.Icons,
-        on_flash: app.Handler(void),
-        on_cancel: app.Handler(void),
+        on_flash: app.Action,
+        on_cancel: app.Action,
     };
 
-    pub fn update(_: *State, msg: Msg, ctx: *app.Update(FlashStep)) void {
-        switch (msg) {
-            .flash => ctx.emit(ctx.props.on_flash, {}),
-            .cancel => ctx.emit(ctx.props.on_cancel, {}),
-        }
-    }
-
-    pub fn view(ui: *app.Scope(FlashStep), _: *const State, props: Props) !void {
+    pub fn view(ui: *app.Ui, props: Props) !void {
         const active = props.ready or props.running != null;
-        try open(FlashStep, ui, props.icons, .flash, if (active) theme.text else theme.faint, props.running != null);
+        try open(ui, .flash, if (active) theme.text else theme.faint, props.running != null);
         defer ui.close();
 
         const running = props.running orelse {
-            try theme.button(FlashStep, ui, "flash", "Flash!", .{
-                .on_click = if (props.ready) .flash else null,
+            return theme.button(ui, "flash", "Flash!", .{
+                .on_click = if (props.ready) props.on_flash else null,
                 .width = button_width,
                 .height = button_height,
             });
-            return;
         };
 
         try progressBar(ui, running);
 
+        const details_style = theme.font(.small, theme.muted);
         if (running.canceling) {
-            try caption(FlashStep, ui, "Canceling\u{2026}", theme.font(.small, theme.muted));
-            return;
+            return caption(ui, details_style, "Canceling\u{2026}", .{});
         }
         if (running.speed > 0) {
-            var speed_buffer: [32]u8 = undefined;
-            var left_buffer: [32]u8 = undefined;
-            const speed = format.speed(&speed_buffer, running.speed);
-            try caption(FlashStep, ui, if (running.secondsLeft()) |left|
-                try ui.fmt("{s} \u{00b7} ETA {s}", .{ speed, format.duration(&left_buffer, left) })
-            else
-                try ui.arena().dupe(u8, speed), theme.font(.small, theme.muted));
+            if (running.secondsLeft()) |left| {
+                try caption(ui, details_style, "{f} \u{00b7} ETA {f}", .{ format.speed(running.speed), format.duration(left) });
+            } else {
+                try caption(ui, details_style, "{f}", .{format.speed(running.speed)});
+            }
         } else {
-            try caption(FlashStep, ui, " ", theme.font(.small, theme.muted));
+            try caption(ui, details_style, " ", .{});
         }
-        try theme.link(FlashStep, ui, "cancel", "Cancel", .cancel, theme.danger);
+        try theme.link(ui, "cancel", "Cancel", props.on_cancel, theme.danger);
     }
 
-    fn progressBar(ui: *app.Scope(FlashStep), running: *const model.Running) !void {
+    fn progressBar(ui: *app.Ui, running: *const model.Running) !void {
         const color = if (running.phase == .verifying) theme.verifying else theme.accent;
         const fraction = running.fraction();
 
@@ -252,12 +213,11 @@ pub const FlashStep = struct {
             .flashing => "Flashing",
             .verifying => "Validating",
         };
-        var style = theme.font(.label, .white);
-        style.wrap_mode = .none;
+        const style = theme.font(.label, .white).with(.{ .wrap_mode = .none });
         if (fraction) |value| {
-            try ui.text(try ui.fmt("{s}\u{2026} {d}%", .{ verb, @as(u32, @intFromFloat(@floor(value * 100))) }), style);
+            try ui.print(style, "{s}\u{2026} {d}%", .{ verb, @as(u32, @intFromFloat(@floor(value * 100))) });
         } else {
-            try ui.text(try ui.fmt("{s}\u{2026}", .{verb}), style);
+            try ui.print(style, "{s}\u{2026}", .{verb});
         }
     }
 };

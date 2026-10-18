@@ -1,13 +1,15 @@
-//! Colors, type and the small widgets every screen shares: buttons, links
-//! and badges. Widgets are view functions rather than components, since they
-//! keep no state of their own; their events are the calling component's
-//! messages.
+//! Colors, type and the small widgets every screen shares: buttons, links,
+//! badges and icons. Widgets are view helpers rather than components, since
+//! they keep no state of their own and need no keys of their own; their
+//! events are whatever `app.Action` the caller passes.
 const std = @import("std");
 
 const fabrum = @import("fabrum");
 const app = fabrum.app;
 const layout = fabrum.layout;
 const Color = fabrum.Color;
+
+const model = @import("model.zig");
 
 pub const window_background = Color.rgb(36, 41, 50);
 pub const header_text = Color.rgb(230, 233, 238);
@@ -55,19 +57,17 @@ pub fn font(kind: Text, color: Color) layout.text.Style {
 
 pub const ButtonKind = enum { primary, danger, secondary };
 
-pub fn ButtonOptions(comptime Msg: type) type {
-    return struct {
-        /// Null disables the button.
-        on_click: ?Msg,
-        kind: ButtonKind = .primary,
-        /// Zero fits the label.
-        width: f32 = 0,
-        height: f32 = 40,
-    };
-}
+pub const ButtonOptions = struct {
+    /// Null disables the button.
+    on_click: ?app.Action,
+    kind: ButtonKind = .primary,
+    /// Zero fits the label.
+    width: f32 = 0,
+    height: f32 = 40,
+};
 
 /// A pill button that lightens on hover and darkens while pressed.
-pub fn button(comptime C: type, ui: *app.Scope(C), key: anytype, label: []const u8, options: ButtonOptions(C.Msg)) !void {
+pub fn button(ui: *app.Ui, key: anytype, label: []const u8, options: ButtonOptions) !void {
     const enabled = options.on_click != null;
     const hovered = enabled and ui.hovered(key);
     const pressed = enabled and ui.pressed(key);
@@ -95,40 +95,34 @@ pub fn button(comptime C: type, ui: *app.Scope(C), key: anytype, label: []const 
         .on_click = options.on_click,
     });
     defer ui.close();
-    var style = font(.label, foreground);
-    style.wrap_mode = .none;
-    try ui.text(label, style);
+    try ui.text(label, font(.label, foreground).with(.{ .wrap_mode = .none }));
 }
 
 /// Clickable text, underlined by color only: brighter while hovered.
-pub fn link(comptime C: type, ui: *app.Scope(C), key: anytype, label: []const u8, on_click: C.Msg, color: Color) !void {
+pub fn link(ui: *app.Ui, key: anytype, label: []const u8, on_click: app.Action, color: Color) !void {
     try ui.open(key, .{ .layout = .{ .padding = .xy(2, 1) }, .on_click = on_click });
     defer ui.close();
     const shown = if (ui.pressed(key)) color.withAlpha(160) else if (ui.hovered(key)) lighten(color) else color;
-    var style = font(.small, shown);
-    style.font_weight = .medium;
-    style.wrap_mode = .none;
-    try ui.text(label, style);
+    try ui.text(label, font(.small, shown).with(.{ .font_weight = .medium, .wrap_mode = .none }));
 }
 
 /// A small rounded label, such as a drive warning.
-pub fn badge(comptime C: type, ui: *app.Scope(C), label: []const u8, color: Color) !void {
+pub fn badge(ui: *app.Ui, label: []const u8, color: Color) !void {
     try ui.open(null, .{
         .layout = .{ .padding = .xy(7, 2) },
         .background_color = color.withAlpha(40),
         .corner_radius = .uniform(9),
     });
     defer ui.close();
-    var style = font(.caption, color);
-    style.wrap_mode = .none;
-    try ui.text(label, style);
+    try ui.text(label, font(.caption, color).with(.{ .wrap_mode = .none }));
 }
 
-/// A square box of `size` showing `icon`.
-pub fn icon(comptime C: type, ui: *app.Scope(C), content: *layout.Content, size: f32) !void {
+/// A square box of `size` showing `icon` in `color`, from the provided
+/// `model.Icons`.
+pub fn icon(ui: *app.Ui, which: model.Icon, color: Color, size: f32) !void {
     try ui.open(null, .{ .layout = .{ .sizing = .fixed(size), .child_alignment = .center } });
     defer ui.close();
-    ui.content(content);
+    ui.content(try ui.use(model.Icons).content(ui.arena(), which, color));
 }
 
 fn lighten(color: Color) Color {

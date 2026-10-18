@@ -39,6 +39,7 @@ const Gui = struct {
     renderer: Quartz,
     icons: Icons,
     services: Services,
+    /// Provided to the interface as root values.
     services_interface: ui.model.Services,
     icons_interface: ui.model.Icons,
     /// Set by a script's `image=` step: the next pick answers with it.
@@ -46,13 +47,9 @@ const Gui = struct {
     /// From `OPENETCHER_GUI_LAYOUT_FILE`, in debug builds.
     layout_file: ?[]const u8 = null,
 
-    fn props(self: *Gui) ui.App.Props {
-        return .{ .services = &self.services_interface, .icons = &self.icons_interface };
-    }
-
     fn draw(ctx: *anyopaque, cg: *shell.CGContext, width: f64, height: f64) callconv(.c) void {
         const self: *Gui = @ptrCast(@alignCast(ctx));
-        var commands = self.runtime.frame(ui.App, self.props(), .init(@floatCast(width), @floatCast(height))) catch |err| {
+        var commands = self.runtime.frame(ui.App, .{}, .init(@floatCast(width), @floatCast(height))) catch |err| {
             std.log.err("frame failed: {t}", .{err});
             return;
         };
@@ -150,6 +147,8 @@ pub fn main(init: std.process.Init) !void {
         .io = io,
         .text_context = gui.renderer.text_context,
         .platform = shell.platform,
+        // filled in below, before the first frame
+        .provide = &.{ .of(&gui.services_interface), .of(&gui.icons_interface) },
     });
     gui.services = .{
         .gpa = gpa,
@@ -211,11 +210,8 @@ fn writeLayout(comptime Text: type, writer: *Io.Writer, context: *const fabrum.l
 test writeLayout {
     const TestRuntime = app.Runtime(.{});
     const Label = struct {
-        pub const State = struct {};
-        pub const Msg = union(enum) {};
         pub const Props = struct {};
-        pub fn update(_: *State, _: Msg, _: *app.Update(@This())) void {}
-        pub fn view(scope: *app.Scope(@This()), _: *const State, _: Props) !void {
+        pub fn view(scope: *app.Ui, _: Props) !void {
             try scope.open(null, .{ .layout = .{ .padding = .init(10, 0, 20, 0) } });
             defer scope.close();
             try scope.text("Flash!\tnow", .{ .font_size = 10, .line_height = 1 });

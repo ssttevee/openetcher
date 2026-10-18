@@ -1,9 +1,10 @@
 //! The root component: the shared model of the image, the target and the
 //! flash, and the screen built from it.
 //!
-//! The steps and dialogs are child components that report back through
-//! handlers. Work that takes time or touches the system goes through
-//! `Services`, whose answers come back as messages.
+//! The steps and dialogs are child components whose buttons fire the app's
+//! messages. Work that takes time or touches the system goes through the
+//! `model.Services` provided to the runtime, whose answers come back as
+//! messages.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -110,14 +111,11 @@ pub const Msg = union(enum) {
     }
 };
 
-pub const Props = struct {
-    services: *const model.Services,
-    icons: *const model.Icons,
-};
+pub const Props = struct {};
 
 pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) void {
     const gpa = ctx.gpa;
-    const services = ctx.props.services;
+    const services = ctx.use(model.Services);
     switch (msg) {
         .pick_image => if (!state.flashing()) services.pickImage(ctx.handler(.image_picked)),
         .image_picked => |picked| {
@@ -213,30 +211,29 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) void {
 
 fn start(state: *State, ctx: *app.Update(App)) void {
     state.flash = .{ .running = .{} };
-    ctx.props.services.startFlash(state.image.?.id, &state.target.?, .{
+    ctx.use(model.Services).startFlash(state.image.?.id, &state.target.?, .{
         .progress = ctx.handler(.flash_progress),
         .done = ctx.handler(.flash_done),
     });
 }
 
-pub fn view(ui: *app.Scope(App), state: *const State, props: Props) !void {
+pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
     try ui.open(null, .{
         .layout = .{ .sizing = .grow(.{}), .axis = .y, .child_alignment = .top_center },
         .background_color = theme.window_background,
     });
     defer ui.close();
 
-    try header(ui, props);
+    try header(ui);
 
     switch (state.flash) {
         .finished => |outcome| try ui.child(Finish, {}, .{
             .outcome = outcome,
             .image_name = if (state.image) |image| image.name() else "",
             .drive_name = if (state.target) |target| target.name else "",
-            .icons = props.icons,
-            .on_again = ui.handler(.flash_another),
+            .on_again = try ui.bind(App, .flash_another),
         }),
-        else => try stepsRow(ui, state, props),
+        else => try stepsRow(ui, state),
     }
 
     switch (state.dialog) {
@@ -253,31 +250,27 @@ pub fn view(ui: *app.Scope(App), state: *const State, props: Props) !void {
             },
             .image_size = if (state.image) |image| image.size() else null,
             .current = if (state.target) |target| target.path else null,
-            .on_cancel = ui.handler(.close_drives),
-            .on_select = ui.handler(.select_drive),
-            .on_refresh = ui.handler(.refresh_drives),
+            .on_cancel = try ui.bind(App, .close_drives),
+            .on_select = ui.handler(App, .select_drive),
+            .on_refresh = try ui.bind(App, .refresh_drives),
         }),
         .confirm => if (state.target) |*target| try ui.child(ConfirmDialog, {}, .{
             .drive = target,
             .image_name = if (state.image) |image| image.name() else "",
-            .icons = props.icons,
-            .on_confirm = ui.handler(.confirm_flash),
-            .on_cancel = ui.handler(.cancel_confirm),
+            .on_confirm = try ui.bind(App, .confirm_flash),
+            .on_cancel = try ui.bind(App, .cancel_confirm),
         }),
     }
 }
 
-fn header(ui: *app.Scope(App), props: Props) !void {
+fn header(ui: *app.Ui) !void {
     try ui.open(null, .{ .layout = .{ .padding = .init(0, 0, 44, 0), .child_gap = 8, .child_alignment = .center } });
     defer ui.close();
-    try theme.icon(App, ui, try props.icons.content(ui.arena(), .flash, theme.accent), 22);
-    var style = theme.font(.heading, theme.header_text);
-    style.wrap_mode = .none;
-    style.letter_spacing = 0.5;
-    try ui.text("OpenEtcher", style);
+    try theme.icon(ui, .flash, theme.accent, 22);
+    try ui.text("OpenEtcher", theme.font(.heading, theme.header_text).with(.{ .wrap_mode = .none, .letter_spacing = 0.5 }));
 }
 
-fn stepsRow(ui: *app.Scope(App), state: *const State, props: Props) !void {
+fn stepsRow(ui: *app.Ui, state: *const State) !void {
     // centers the row in the space under the header
     try ui.open(null, .{ .layout = .{ .sizing = .grow(.{}), .child_alignment = .center, .padding = .init(0, 0, 0, 30) } });
     defer ui.close();
@@ -288,28 +281,25 @@ fn stepsRow(ui: *app.Scope(App), state: *const State, props: Props) !void {
     try ui.child(steps.ImageStep, {}, .{
         .image = if (state.image) |*image| image else null,
         .locked = state.flashing(),
-        .icons = props.icons,
-        .on_pick = ui.handler(.pick_image),
-        .on_remove = ui.handler(.remove_image),
+        .on_pick = try ui.bind(App, .pick_image),
+        .on_remove = try ui.bind(App, .remove_image),
     });
-    try steps.connector(App, ui, image_size != null);
+    try steps.connector(ui, image_size != null);
     try ui.child(steps.TargetStep, {}, .{
         .target = if (state.target) |*target| target else null,
         .enabled = state.image != null,
         .locked = state.flashing(),
         .image_size = image_size,
-        .icons = props.icons,
-        .on_open = ui.handler(.open_drives),
+        .on_open = try ui.bind(App, .open_drives),
     });
-    try steps.connector(App, ui, state.ready() or state.flashing());
+    try steps.connector(ui, state.ready() or state.flashing());
     try ui.child(steps.FlashStep, {}, .{
         .ready = state.ready(),
         .running = switch (state.flash) {
             .running => |*running| running,
             else => null,
         },
-        .icons = props.icons,
-        .on_flash = ui.handler(.request_flash),
-        .on_cancel = ui.handler(.cancel_flash),
+        .on_flash = try ui.bind(App, .request_flash),
+        .on_cancel = try ui.bind(App, .cancel_flash),
     });
 }

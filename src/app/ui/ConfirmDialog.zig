@@ -9,28 +9,14 @@ const model = @import("model.zig");
 const theme = @import("theme.zig");
 const format = @import("format.zig");
 
-const ConfirmDialog = @This();
-
-pub const State = struct {};
-
-pub const Msg = union(enum) { confirm, cancel };
-
 pub const Props = struct {
     drive: *const model.Drive,
     image_name: []const u8,
-    icons: *const model.Icons,
-    on_confirm: app.Handler(void),
-    on_cancel: app.Handler(void),
+    on_confirm: app.Action,
+    on_cancel: app.Action,
 };
 
-pub fn update(_: *State, msg: Msg, ctx: *app.Update(ConfirmDialog)) void {
-    switch (msg) {
-        .confirm => ctx.emit(ctx.props.on_confirm, {}),
-        .cancel => ctx.emit(ctx.props.on_cancel, {}),
-    }
-}
-
-pub fn view(ui: *app.Scope(ConfirmDialog), _: *const State, props: Props) !void {
+pub fn view(ui: *app.Ui, props: Props) !void {
     const drive = props.drive;
 
     try ui.open("backdrop", .{
@@ -47,46 +33,39 @@ pub fn view(ui: *app.Scope(ConfirmDialog), _: *const State, props: Props) !void 
     });
     defer ui.close();
 
-    const warning_color = if (drive.system) theme.danger else theme.warning;
-    try theme.icon(ConfirmDialog, ui, try props.icons.content(ui.arena(), .warning, warning_color), 40);
+    try theme.icon(ui, .warning, if (drive.system) theme.danger else theme.warning, 40);
 
     var name_buffer: [64]u8 = undefined;
     const name = format.middle(&name_buffer, drive.name, 32);
-    var title_style = theme.font(.heading, theme.card_text);
-    title_style.alignment = .center;
-    try ui.text(try ui.fmt("Erase {s}?", .{name}), title_style);
+    try ui.print(theme.font(.heading, theme.card_text).with(.{ .alignment = .center }), "Erase {s}?", .{name});
 
-    var size_buffer: [32]u8 = undefined;
     var image_buffer: [64]u8 = undefined;
-    var body = theme.font(.body, theme.card_muted);
-    body.alignment = .center;
-    try paragraph(ui, try ui.fmt("Everything on {s} ({s}, {s}) will be replaced with {s}. This can't be undone.", .{
+    const body = theme.font(.body, theme.card_muted).with(.{ .alignment = .center });
+    try paragraph(ui, body, "Everything on {s} ({f}, {s}) will be replaced with {s}. This can't be undone.", .{
         name,
-        format.bytes(&size_buffer, drive.size),
+        format.bytes(drive.size),
         drive.location,
         format.middle(&image_buffer, props.image_name, 40),
-    }), body);
+    });
 
     if (drive.system) {
-        var alarm = theme.font(.body, theme.danger);
-        alarm.alignment = .center;
-        alarm.font_weight = .semibold;
-        try paragraph(ui, "This is a system drive. Writing to it can leave this Mac unable to start.", alarm);
+        const alarm = theme.font(.body, theme.danger).with(.{ .alignment = .center, .font_weight = .semibold });
+        try paragraph(ui, alarm, "This is a system drive. Writing to it can leave this Mac unable to start.", .{});
     }
 
     try ui.open(null, .{ .layout = .{ .padding = .init(0, 0, 8, 0), .child_gap = 12 } });
     defer ui.close();
-    try theme.button(ConfirmDialog, ui, "cancel", "Cancel", .{ .on_click = .cancel, .kind = .secondary, .height = 38 });
-    try theme.button(ConfirmDialog, ui, "confirm", if (drive.system) "Erase system drive" else "Yes, flash it", .{
-        .on_click = .confirm,
+    try theme.button(ui, "cancel", "Cancel", .{ .on_click = props.on_cancel, .kind = .secondary, .height = 38 });
+    try theme.button(ui, "confirm", if (drive.system) "Erase system drive" else "Yes, flash it", .{
+        .on_click = props.on_confirm,
         .kind = if (drive.system) .danger else .primary,
         .height = 38,
     });
 }
 
-/// Text wrapped to the card's width.
-fn paragraph(ui: *app.Scope(ConfirmDialog), text: []const u8, style: fabrum.layout.text.Style) !void {
+/// Text wrapped to the card's width, formatted as with `ui.print`.
+fn paragraph(ui: *app.Ui, style: fabrum.layout.text.Style, comptime fmt: []const u8, args: anytype) !void {
     try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .fixed(388) }, .child_alignment = .top_center } });
     defer ui.close();
-    try ui.text(text, style);
+    try ui.print(style, fmt, args);
 }
