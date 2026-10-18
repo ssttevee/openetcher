@@ -178,8 +178,7 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) !void {
                 else => return,
             };
             if (index >= list.items.len or state.flashing()) return;
-            const target = list.items[index].clone(gpa) catch return;
-            state.setTarget(gpa, target);
+            state.setTarget(gpa, try list.items[index].clone(gpa));
             state.dialog = .none;
         },
 
