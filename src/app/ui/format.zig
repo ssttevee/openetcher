@@ -1,9 +1,9 @@
-//! Formatting for what the interface shows: sizes, speeds, durations and
-//! shortened names.
+//! Formatting for what the interface shows: sizes, speeds and durations.
 //!
-//! Sizes, speeds and durations are values with a `format` method, so views
-//! print them with `{f}`, as in
-//! `ui.print(style, "{f} · {s}", .{ format.bytes(size), codec })`.
+//! Each is a value with a `format` method, so views print it with `{f}`,
+//! as in `ui.print(style, "{f} · {s}", .{ format.bytes(size), codec })`.
+//! Long names aren't shortened here: text styles cut them to fit with
+//! `overflow`.
 const std = @import("std");
 const Writer = std.Io.Writer;
 
@@ -63,26 +63,6 @@ pub const Duration = struct {
     }
 };
 
-/// `text` shortened to at most `max` bytes by cutting out its middle, which
-/// keeps both the start and the extension of a file name. Cuts only on
-/// UTF-8 character boundaries.
-pub fn middle(buffer: []u8, text: []const u8, max: usize) []const u8 {
-    const ellipsis = "\u{2026}";
-    if (text.len <= max or max <= ellipsis.len + 2) return text;
-
-    const keep = max - ellipsis.len;
-    var head = keep / 2;
-    var tail_start = text.len - (keep - head);
-    while (head > 0 and isContinuation(text[head])) head -= 1;
-    while (tail_start < text.len and isContinuation(text[tail_start])) tail_start += 1;
-
-    return std.fmt.bufPrint(buffer, "{s}{s}{s}", .{ text[0..head], ellipsis, text[tail_start..] }) catch text;
-}
-
-fn isContinuation(byte: u8) bool {
-    return byte & 0b1100_0000 == 0b1000_0000;
-}
-
 test bytes {
     try std.testing.expectFmt("0 B", "{f}", .{bytes(0)});
     try std.testing.expectFmt("999 B", "{f}", .{bytes(999)});
@@ -101,13 +81,4 @@ test duration {
     try std.testing.expectFmt("45s", "{f}", .{duration(44.6)});
     try std.testing.expectFmt("3m 05s", "{f}", .{duration(185)});
     try std.testing.expectFmt("1h 02m", "{f}", .{duration(3725)});
-}
-
-test middle {
-    var buffer: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("short.img", middle(&buffer, "short.img", 20));
-    try std.testing.expectEqualStrings("raspios-b\u{2026}ite.img.xz", middle(&buffer, "raspios-bookworm-arm64-lite.img.xz", 22));
-    // never splits a multi-byte character
-    const cut = middle(&buffer, "ééééééééééééé.img", 12);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
 }

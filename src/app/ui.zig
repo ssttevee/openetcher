@@ -15,6 +15,7 @@ pub const theme = @import("ui/theme.zig");
 pub const format = @import("ui/format.zig");
 pub const App = @import("ui/App.zig");
 pub const DriveSelector = @import("ui/DriveSelector.zig");
+pub const steps = @import("ui/steps.zig");
 
 test {
     _ = format;
@@ -411,4 +412,43 @@ test "a relisting that reorders the drives keeps the picked one" {
     try h.listDrives(&.{ file_target, sd_card });
     try h.click("Select");
     try testing.expectEqualStrings("/tmp/target.img", h.state().target.?.path);
+}
+
+test "long names are cut to fit, and keep both ends" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+
+    const long_name = "raspios-bookworm-arm64-lite-2024-11-19-with-desktop-and-recommended-software.img.xz";
+    try h.pickImage("/images/" ++ long_name, 2_000_000_000);
+    const name = h.findText(long_name).?;
+    try testing.expect(name.bbox.w <= steps.width);
+
+    const drive: model.Drive = .{
+        .path = "/dev/disk6",
+        .name = "Generic Multi-Card Reader With An Unreasonably Long Product Name",
+        .location = "/dev/disk6, /Volumes/A Volume With A Long Name, /Volumes/Another",
+        .size = 64_000_000_000,
+        .system = false,
+        .removable = true,
+    };
+    try h.click("Select target");
+    try h.listDrives(&.{drive});
+    // the row's name gives way to the size and location columns
+    const row_name = h.findText(drive.name).?;
+    const location = h.findText(drive.location).?;
+    try testing.expect(row_name.bbox.x + row_name.bbox.w <= location.bbox.x);
+    try testing.expect(location.bbox.w <= 170);
+
+    try h.click(drive.name);
+    try h.click("Select");
+    try h.click("Flash!");
+    const title = h.findText("Erase " ++ drive.name ++ "?").?;
+    // within the dialog's card, less its padding
+    try testing.expect(title.bbox.w <= 440 - 2 * 26);
+    var lines = TestRuntime.Text.asTextContent(title.data.content).?.lines(title.bbox.w);
+    const shown = (try lines.next()).?;
+    try testing.expect(std.mem.startsWith(u8, shown, "Erase "));
+    try testing.expect(std.mem.endsWith(u8, shown, "?"));
+    try testing.expect(std.mem.indexOf(u8, shown, layout.text.ellipsis) != null);
 }

@@ -30,15 +30,12 @@ pub fn view(ui: *app.Ui, props: Props) !void {
     {
         try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .fixed(480) }, .child_alignment = .top_center } });
         defer ui.close();
-        var image_buffer: [64]u8 = undefined;
-        var drive_buffer: [64]u8 = undefined;
-        const image = format.middle(&image_buffer, props.image_name, 40);
-        const drive = format.middle(&drive_buffer, props.drive_name, 32);
-        const detail = theme.font(.body, theme.muted).with(.{ .alignment = .center });
+        // names too long for a line of their own are cut in the middle
+        const detail = theme.font(.body, theme.muted).with(.{ .alignment = .center, .overflow = .ellipsis_middle });
         switch (props.outcome) {
-            .done => try ui.print(detail, "{s} was written to {s} and validated.", .{ image, drive }),
+            .done => try ui.print(detail, "{s} was written to {s} and validated.", .{ props.image_name, props.drive_name }),
             .failed => |err| try ui.text(model.describeError(err), detail),
-            .canceled => try ui.print(detail, "{s} may be partly written.", .{drive}),
+            .canceled => try ui.print(detail, "{s} may be partly written.", .{props.drive_name}),
         }
     }
 

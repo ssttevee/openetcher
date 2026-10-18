@@ -95,8 +95,7 @@ pub fn view(ui: *app.Ui, state: *const State, props: Props) !void {
         try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .grow(.{}) }, .child_alignment = .center_left, .child_gap = 10 } });
         defer ui.close();
         try ui.text("Select target", theme.font(.heading, theme.card_text));
-        try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .grow(.{}) } } });
-        ui.close();
+        ui.spacer();
         if (!props.loading) try theme.link(ui, "refresh", "Refresh", props.on_refresh, theme.accent);
     }
 
@@ -116,8 +115,7 @@ pub fn view(ui: *app.Ui, state: *const State, props: Props) !void {
             try ui.fmt("Show {d} hidden", .{hidden});
         try theme.link(ui, "hidden", label, try ui.bind(DriveSelector, .toggle_hidden), theme.card_muted);
     }
-    try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .grow(.{}) } } });
-    ui.close();
+    ui.spacer();
     try theme.button(ui, "cancel", "Cancel", .{ .on_click = props.on_cancel, .kind = .secondary, .height = 36 });
     try theme.button(ui, "select", "Select", .{
         .on_click = if (selectedIndex(state, props) != null) try ui.bind(DriveSelector, .select) else null,
@@ -191,8 +189,7 @@ const Row = struct {
         {
             try ui.open(null, .{ .layout = .{ .sizing = .{ .width = .grow(.{}) }, .axis = .y, .child_gap = 3 } });
             defer ui.close();
-            var name_buffer: [64]u8 = undefined;
-            try ui.text(format.middle(&name_buffer, drive.name, 36), theme.font(.body, text_color).with(.{ .font_weight = .medium, .wrap_mode = .none }));
+            try ui.text(drive.name, theme.font(.body, text_color).with(.{ .font_weight = .medium, .wrap_mode = .none, .overflow = .ellipsis_middle }));
 
             try ui.open(null, .{ .layout = .{ .child_gap = 6 } });
             defer ui.close();
@@ -203,8 +200,7 @@ const Row = struct {
         }
 
         try column(ui, .fixed(size_width), try ui.fmt("{f}", .{format.bytes(drive.size)}), theme.font(.body, text_color));
-        var location_buffer: [64]u8 = undefined;
-        try column(ui, .fixed(location_width), format.middle(&location_buffer, drive.location, 26), theme.font(.small, theme.card_muted));
+        try column(ui, .fixed(location_width), drive.location, theme.font(.small, theme.card_muted).with(.{ .overflow = .ellipsis_middle }));
     }
 };
 

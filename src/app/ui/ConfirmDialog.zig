@@ -35,17 +35,17 @@ pub fn view(ui: *app.Ui, props: Props) !void {
 
     try theme.icon(ui, .warning, if (drive.system) theme.danger else theme.warning, 40);
 
-    var name_buffer: [64]u8 = undefined;
-    const name = format.middle(&name_buffer, drive.name, 32);
-    try ui.print(theme.font(.heading, theme.card_text).with(.{ .alignment = .center }), "Erase {s}?", .{name});
+    // one line, which keeps "Erase" and the question mark around a long name
+    const title = theme.font(.heading, theme.card_text).with(.{ .alignment = .center, .wrap_mode = .none, .overflow = .ellipsis_middle });
+    try ui.print(title, "Erase {s}?", .{drive.name});
 
-    var image_buffer: [64]u8 = undefined;
-    const body = theme.font(.body, theme.card_muted).with(.{ .alignment = .center });
+    // names too long for a line of their own are cut in the middle
+    const body = theme.font(.body, theme.card_muted).with(.{ .alignment = .center, .overflow = .ellipsis_middle });
     try paragraph(ui, body, "Everything on {s} ({f}, {s}) will be replaced with {s}. This can't be undone.", .{
-        name,
+        drive.name,
         format.bytes(drive.size),
         drive.location,
-        format.middle(&image_buffer, props.image_name, 40),
+        props.image_name,
     });
 
     if (drive.system) {

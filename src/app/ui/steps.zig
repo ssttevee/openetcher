@@ -41,13 +41,12 @@ fn open(ui: *app.Ui, icon: model.Icon, color: Color, done: bool) !void {
     ui.close();
 }
 
-/// What a step has chosen, in place of its button, shortened in the
-/// middle.
+/// What a step has chosen, in place of its button, cut in the middle to
+/// fit.
 fn chosen(ui: *app.Ui, name: []const u8) !void {
     try ui.open(null, .{ .layout = .{ .sizing = .{ .height = .fixed(button_height) }, .child_alignment = .center } });
     defer ui.close();
-    var buffer: [64]u8 = undefined;
-    try ui.text(format.middle(&buffer, name, 24), theme.font(.label, theme.text).with(.{ .wrap_mode = .none }));
+    try ui.text(name, theme.font(.label, theme.text).with(.{ .wrap_mode = .none, .overflow = .ellipsis_middle }));
 }
 
 /// A wrapped, centered line under a step's button, formatted as with
