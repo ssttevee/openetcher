@@ -215,28 +215,18 @@ fn readBootSector(io: std.Io, r: *const Reader, size: u64) !BootSector {
 
 fn clusterAllocated(filesystem: Filesystem, fat: []const u8, cluster: u32) bool {
     return switch (filesystem) {
-        .fat16 => blk: {
-            const offset = @as(usize, cluster) * 2;
-            if (offset + 2 > fat.len) break :blk false;
-            const value = readU16(fat[offset .. offset + 2]);
-            break :blk value != 0;
-        },
-        .fat32 => blk: {
-            const offset = @as(usize, cluster) * 4;
-            if (offset + 4 > fat.len) break :blk false;
-            const value = readU32(fat[offset .. offset + 4]) & 0x0fffffff;
-            break :blk value != 0;
-        },
+        .fat16 => (fatEntry(u16, fat, cluster) orelse 0) != 0,
+        // The top four bits of a FAT32 entry are reserved.
+        .fat32 => (fatEntry(u32, fat, cluster) orelse 0) & 0x0fffffff != 0,
         else => false,
     };
 }
 
-fn readU16(bytes: []const u8) u16 {
-    return std.mem.readInt(u16, bytes[0..2], .little);
-}
-
-fn readU32(bytes: []const u8) u32 {
-    return std.mem.readInt(u32, bytes[0..4], .little);
+/// The entry for `cluster` in a FAT of `T`-sized entries; null past its end.
+fn fatEntry(comptime T: type, fat: []const u8, cluster: u32) ?T {
+    const offset = @as(usize, cluster) * @sizeOf(T);
+    if (offset + @sizeOf(T) > fat.len) return null;
+    return std.mem.readInt(T, fat[offset..][0..@sizeOf(T)], .little);
 }
 
 // Filesystem driver contract; see driver.zig.
