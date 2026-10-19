@@ -13,11 +13,8 @@ pub const Region = struct {
     }
 
     pub fn contains(self: @This(), relative: ByteRange) !bool {
-        if (std.math.add(u64, relative.offset, relative.length)) |relative_end| {
-            return relative_end <= self.length;
-        } else |_| {
-            return error.RangeOverflow;
-        }
+        const relative_end = std.math.add(u64, relative.offset, relative.length) catch return error.RangeOverflow;
+        return relative_end <= self.length;
     }
 
     pub fn toImageOffset(self: @This(), relative_offset: u64) !u64 {
