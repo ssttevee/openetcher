@@ -72,19 +72,10 @@ pub fn probeImage(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !
     var analysis = try analyzeReader(io, allocator, &r);
     defer analysis.deinit(allocator);
 
-    const info = analysis.takeInfo();
-    return .{
-        .image_size = image_size,
-        .encoded_size = image_size,
-        .compression = info.compression,
-        .layout = info.layout,
-        .filesystem = info.filesystem,
-        .block_size = info.block_size,
-        .used_bytes = info.used_bytes,
-        .skipped_bytes = info.skipped_bytes,
-        .range_count = info.range_count,
-        .partitions = info.partitions,
-    };
+    var info = analysis.takeInfo();
+    info.image_size = image_size;
+    info.encoded_size = image_size;
+    return info;
 }
 
 pub fn probeImageFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) !Info {
@@ -122,20 +113,10 @@ pub fn probeImageSource(allocator: std.mem.Allocator, io: std.Io, image_source: 
     var analysis = try analyzeSource(allocator, io, image_source, options.max_image_size);
     defer analysis.deinit(allocator);
 
-    const image_size = analysis.info.image_size;
-    const info = analysis.takeInfo();
-    return .{
-        .image_size = image_size,
-        .encoded_size = image_source.metadata.encoded_size orelse image_size,
-        .compression = image_source.metadata.compression,
-        .layout = info.layout,
-        .filesystem = info.filesystem,
-        .block_size = info.block_size,
-        .used_bytes = info.used_bytes,
-        .skipped_bytes = info.skipped_bytes,
-        .range_count = info.range_count,
-        .partitions = info.partitions,
-    };
+    var info = analysis.takeInfo();
+    info.encoded_size = image_source.metadata.encoded_size orelse info.image_size;
+    info.compression = image_source.metadata.compression;
+    return info;
 }
 
 pub fn probeImageSourceFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8, options: ProbeOptions) !Info {
@@ -321,67 +302,46 @@ fn planPartition(io: std.Io, allocator: std.mem.Allocator, r: *const reader.Read
         if (fs_drivers.claimsMbrType(D, span.partition_type)) return planWithDriver(D, io, allocator, span, &sr);
     }
 
-    if (span.partition_type == 0x83) {
+    if (span.partition_type == mbr.linux_partition_type) {
         if (fs_api.squashfs.detect(io, &sr)) {
             return planWithDriver(fs_api.squashfs, io, allocator, span, &sr);
         }
 
-        if (partitionHeadIsZero(io, &sr)) {
-            return .{ .partition = .{
-                .index = span.index,
-                .start_offset = span.start_offset,
-                .size = span.size,
-                .partition_type = span.partition_type,
-                .filesystem = .empty,
-                .supported = false,
-                .reason = .empty,
-            } };
-        }
+        if (partitionHeadIsZero(io, &sr)) return unsupportedPartition(span, .empty, .empty);
 
         return planWithDriver(fs_api.ext4, io, allocator, span, &sr);
     }
 
-    return .{ .partition = .{
-        .index = span.index,
-        .start_offset = span.start_offset,
-        .size = span.size,
-        .partition_type = span.partition_type,
-        .filesystem = .unknown,
-        .supported = false,
-        .reason = .unknown_type,
-    } };
+    return unsupportedPartition(span, .unknown, .unknown_type);
 }
 
 fn planWithDriver(comptime D: type, io: std.Io, allocator: std.mem.Allocator, span: mbr.PartitionSpan, sr: *const reader.Reader) PartitionPlan {
     comptime fs_drivers.validate(D);
     const probe = D.probeRegion(allocator, io, sr) catch |err| {
-        return .{ .partition = .{
-            .index = span.index,
-            .start_offset = span.start_offset,
-            .size = span.size,
-            .partition_type = span.partition_type,
-            .filesystem = D.unrecognized,
-            .supported = false,
-            .reason = .{ .driver_failed = .{ .driver = D.name, .stage = .probe, .err = err } },
-        } };
+        return unsupportedPartition(span, D.unrecognized, .{ .driver_failed = .{ .driver = D.name, .stage = .probe, .err = err } });
     };
 
     const relative_ranges = D.collectRanges(allocator, io, sr) catch |err| {
-        return .{ .partition = .{
-            .index = span.index,
-            .start_offset = span.start_offset,
-            .size = span.size,
-            .partition_type = span.partition_type,
-            .filesystem = probe.filesystem,
-            .supported = false,
-            .reason = .{ .driver_failed = .{ .driver = D.name, .stage = .range_collection, .err = err } },
-        } };
+        return unsupportedPartition(span, probe.filesystem, .{ .driver_failed = .{ .driver = D.name, .stage = .range_collection, .err = err } });
     };
 
     return .{
         .partition = .probed(probe, span.index, span.start_offset, span.size, span.partition_type),
         .relative_ranges = relative_ranges,
     };
+}
+
+/// `span` as a partition the planner cannot write, with why.
+fn unsupportedPartition(span: mbr.PartitionSpan, filesystem: Info.Filesystem, reason: Info.Reason) PartitionPlan {
+    return .{ .partition = .{
+        .index = span.index,
+        .start_offset = span.start_offset,
+        .size = span.size,
+        .partition_type = span.partition_type,
+        .filesystem = filesystem,
+        .supported = false,
+        .reason = reason,
+    } };
 }
 
 fn partitionHeadIsZero(io: std.Io, sr: *const reader.Reader) bool {

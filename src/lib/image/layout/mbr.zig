@@ -8,6 +8,8 @@ pub const sector_size: usize = 512;
 pub const partition_entry_offset: usize = 446;
 pub const partition_entry_size: usize = 16;
 pub const partition_entry_count: usize = 4;
+/// The type byte for a Linux partition, which may hold any filesystem.
+pub const linux_partition_type: u8 = 0x83;
 
 /// The classic MBR sector. Partition entries start at the unaligned offset
 /// 446, so every multi-byte field is declared `align(1)`.
