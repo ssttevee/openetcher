@@ -5,7 +5,6 @@ const range = @import("../../range.zig");
 const reader_mod = @import("../reader.zig");
 const ondisk = @import("../ondisk.zig");
 
-pub const ImageInfo = types.Info;
 pub const ByteRange = range.ByteRange;
 pub const Reader = reader_mod.Reader;
 
@@ -57,38 +56,6 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
     return ranges;
 }
 
-// File-handle wrappers kept for library callers.
-
-pub fn looksLikeIso9660(io: std.Io, file: std.Io.File, image_size: u64) !bool {
-    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
-    const r = region.reader();
-    return detect(io, &r);
-}
-
-pub fn probeIso9660Image(io: std.Io, file: std.Io.File) !ImageInfo {
-    const image_size = try file.length(io);
-    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
-    const r = region.reader();
-    if (!detect(io, &r)) return error.InvalidIso9660Image;
-
-    return .{
-        .image_size = image_size,
-        .layout = .raw_iso9660,
-        .filesystem = .iso9660,
-        .block_size = logical_block_size,
-        .used_bytes = image_size,
-        .skipped_bytes = 0,
-        .range_count = 1,
-    };
-}
-
-pub fn collectIso9660Ranges(allocator: std.mem.Allocator, io: std.Io, file: std.Io.File) ![]ByteRange {
-    const image_size = try file.length(io);
-    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
-    const r = region.reader();
-    return collectRanges(allocator, io, &r);
-}
-
 // Filesystem driver contract; see driver.zig.
 
 pub const name = "iso9660";
@@ -96,9 +63,7 @@ pub const unrecognized: types.Info.Filesystem = .linux_unknown;
 pub const raw_layout: types.Info.Layout = .raw_iso9660;
 pub const filesystem: types.Info.Filesystem = .iso9660;
 
-pub fn blockSize(io: std.Io, r: *const Reader) error{}!u32 {
-    _ = io;
-    _ = r;
+pub fn blockSize(_: std.Io, _: *const Reader) error{}!u32 {
     return logical_block_size;
 }
 

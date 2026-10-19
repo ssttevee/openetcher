@@ -6,7 +6,6 @@ const types = @import("../types.zig");
 const ondisk = @import("../ondisk.zig");
 
 pub const ByteRange = range.ByteRange;
-pub const PartitionInfo = types.Info.PartitionInfo;
 pub const Filesystem = types.Info.Filesystem;
 pub const Reader = reader_mod.Reader;
 
@@ -143,20 +142,6 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
     }
 
     return range.normalizeWithin(allocator, ranges.items, r.size);
-}
-
-// File-handle wrappers kept for library callers.
-
-pub fn probeFatPartition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
-    var region = reader_mod.FileRegion.init(io, file, start_offset, size);
-    const r = region.reader();
-    return .probed(try probeRegion(allocator, io, &r), 0, start_offset, size, 0);
-}
-
-pub fn collectFatRangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
-    var region = reader_mod.FileRegion.init(io, file, start_offset, size);
-    const r = region.reader();
-    return collectRanges(allocator, io, &r);
 }
 
 fn readBootSector(io: std.Io, r: *const Reader, size: u64) !BootSector {

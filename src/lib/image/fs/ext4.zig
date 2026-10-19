@@ -5,16 +5,12 @@ const reader_mod = @import("../reader.zig");
 const types = @import("../types.zig");
 
 pub const ByteRange = range.ByteRange;
-pub const ImageInfo = types.Info;
-pub const PartitionInfo = types.Info.PartitionInfo;
 pub const Reader = reader_mod.Reader;
 
 const ondisk = @import("../ondisk.zig");
-const mbr = @import("../layout/mbr.zig");
 const scan = @import("../../scan.zig");
 
 const superblock_offset: u64 = 1024;
-const sector_size: usize = 512;
 const ext4_magic: u16 = 0xEF53;
 
 /// On-disk ext4 structures, as laid out in the kernel's ext4 documentation.
@@ -316,66 +312,6 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
     return range.normalizeWithin(allocator, used_blocks.items, r.size);
 }
 
-// File-handle wrappers kept for library callers.
-
-pub fn probeExt4Image(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) !ImageInfo {
-    const ranges = try collectExt4Ranges(io, allocator, file);
-    defer allocator.free(ranges);
-
-    const image_size = try file.length(io);
-    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
-    const r = region.reader();
-    const block_size = try superblockBlockSize(io, &r);
-
-    var used_bytes: u64 = 0;
-    for (ranges) |segment| used_bytes += segment.length;
-
-    return .{
-        .image_size = image_size,
-        .layout = .raw_ext4,
-        .filesystem = .ext4,
-        .block_size = block_size,
-        .used_bytes = used_bytes,
-        .skipped_bytes = image_size - used_bytes,
-        .range_count = ranges.len,
-    };
-}
-
-pub fn probeExt4ImageFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) !ImageInfo {
-    var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
-    defer file.close(io);
-
-    return probeExt4Image(io, allocator, file);
-}
-
-pub fn collectExt4Ranges(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ![]ByteRange {
-    const image_size = try file.length(io);
-    try rejectUnsupportedImageLayout(io, file, image_size);
-
-    var region = reader_mod.FileRegion.init(io, file, 0, image_size);
-    const r = region.reader();
-    return collectRanges(allocator, io, &r);
-}
-
-pub fn collectExt4RangesFromPath(allocator: std.mem.Allocator, io: std.Io, image_path: []const u8) ![]ByteRange {
-    var file = try std.Io.Dir.cwd().openFile(io, image_path, .{ .mode = .read_only, .allow_directory = false });
-    defer file.close(io);
-
-    return collectExt4Ranges(io, allocator, file);
-}
-
-pub fn collectExt4RangesInRegion(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) ![]ByteRange {
-    var region = reader_mod.FileRegion.init(io, file, start_offset, size);
-    const r = region.reader();
-    return collectRanges(allocator, io, &r);
-}
-
-pub fn probeExt4Partition(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File, start_offset: u64, size: u64) !PartitionInfo {
-    var region = reader_mod.FileRegion.init(io, file, start_offset, size);
-    const r = region.reader();
-    return .probed(try probeRegion(allocator, io, &r), 0, start_offset, size, 0x83);
-}
-
 fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
     const raw = try ondisk.read(OnDisk.Superblock, io, r, superblock_offset);
     if (raw.magic != ext4_magic) return error.InvalidExt4Superblock;
@@ -397,17 +333,6 @@ fn readSuperblock(io: std.Io, r: *const Reader) !Superblock {
         .desc_size = raw.desc_size,
         .inode_size = if (dynamic) raw.inode_size else 128,
     };
-}
-
-fn rejectUnsupportedImageLayout(io: std.Io, file: std.Io.File, image_size: u64) !void {
-    if (image_size < sector_size) return;
-
-    var sector: [sector_size]u8 = undefined;
-    const count = try file.readPositionalAll(io, &sector, 0);
-    if (count != sector.len) return error.InvalidExt4Superblock;
-
-    if (!mbr.looksLikeMbr(&sector)) return;
-    return error.UnsupportedImageLayout;
 }
 
 fn validateSuperblock(superblock: Superblock, image_size: u64) !void {
