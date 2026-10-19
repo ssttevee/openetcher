@@ -11,6 +11,13 @@ pub const VerifyMode = enum {
     digest,
     reread_source,
     written,
+
+    /// Whether verification decodes the source a second time and compares
+    /// it with the target, rather than trusting the digest taken while
+    /// writing.
+    pub fn rereadsSource(self: VerifyMode) bool {
+        return self == .reread_source or self == .written;
+    }
 };
 
 pub const Strategy = enum {
@@ -87,7 +94,7 @@ pub fn flashSource(allocator: std.mem.Allocator, io: std.Io, source: *root.Image
 }
 
 pub fn flashPlannedSource(allocator: std.mem.Allocator, io: std.Io, image_source: *root.ImageSource, destination_path: []const u8, plan: root.FlashPlan, options: Options) !Report {
-    try validatePlan(plan);
+    try validatePlan(plan.image_size, plan.ranges);
     var stream = try image_source.openStream(io, allocator);
     defer stream.deinit();
     if (options.max_image_size) |limit| stream.max_image_size = limit;
@@ -97,7 +104,7 @@ pub fn flashPlannedSource(allocator: std.mem.Allocator, io: std.Io, image_source
 
     const result = try flashStream(allocator, io, &stream, &target, plan.image_size, plan.ranges, options);
 
-    if (options.verify == .reread_source or options.verify == .written) {
+    if (options.verify.rereadsSource()) {
         var verify_stream = try image_source.openStream(io, allocator);
         defer verify_stream.deinit();
         if (options.max_image_size) |limit| verify_stream.max_image_size = limit;
@@ -121,7 +128,7 @@ fn flashFullSource(allocator: std.mem.Allocator, io: std.Io, image_source: *root
 
     const result = try flashStream(allocator, io, &stream, &target, image_source.metadata.image_size, null, options);
 
-    if (options.verify == .reread_source or options.verify == .written) {
+    if (options.verify.rereadsSource()) {
         var verify_stream = try image_source.openStream(io, allocator);
         defer verify_stream.deinit();
         if (options.max_image_size) |limit| verify_stream.max_image_size = limit;
@@ -132,12 +139,12 @@ fn flashFullSource(allocator: std.mem.Allocator, io: std.Io, image_source: *root
     return result.report;
 }
 
-fn validatePlan(plan: root.FlashPlan) !void {
+fn validatePlan(image_size: u64, ranges: []const ByteRange) !void {
     var previous_end: u64 = 0;
-    for (plan.ranges, 0..) |item, index| {
+    for (ranges, 0..) |item, index| {
         if (item.length == 0) return error.InvalidFlashPlan;
         const end = std.math.add(u64, item.offset, item.length) catch return error.RangeOverflow;
-        if (end > plan.image_size) return error.RangeOutsideImage;
+        if (end > image_size) return error.RangeOutsideImage;
         if (index != 0 and item.offset < previous_end) return error.InvalidFlashPlan;
         previous_end = end;
     }
@@ -280,7 +287,7 @@ fn flashStream(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, t
     }
     if (ranges) |items| {
         const image_size = expected_size orelse return error.InvalidImageSize;
-        try validatePlan(.{ .image_size = image_size, .ranges = @constCast(items) });
+        try validatePlan(image_size, items);
         // Chunks start at range offsets, so this check before the first
         // write keeps a plan the device would reject from half-writing it.
         for (items) |item| if (!capabilities.isWriteAligned(item.offset)) return error.UnalignedTargetOffset;
@@ -428,7 +435,7 @@ fn verifyDigestTarget(allocator: std.mem.Allocator, io: std.Io, target: *device.
 }
 
 fn verifySourceRanges(allocator: std.mem.Allocator, io: std.Io, stream: *root.Stream, target: *device.OpenTarget, image_size: u64, ranges: []const ByteRange, options: Options) !void {
-    try validatePlan(.{ .image_size = image_size, .ranges = @constCast(ranges) });
+    try validatePlan(image_size, ranges);
     const source_buffer = try allocator.alloc(u8, options.block_size);
     defer allocator.free(source_buffer);
     const target_buffer = try allocator.alloc(u8, options.block_size);
@@ -480,7 +487,7 @@ pub fn flashToPathFromPath(allocator: std.mem.Allocator, io: std.Io, image_path:
 
     const result = try flashStream(allocator, io, &stream, &target, image_size, ranges, options);
 
-    if (options.verify == .reread_source or options.verify == .written) {
+    if (options.verify.rereadsSource()) {
         var verify_stream = try openFileStream(io, allocator, source_file);
         defer verify_stream.deinit();
         try verifySourceRanges(allocator, io, &verify_stream, &target, image_size, ranges, options);
@@ -519,7 +526,7 @@ pub fn flashImage(allocator: std.mem.Allocator, io: std.Io, source: std.Io.File,
 
     const result = try flashStream(allocator, io, &stream, &target, image_size, ranges, options);
 
-    if (options.verify == .reread_source or options.verify == .written) {
+    if (options.verify.rereadsSource()) {
         var verify_stream = try openFileStream(io, allocator, source);
         defer verify_stream.deinit();
         try verifySourceRanges(allocator, io, &verify_stream, &target, image_size, ranges, options);
