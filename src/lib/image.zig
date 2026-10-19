@@ -273,17 +273,15 @@ fn analyzePartitioned(comptime L: type, io: std.Io, allocator: std.mem.Allocator
 /// Converts driver-relative ranges to absolute image ranges inside a span.
 fn toImageRanges(allocator: std.mem.Allocator, relative: []const ByteRange, span: mbr.PartitionSpan) ![]ByteRange {
     const absolute = try allocator.alloc(ByteRange, relative.len);
-    var completed: usize = 0;
-    errdefer allocator.free(absolute[0..completed]);
+    errdefer allocator.free(absolute);
 
-    for (relative) |item| {
+    for (absolute, relative) |*out, item| {
         const relative_end = std.math.add(u64, item.offset, item.length) catch return error.RangeOverflow;
         if (relative_end > span.size) return error.RegionOutOfBounds;
-        absolute[completed] = .{
+        out.* = .{
             .offset = try std.math.add(u64, span.start_offset, item.offset),
             .length = item.length,
         };
-        completed += 1;
     }
     return absolute;
 }
@@ -489,6 +487,18 @@ test "planImageFlash rejects unsupported mbr partitions" {
     const path = try tmp.dir.realPathFileAlloc(io, "disk.img", std.testing.allocator);
     defer std.testing.allocator.free(path);
     try std.testing.expectError(error.UnsupportedPartitionFilesystem, planImageFlashFromPath(std.testing.allocator, io, path));
+}
+
+test "toImageRanges rejects ranges past the span and frees what it allocated" {
+    const span: mbr.PartitionSpan = .{ .index = 1, .partition_type = 0x83, .start_offset = 4096, .size = 8192 };
+    const inside = try toImageRanges(std.testing.allocator, &.{ .{ .offset = 0, .length = 512 }, .{ .offset = 1024, .length = 7168 } }, span);
+    defer std.testing.allocator.free(inside);
+    try std.testing.expectEqualSlices(ByteRange, &.{ .{ .offset = 4096, .length = 512 }, .{ .offset = 5120, .length = 7168 } }, inside);
+
+    // The testing allocator fails the test if the error path frees less than
+    // it allocated.
+    try std.testing.expectError(error.RegionOutOfBounds, toImageRanges(std.testing.allocator, &.{ .{ .offset = 0, .length = 512 }, .{ .offset = 8192, .length = 1 } }, span));
+    try std.testing.expectError(error.RangeOverflow, toImageRanges(std.testing.allocator, &.{.{ .offset = std.math.maxInt(u64), .length = 1 }}, span));
 }
 
 test "appendGapRanges preserves non-partition disk gaps" {
