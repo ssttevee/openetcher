@@ -293,9 +293,8 @@ pub fn collectRanges(allocator: std.mem.Allocator, io: std.Io, r: *const Reader)
     var used_blocks: std.ArrayList(ByteRange) = .empty;
     defer used_blocks.deinit(allocator);
 
-    var group_index: u64 = 0;
-    while (group_index < groups_count) : (group_index += 1) {
-        const descriptor = descriptors[@intCast(group_index)];
+    for (descriptors, 0..) |descriptor, index| {
+        const group_index: u64 = index;
         const group_first_block = superblock.first_data_block + (group_index * superblock.blocks_per_group);
         const remaining_blocks = blocks_count - group_first_block;
         const blocks_in_group = @min(@as(u64, superblock.blocks_per_group), remaining_blocks);
