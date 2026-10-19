@@ -4,6 +4,10 @@
 
 The command-line tool is a thin layer over the `openetcher` library. Disk discovery works on macOS, Linux, and Windows; flashing physical disks works on macOS and Linux. The core planning and flashing library is platform-neutral.
 
+On macOS it also has a GUI in the style of balena Etcher, written with the [fabrum](https://github.com/ssttevee/fabrum) UI framework (see [macOS GUI](#macos-gui)).
+
+![OpenEtcher writing an image](docs/screenshots/flashing.png)
+
 ## Contents
 
 - [Requirements](#requirements)
@@ -25,7 +29,7 @@ The command-line tool is a thin layer over the `openetcher` library. Disk discov
 - macOS or Linux for flashing physical disks; Windows for listing them
 - On macOS, the DiskArbitration and CoreFoundation frameworks from the SDK, which the build links. Cross-building for another macOS architecture finds the SDK with `xcrun`
 
-The project has no third-party library dependencies.
+The library and command-line tool have no third-party dependencies. The macOS GUI depends on [fabrum](https://github.com/ssttevee/fabrum), which `zig build` fetches.
 
 ## Build and Test
 
@@ -204,7 +208,15 @@ On macOS, `zig build` also builds `openetcher-gui`, a window in the style of bal
 zig build gui
 ```
 
-It needs the [fabrum](../zig-layout) UI framework checked out next to this repository; it is a path dependency in `build.zig.zon`. Its AppKit platform brings the window, the file chooser, the dialogs and the Quartz canvas. Other platforms build without it.
+| Choose an image | Choose a target | Ready |
+|---|---|---|
+| ![The start screen](docs/screenshots/start.png) | ![The target list, with a file target picked](docs/screenshots/targets.png) | ![An image and a target chosen](docs/screenshots/ready.png) |
+
+| Flashing | Validating | Done |
+|---|---|---|
+| ![Writing, with speed and time left](docs/screenshots/flashing.png) | ![Reading the target back](docs/screenshots/validating.png) | ![Flash complete](docs/screenshots/done.png) |
+
+It is built on the [fabrum](https://github.com/ssttevee/fabrum) UI framework, a dependency in `build.zig.zon` that `zig build` fetches from GitHub. Its AppKit platform brings the window, the file chooser, the dialogs and the Quartz canvas. Other platforms build without it.
 
 - The image chooser (the system's open panel) offers `.img`, `.iso`, `.raw`, `.bin`, and images compressed with gzip, xz, zstd or bzip2. A compressed image is decoded into the spool when it is chosen, with its progress shown.
 - The target list comes from `listCandidateDisks` with system disks included but hidden until asked for; drives too small for the image can't be chosen. Writing to a drive asks for confirmation first, with a stronger warning for a system drive.
@@ -214,7 +226,7 @@ It needs the [fabrum](../zig-layout) UI framework checked out next to this repos
 
 The interface is in `src/app/ui/` as fabrum.app components, drawn in Etcher's own look on fabrum's canvas and tested without a window by `zig build test` (the file chooser and the quit dialog answered through fabrum's fake services). `src/app/main.zig` runs it in fabrum's AppKit window, and `src/app/services.zig` runs library calls on background tasks.
 
-Debug builds take two environment variables for development: `OPENETCHER_GUI_FILE_TARGETS`, colon-separated regular files offered as targets, which also refuses writing to anything else; and `OPENETCHER_GUI_SCRIPT`, steps that drive the window and save snapshots of it (see `src/app/main.zig`).
+Debug builds take three environment variables for development: `OPENETCHER_GUI_FILE_TARGETS`, colon-separated regular files offered as targets, which also refuses writing to anything else; `OPENETCHER_GUI_SCRIPT`, steps that drive the window and save snapshots of it (the screenshots above were taken this way, flashing an ISO to a file target); and `OPENETCHER_GUI_LAYOUT_FILE`, where the window writes the bounds of its texts for tests that drive it with real input (see `src/app/main.zig`).
 
 ## Image Support and Planning
 
@@ -568,6 +580,7 @@ Each filesystem ships one parser that serves both open-file and in-memory inputs
 | Physical-disk preparation (unmount) | Yes | Yes | No |
 | Physical-disk flashing | Yes | Yes | No |
 | Disk ids | Yes | Yes | Yes |
+| GUI | Yes | No | No |
 
 Windows lists disks but opens only regular-file targets: raw `\\.\PhysicalDriveN` writes, which need volume locking and dismounting first, are not implemented.
 
