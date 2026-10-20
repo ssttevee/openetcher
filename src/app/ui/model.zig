@@ -54,13 +54,27 @@ pub const Drive = struct {
 pub const DriveList = struct {
     items: []Drive,
 
+    pub fn clone(self: DriveList, gpa: Allocator) !DriveList {
+        const items = try gpa.alloc(Drive, self.items.len);
+        var count: usize = 0;
+        errdefer {
+            for (items[0..count]) |drive| drive.deinit(gpa);
+            gpa.free(items);
+        }
+        for (self.items, items) |drive, *item| {
+            item.* = try drive.clone(gpa);
+            count += 1;
+        }
+        return .{ .items = items };
+    }
+
     pub fn deinit(self: DriveList, gpa: Allocator) void {
         for (self.items) |drive| drive.deinit(gpa);
         gpa.free(self.items);
     }
 };
 
-/// The result of `Services.listDrives`.
+/// The result of `tasks.listDrives`.
 pub const DriveListing = union(enum) {
     listed: DriveList,
     failed: anyerror,
@@ -73,7 +87,7 @@ pub const DriveListing = union(enum) {
     }
 };
 
-/// What probing an image found. Strings are static.
+/// What probing an image found. Task messages borrow the strings.
 pub const ImageDetails = struct {
     /// Decoded size: what will be written at most.
     size: u64,
@@ -83,6 +97,20 @@ pub const ImageDetails = struct {
     compression: ?[]const u8 = null,
     /// The recognized layout, such as `mbr`.
     layout: []const u8,
+
+    pub fn clone(self: ImageDetails, gpa: Allocator) !ImageDetails {
+        const layout_name = try gpa.dupe(u8, self.layout);
+        errdefer gpa.free(layout_name);
+        var result = self;
+        result.layout = layout_name;
+        result.compression = if (self.compression) |c| try gpa.dupe(u8, c) else null;
+        return result;
+    }
+
+    pub fn deinit(self: ImageDetails, gpa: Allocator) void {
+        gpa.free(self.layout);
+        if (self.compression) |c| gpa.free(c);
+    }
 };
 
 /// How far loading has got: compressed images are decoded once, up front.
@@ -99,12 +127,7 @@ pub const ImageProgress = struct {
     loading: Loading,
 };
 
-pub const ImageHandlers = struct {
-    progress: app.Handler(ImageProgress),
-    loaded: app.Handler(ImageLoad),
-};
-
-/// The result of `Services.loadImage`, for the load with `id`.
+/// The result of `tasks.loadImage`, for the load with `id`.
 pub const ImageLoad = struct {
     id: u32,
     result: union(enum) {
@@ -125,7 +148,18 @@ pub const Image = struct {
         loading: Loading,
         ready: ImageDetails,
         failed: anyerror,
+        pub fn deinit(self: Status, gpa: Allocator) void {
+            switch (self) {
+                .ready => |details| details.deinit(gpa),
+                else => {},
+            }
+        }
     };
+
+    pub fn deinit(self: Image, gpa: Allocator) void {
+        gpa.free(self.path);
+        self.status.deinit(gpa);
+    }
 
     pub fn name(self: Image) []const u8 {
         return std.fs.path.basename(self.path);
@@ -232,41 +266,19 @@ pub const FlashHandlers = struct {
 };
 
 /// Side effects the interface asks for. Each request returns at once; the
-/// answer arrives later as a message through the handler it was given, so
+/// flash answer arrives later as a message through the handler it was given, so
 /// `update` never blocks or re-enters the runtime.
 pub const Services = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Lets the user choose an image file. Posts the path, owned by the
-        /// message, or null if the user canceled.
-        /// Opens and probes the image at `path` in the background,
-        /// replacing any image loaded before. `path` is only borrowed for
-        /// the call.
-        loadImage: *const fn (ctx: *anyopaque, id: u32, path: []const u8, handlers: ImageHandlers) void,
-        /// Forgets the loaded image.
-        unloadImage: *const fn (ctx: *anyopaque) void,
-        /// Lists every drive, system ones included, in the background.
-        listDrives: *const fn (ctx: *anyopaque, on_listed: app.Handler(DriveListing)) void,
         /// Writes the loaded image with `image_id` to `target` in the
         /// background. `target` is only borrowed for the call.
         startFlash: *const fn (ctx: *anyopaque, image_id: u32, target: *const Drive, handlers: FlashHandlers) void,
         /// Asks the running flash to stop. It still reports how it ended.
         cancelFlash: *const fn (ctx: *anyopaque) void,
     };
-
-    pub fn loadImage(self: Services, id: u32, path: []const u8, handlers: ImageHandlers) void {
-        self.vtable.loadImage(self.ctx, id, path, handlers);
-    }
-
-    pub fn unloadImage(self: Services) void {
-        self.vtable.unloadImage(self.ctx);
-    }
-
-    pub fn listDrives(self: Services, on_listed: app.Handler(DriveListing)) void {
-        self.vtable.listDrives(self.ctx, on_listed);
-    }
 
     pub fn startFlash(self: Services, image_id: u32, target: *const Drive, handlers: FlashHandlers) void {
         self.vtable.startFlash(self.ctx, image_id, target, handlers);

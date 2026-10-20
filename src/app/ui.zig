@@ -2,7 +2,7 @@
 //!
 //! Nothing here touches the window, the renderer or the disk. The GUI in
 //! `main.zig` provides `model.Services` and `model.Icons` to the runtime as
-//! root values; the tests below provide fakes and drive the interface with
+//! root values; the tests below provide a flash fake and queued task results with
 //! `app.testing.Harness`, clicking as a user would, and answering the
 //! platform's file chooser and dialogs through its fake services.
 const std = @import("std");
@@ -29,11 +29,7 @@ const Harness = app.testing.Harness(.{}, App);
 /// Records what the interface asked for, so tests can answer as the real
 /// services would.
 const FakeServices = struct {
-    loads: std.ArrayList(struct { id: u32, path: []const u8 }) = .empty,
-    loaded: ?model.ImageHandlers = null,
-    unloads: usize = 0,
-    listed: ?app.Handler(model.DriveListing) = null,
-    lists: usize = 0,
+    work: App.tasks.Work = .{ .gpa = testing.allocator },
     flash: ?model.FlashHandlers = null,
     flash_target: ?[]const u8 = null,
     cancels: usize = 0,
@@ -41,16 +37,11 @@ const FakeServices = struct {
     interface: model.Services = undefined,
 
     fn deinit(self: *FakeServices) void {
-        for (self.loads.items) |load| testing.allocator.free(load.path);
-        self.loads.deinit(testing.allocator);
         if (self.flash_target) |path| testing.allocator.free(path);
     }
 
     fn services(self: *FakeServices) model.Services {
         return .{ .ctx = self, .vtable = &.{
-            .loadImage = loadImage,
-            .unloadImage = unloadImage,
-            .listDrives = listDrives,
             .startFlash = startFlash,
             .cancelFlash = cancelFlash,
         } };
@@ -60,26 +51,11 @@ const FakeServices = struct {
     /// fake must outlive it. Start it with `frame`.
     fn harness(self: *FakeServices) !Harness {
         self.interface = self.services();
-        return .init(.{}, .{ .viewport = .init(800, 480), .provide = &.{ .of(&self.interface), .of(&fake_icons) } });
+        return .init(.{}, .{ .viewport = .init(800, 480), .provide = &.{ .of(&self.interface), .of(&fake_icons), .of(&self.work) } });
     }
 
     fn get(ctx: *anyopaque) *FakeServices {
         return @ptrCast(@alignCast(ctx));
-    }
-
-    fn loadImage(ctx: *anyopaque, id: u32, path: []const u8, handlers: model.ImageHandlers) void {
-        const self = get(ctx);
-        self.loads.append(testing.allocator, .{ .id = id, .path = testing.allocator.dupe(u8, path) catch unreachable }) catch unreachable;
-        self.loaded = handlers;
-    }
-
-    fn unloadImage(ctx: *anyopaque) void {
-        get(ctx).unloads += 1;
-    }
-
-    fn listDrives(ctx: *anyopaque, on_listed: app.Handler(model.DriveListing)) void {
-        get(ctx).listed = on_listed;
-        get(ctx).lists += 1;
     }
 
     fn startFlash(ctx: *anyopaque, image_id: u32, target: *const model.Drive, handlers: model.FlashHandlers) void {
@@ -109,18 +85,17 @@ const fake_icons: model.Icons = .{ .ctx = undefined, .make = struct {
 }.make };
 
 /// Chooses an image in the file chooser and has it load as `size` bytes.
-fn chooseImage(h: *Harness, fake: *FakeServices, path: []const u8, size: u64) !void {
+fn chooseImage(h: *Harness, path: []const u8, size: u64) !void {
     try h.click("Flash from file");
     try h.chooseFile(path);
-    const id = fake.loads.getLast().id;
-    try h.post(fake.loaded.?.loaded, model.ImageLoad{ .id = id, .result = .{ .ready = .{ .size = size, .file_size = size, .layout = "mbr" } } });
+    const id = h.state().image.?.id;
+    try h.completeTask("image", App.tasks.loadImage, model.ImageLoad{ .id = id, .result = .{ .ready = .{ .size = size, .file_size = size, .layout = "mbr" } } });
 }
 
 /// Answers the latest drive listing with copies of `drives`.
-fn answerDrives(h: *Harness, fake: *FakeServices, drives: []const model.Drive) !void {
-    const items = try testing.allocator.alloc(model.Drive, drives.len);
-    for (drives, items) |drive, *item| item.* = try drive.clone(testing.allocator);
-    try h.post(fake.listed.?, model.DriveListing{ .listed = .{ .items = items } });
+fn answerDrives(h: *Harness, drives: []const model.Drive) !void {
+    // completeTask copies the fixture, and update clones what state keeps.
+    try h.completeTask(.{ "drives", h.state().drive_refresh }, App.tasks.listDrives, .{ .listed = .{ .items = @constCast(drives) } });
 }
 
 const sd_card: model.Drive = .{ .path = "/dev/disk4", .name = "SD Card Reader", .location = "/dev/disk4", .size = 31_914_983_424, .system = false, .removable = true };
@@ -139,21 +114,21 @@ test "choosing an image loads it and enables the target step" {
     try h.expectText("Select target");
     // nothing to write yet: the target and flash buttons are disabled
     try h.click("Select target");
-    try testing.expectEqual(0, fake.lists);
+    try testing.expect(!h.taskStarted(.{ "drives", h.state().drive_refresh }));
 
     try h.click("Flash from file");
     // the platform's chooser, offering image files
     try testing.expectEqualStrings("Choose an image to flash", h.tree.file_requests.items[0].message);
     try testing.expectEqualStrings("xz", h.tree.file_requests.items[0].extensions[5]);
     try h.chooseFile("/images/raspios.img.xz");
-    try testing.expectEqual(1, fake.loads.items.len);
-    try testing.expectEqualStrings("/images/raspios.img.xz", fake.loads.items[0].path);
+    try testing.expect(h.taskStarted("image"));
+    try testing.expectEqualStrings("/images/raspios.img.xz", h.state().image.?.path);
     try h.expectText("raspios.img.xz");
     try h.expectText("Reading image\u{2026}");
-    try h.post(fake.loaded.?.progress, model.ImageProgress{ .id = fake.loads.items[0].id, .loading = .{ .decoded = 125, .total = 500 } });
+    try h.post(h.root().handler(App, .image_progress), model.ImageProgress{ .id = h.state().image.?.id, .loading = .{ .decoded = 125, .total = 500 } });
     try h.expectText("Decompressing\u{2026} 25%");
 
-    try h.post(fake.loaded.?.loaded, model.ImageLoad{ .id = fake.loads.items[0].id, .result = .{ .ready = .{
+    try h.completeTask("image", App.tasks.loadImage, model.ImageLoad{ .id = h.state().image.?.id, .result = .{ .ready = .{
         .size = 2_700_000_000,
         .file_size = 500_000_000,
         .compression = "xz",
@@ -162,7 +137,7 @@ test "choosing an image loads it and enables the target step" {
     try h.expectText("2.70 GB \u{00b7} xz");
 
     try h.click("Select target");
-    try testing.expectEqual(1, fake.lists);
+    try testing.expect(h.taskStarted(.{ "drives", h.state().drive_refresh }));
     try h.expectText("Looking for drives\u{2026}");
 }
 
@@ -179,21 +154,22 @@ test "canceling the file picker or a stale load changes nothing" {
 
     try h.click("Flash from file");
     try h.chooseFile("/images/first.img");
+    const first_id = h.state().image.?.id;
     try h.click("Remove");
-    try testing.expectEqual(1, fake.unloads);
+    try testing.expect(h.taskStarted("image"));
     try h.click("Flash from file");
     try h.chooseFile("/images/second.iso");
     // the first image's result arrives after the second was chosen
-    try h.post(fake.loaded.?.loaded, model.ImageLoad{ .id = fake.loads.items[0].id, .result = .{ .failed = error.InvalidImage } });
+    try h.post(h.root().handler(App, .image_loaded), model.ImageLoad{ .id = first_id, .result = .{ .failed = error.InvalidImage } });
     try testing.expect(h.state().image.?.status == .loading);
     try h.expectText("second.iso");
 
-    try h.post(fake.loaded.?.loaded, model.ImageLoad{ .id = fake.loads.items[1].id, .result = .{ .failed = error.InvalidImage } });
+    try h.completeTask("image", App.tasks.loadImage, model.ImageLoad{ .id = h.state().image.?.id, .result = .{ .failed = error.InvalidImage } });
     try h.expectText(model.describeError(error.InvalidImage));
 
     try h.click("Remove");
     try testing.expectEqual(null, h.state().image);
-    try testing.expectEqual(2, fake.unloads);
+    try testing.expect(h.taskStarted("image"));
     try h.expectText("Flash from file");
 }
 
@@ -204,9 +180,9 @@ test "the drive selector hides system drives and refuses ones too small" {
     defer h.deinit();
     try h.frame();
 
-    try chooseImage(&h, &fake, "/images/os.img", 2_000_000_000);
+    try chooseImage(&h, "/images/os.img", 2_000_000_000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{ internal, sd_card, tiny });
+    try answerDrives(&h, &.{ internal, sd_card, tiny });
 
     try h.expectText("SD Card Reader");
     try h.expectNoText("APPLE SSD");
@@ -233,8 +209,9 @@ test "the drive selector hides system drives and refuses ones too small" {
 
     // reopening starts from the current target, and Cancel keeps it
     try h.click("Change");
-    try testing.expectEqual(2, fake.lists);
-    try answerDrives(&h, &fake, &.{sd_card});
+    try testing.expectEqual(2, h.state().drive_refresh);
+    try testing.expect(h.taskStarted(.{ "drives", h.state().drive_refresh }));
+    try answerDrives(&h, &.{sd_card});
     try h.click("Cancel");
     try testing.expectEqualStrings("/dev/disk4", h.state().target.?.path);
 }
@@ -246,9 +223,9 @@ test "flashing a drive asks first, reports progress and finishes" {
     defer h.deinit();
     try h.frame();
 
-    try chooseImage(&h, &fake, "/images/os.img", 2_000_000_000);
+    try chooseImage(&h, "/images/os.img", 2_000_000_000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{sd_card});
+    try answerDrives(&h, &.{sd_card});
     try h.click("SD Card Reader");
     try h.click("Select");
 
@@ -294,9 +271,9 @@ test "system drives get a stronger warning, file targets none" {
     defer h.deinit();
     try h.frame();
 
-    try chooseImage(&h, &fake, "/images/os.img", 1000);
+    try chooseImage(&h, "/images/os.img", 1000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{ internal, file_target });
+    try answerDrives(&h, &.{ internal, file_target });
     try h.click("Show 1 hidden");
     try h.click("APPLE SSD");
     try h.click("Select");
@@ -306,7 +283,7 @@ test "system drives get a stronger warning, file targets none" {
     try h.click("Cancel");
 
     try h.click("Change");
-    try answerDrives(&h, &fake, &.{ internal, file_target });
+    try answerDrives(&h, &.{ internal, file_target });
     try h.click("target.img");
     try h.click("Select");
     try h.click("Flash!");
@@ -321,9 +298,9 @@ test "canceling a flash asks the services once and shows how it ended" {
     defer h.deinit();
     try h.frame();
 
-    try chooseImage(&h, &fake, "/images/os.img", 1000);
+    try chooseImage(&h, "/images/os.img", 1000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{file_target});
+    try answerDrives(&h, &.{file_target});
     try h.click("target.img");
     try h.click("Select");
     try h.click("Flash!");
@@ -336,7 +313,7 @@ test "canceling a flash asks the services once and shows how it ended" {
 
     try h.click("Flash another");
     try h.click("Select target");
-    try h.post(fake.listed.?, model.DriveListing{ .failed = error.DiskListFailed });
+    try h.completeTask(.{ "drives", h.state().drive_refresh }, App.tasks.listDrives, .{ .failed = error.DiskListFailed });
     try h.expectText("Listing drives failed.");
 }
 
@@ -349,9 +326,9 @@ test "closing or quitting while flashing asks first, in the platform's dialog" {
 
     // nothing running: closing goes ahead
     try testing.expect(try h.requestClose(.quit));
-    try chooseImage(&h, &fake, "/images/os.img", 1000);
+    try chooseImage(&h, "/images/os.img", 1000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{file_target});
+    try answerDrives(&h, &.{file_target});
     try h.click("target.img");
     try h.click("Select");
     try h.click("Flash!");
@@ -380,9 +357,9 @@ test "a failed flash shows why" {
     defer h.deinit();
     try h.frame();
 
-    try chooseImage(&h, &fake, "/images/os.img", 1000);
+    try chooseImage(&h, "/images/os.img", 1000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{sd_card});
+    try answerDrives(&h, &.{sd_card});
     try h.click("SD Card Reader");
     try h.click("Select");
     try h.click("Flash!");
@@ -399,14 +376,14 @@ test "a relisting that reorders the drives keeps the picked one" {
     defer h.deinit();
     try h.frame();
 
-    try chooseImage(&h, &fake, "/images/os.img", 1000);
+    try chooseImage(&h, "/images/os.img", 1000);
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{ sd_card, file_target });
+    try answerDrives(&h, &.{ sd_card, file_target });
     try h.click("target.img");
 
     // rows follow their drive's path, not their place in the list
     try h.click("Refresh");
-    try answerDrives(&h, &fake, &.{ file_target, sd_card });
+    try answerDrives(&h, &.{ file_target, sd_card });
     try h.click("Select");
     try testing.expectEqualStrings("/tmp/target.img", h.state().target.?.path);
 }
@@ -419,7 +396,7 @@ test "long names are cut to fit, and keep both ends" {
     try h.frame();
 
     const long_name = "raspios-bookworm-arm64-lite-2024-11-19-with-desktop-and-recommended-software.img.xz";
-    try chooseImage(&h, &fake, "/images/" ++ long_name, 2_000_000_000);
+    try chooseImage(&h, "/images/" ++ long_name, 2_000_000_000);
     const name = h.findText(long_name).?;
     try testing.expect(name.bbox.w <= steps.width);
 
@@ -432,7 +409,7 @@ test "long names are cut to fit, and keep both ends" {
         .removable = true,
     };
     try h.click("Select target");
-    try answerDrives(&h, &fake, &.{drive});
+    try answerDrives(&h, &.{drive});
     // the row's name gives way to the size and location columns
     const row_name = h.findText(drive.name).?;
     const location = h.findText(drive.location).?;

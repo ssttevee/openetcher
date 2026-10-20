@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         .min_height = 440,
     }, .{
         // filled in below, before the first frame
-        .provide = &.{ .of(&provided.services), .of(&provided.icons) },
+        .provide = &.{ .of(&provided.services), .of(&provided.icons), .of(&services.work) },
         .on_terminate = .{ .ctx = services, .call = shutdown },
     });
     services.* = .{

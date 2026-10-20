@@ -3,7 +3,7 @@
 //!
 //! The steps and dialogs are child components whose buttons fire the app's
 //! messages. Work that takes time or touches the system goes through the
-//! `model.Services` provided to the runtime, whose answers come back as
+//! runtime tasks or the flash `model.Services`, whose answers come back as
 //! messages. The image is chosen with the platform's own file chooser
 //! (`Update.openFile`), and while a flash runs, closing the window or
 //! quitting is held for the platform's own question (`ui.guardClose`,
@@ -15,6 +15,7 @@ const fabrum = @import("fabrum");
 const app = fabrum.app;
 
 const model = @import("model.zig");
+pub const tasks = @import("../tasks.zig");
 const theme = @import("theme.zig");
 const steps = @import("steps.zig");
 const DriveSelector = @import("DriveSelector.zig");
@@ -31,6 +32,7 @@ pub const State = struct {
     /// The latest drive listing, for the selector.
     drives: Drives = .idle,
     dialog: Dialog = .none,
+    drive_refresh: u32 = 0,
     flash: Flash = .idle,
 
     pub const Drives = union(enum) {
@@ -49,7 +51,7 @@ pub const State = struct {
     };
 
     pub fn deinit(self: *State, gpa: Allocator) void {
-        if (self.image) |image| gpa.free(image.path);
+        if (self.image) |image| image.deinit(gpa);
         if (self.target) |target| target.deinit(gpa);
         self.setDrives(gpa, .idle);
         self.* = undefined;
@@ -89,6 +91,7 @@ pub const Msg = union(enum) {
     image_progress: model.ImageProgress,
     image_loaded: model.ImageLoad,
     remove_image,
+    image_unloaded,
 
     open_drives,
     refresh_drives,
@@ -129,11 +132,11 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) !void {
             const borrowed = picked orelse return;
             if (state.flashing()) return;
             const path = try gpa.dupe(u8, borrowed);
-            if (state.image) |old| gpa.free(old.path);
+            if (state.image) |old| old.deinit(gpa);
             const id = state.next_image_id;
             state.next_image_id +%= 1;
             state.image = .{ .id = id, .path = path };
-            services.loadImage(id, path, .{ .progress = ctx.handler(.image_progress), .loaded = ctx.handler(.image_loaded) });
+            try ctx.runKey("image", tasks.loadImage, .{ @constCast(ctx.use(tasks.Work)), id, path, ctx.handler(.image_progress) }, ctx.handler(.image_loaded));
         },
         .image_progress => |progress| {
             const image = if (state.image) |*image| image else return;
@@ -144,31 +147,35 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) !void {
             const image = if (state.image) |*image| image else return;
             // a result for an image that was replaced or removed meanwhile
             if (image.id != load.id) return;
-            image.status = switch (load.result) {
-                .ready => |details| .{ .ready = details },
+            const status: model.Image.Status = switch (load.result) {
+                .ready => |details| .{ .ready = try details.clone(gpa) },
                 .failed => |err| .{ .failed = err },
             };
+            image.status.deinit(gpa);
+            image.status = status;
         },
         .remove_image => {
             if (state.flashing()) return;
             const image = state.image orelse return;
-            gpa.free(image.path);
+            image.deinit(gpa);
             state.image = null;
-            services.unloadImage();
+            try ctx.runKey("image", tasks.unloadImage, .{@constCast(ctx.use(tasks.Work))}, ctx.handler(.image_unloaded));
         },
+
+        .image_unloaded => {},
 
         .open_drives => {
             if (state.flashing() or state.image == null) return;
             state.dialog = .drives;
             state.setDrives(gpa, .loading);
-            services.listDrives(ctx.handler(.drives_listed));
+            state.drive_refresh +%= 1;
         },
         .refresh_drives => {
             state.setDrives(gpa, .loading);
-            services.listDrives(ctx.handler(.drives_listed));
+            state.drive_refresh +%= 1;
         },
         .drives_listed => |listing| state.setDrives(gpa, switch (listing) {
-            .listed => |list| .{ .listed = list },
+            .listed => |list| .{ .listed = try list.clone(gpa) },
             .failed => |err| .{ .failed = err },
         }),
         .close_drives => state.dialog = .none,
@@ -255,22 +262,25 @@ pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
 
     switch (state.dialog) {
         .none => {},
-        .drives => try ui.one(DriveSelector, .{
-            .drives = switch (state.drives) {
-                .listed => |list| list.items,
-                else => &.{},
-            },
-            .loading = state.drives == .loading or state.drives == .idle,
-            .failure = switch (state.drives) {
-                .failed => |err| err,
-                else => null,
-            },
-            .image_size = if (state.image) |image| image.size() else null,
-            .current = if (state.target) |target| target.path else null,
-            .on_cancel = on.bind(.close_drives),
-            .on_select = on.handler(.select_drive),
-            .on_refresh = on.bind(.refresh_drives),
-        }),
+        .drives => {
+            try ui.task(.{ "drives", state.drive_refresh }, tasks.listDrives, .{ui.use(tasks.Work).options.file_targets}, on.handler(.drives_listed));
+            try ui.one(DriveSelector, .{
+                .drives = switch (state.drives) {
+                    .listed => |list| list.items,
+                    else => &.{},
+                },
+                .loading = state.drives == .loading or state.drives == .idle,
+                .failure = switch (state.drives) {
+                    .failed => |err| err,
+                    else => null,
+                },
+                .image_size = if (state.image) |image| image.size() else null,
+                .current = if (state.target) |target| target.path else null,
+                .on_cancel = on.bind(.close_drives),
+                .on_select = on.handler(.select_drive),
+                .on_refresh = on.bind(.refresh_drives),
+            });
+        },
         .confirm => if (state.target) |*target| try ui.one(ConfirmDialog, .{
             .drive = target,
             .image_name = if (state.image) |image| image.name() else "",
