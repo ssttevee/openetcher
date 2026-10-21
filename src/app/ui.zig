@@ -30,6 +30,7 @@ const Harness = app.testing.Harness(.{}, App);
 /// services would.
 const FakeServices = struct {
     work: App.tasks.Work = .{ .gpa = testing.allocator },
+    work_ptr: *App.tasks.Work = undefined,
     flash: ?model.FlashHandlers = null,
     flash_target: ?[]const u8 = null,
     cancels: usize = 0,
@@ -37,6 +38,7 @@ const FakeServices = struct {
     interface: model.Services = undefined,
 
     fn deinit(self: *FakeServices) void {
+        self.work.clear(testing.io);
         if (self.flash_target) |path| testing.allocator.free(path);
     }
 
@@ -51,7 +53,8 @@ const FakeServices = struct {
     /// fake must outlive it. Start it with `frame`.
     fn harness(self: *FakeServices) !Harness {
         self.interface = self.services();
-        return .init(.{}, .{ .viewport = .init(800, 480), .provide = &.{ .of(&self.interface), .of(&fake_icons), .of(&self.work) } });
+        self.work_ptr = &self.work;
+        return .init(.{}, .{ .viewport = .init(800, 480), .provide = &.{ .of(&self.interface), .of(&fake_icons), .of(&self.work_ptr) } });
     }
 
     fn get(ctx: *anyopaque) *FakeServices {
@@ -95,7 +98,7 @@ fn chooseImage(h: *Harness, path: []const u8, size: u64) !void {
 /// Answers the latest drive listing with copies of `drives`.
 fn answerDrives(h: *Harness, drives: []const model.Drive) !void {
     // completeTask copies the fixture, and update clones what state keeps.
-    try h.completeTask(.{ "drives", h.state().drive_refresh }, App.tasks.listDrives, .{ .listed = .{ .items = @constCast(drives) } });
+    try h.completeTask(.{ "drives", h.state().drive_refresh }, App.tasks.listDrives, .{ .listed = .{ .items = drives } });
 }
 
 const sd_card: model.Drive = .{ .path = "/dev/disk4", .name = "SD Card Reader", .location = "/dev/disk4", .size = 31_914_983_424, .system = false, .removable = true };

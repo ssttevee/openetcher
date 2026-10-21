@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     const services = try gpa.create(Services);
     const icons = try gpa.create(Icons);
     icons.* = try .init(gpa);
-    const provided = try gpa.create(struct { services: ui.model.Services, icons: ui.model.Icons });
+    const provided = try gpa.create(struct { services: ui.model.Services, icons: ui.model.Icons, work: *ui.App.tasks.Work });
 
     try gui.init(gpa, io, .{}, .{
         .title = "OpenEtcher",
@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         .min_height = 440,
     }, .{
         // filled in below, before the first frame
-        .provide = &.{ .of(&provided.services), .of(&provided.icons), .of(&services.work) },
+        .provide = &.{ .of(&provided.services), .of(&provided.icons), .of(&provided.work) },
         .on_terminate = .{ .ctx = services, .call = shutdown },
     });
     services.* = .{
@@ -81,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
     try services.start();
     provided.services = services.interface();
     provided.icons = icons.interface();
+    provided.work = &services.work;
 
     if (builtin.mode == .debug) {
         if (env.get("OPENETCHER_GUI_SCRIPT")) |steps| {

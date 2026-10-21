@@ -52,7 +52,7 @@ pub const Drive = struct {
 
 /// Drives owned with the gpa.
 pub const DriveList = struct {
-    items: []Drive,
+    items: []const Drive,
 
     pub fn clone(self: DriveList, gpa: Allocator) !DriveList {
         const items = try gpa.alloc(Drive, self.items.len);

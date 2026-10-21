@@ -178,7 +178,7 @@ fn onProgress(ctx: *anyopaque, tree: progress.Tree) void {
             const loading: model.Loading = .{ .decoded = bytes(node.completed), .total = bytes(node.total) };
             if (!std.meta.eql(loading, watch.last)) {
                 watch.last = loading;
-                watch.task.post(watch.handler, .{ .id = watch.id, .loading = loading }) catch |err| std.log.err("dropped image progress: {t}", .{err});
+                watch.progress.post(.{ .id = watch.id, .loading = loading }) catch |err| std.log.err("dropped image progress: {t}", .{err});
             }
         }
     }

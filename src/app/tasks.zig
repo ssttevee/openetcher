@@ -19,8 +19,7 @@ pub const Work = struct {
     pub const Loaded = struct { id: u32, source: openetcher.ImageSource };
     pub const LoadWatch = struct {
         id: u32,
-        task: *app.Task,
-        handler: app.Handler(model.ImageProgress),
+        progress: app.Task.Progress(model.ImageProgress),
         last: model.Loading = .{},
     };
 
@@ -68,7 +67,11 @@ fn load(task: *app.Task, work: *Work, id: u32, path: []const u8, on_progress: ap
         work.mutex.unlock(task.io);
         return err;
     };
-    work.load_watch = .{ .id = id, .task = task, .handler = on_progress };
+    const handle = task.progress(on_progress) catch |err| {
+        work.mutex.unlock(task.io);
+        return err;
+    };
+    work.load_watch = .{ .id = id, .progress = handle };
     work.mutex.unlock(task.io);
     defer {
         work.mutex.lockUncancelable(task.io);

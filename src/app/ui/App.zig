@@ -91,7 +91,6 @@ pub const Msg = union(enum) {
     image_progress: model.ImageProgress,
     image_loaded: model.ImageLoad,
     remove_image,
-    image_unloaded,
 
     open_drives,
     refresh_drives,
@@ -136,7 +135,7 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) !void {
             const id = state.next_image_id;
             state.next_image_id +%= 1;
             state.image = .{ .id = id, .path = path };
-            try ctx.runKey("image", tasks.loadImage, .{ @constCast(ctx.use(tasks.Work)), id, path, ctx.handler(.image_progress) }, ctx.handler(.image_loaded));
+            try ctx.runKey("image", tasks.loadImage, .{ ctx.use(*tasks.Work).*, id, path, ctx.handler(.image_progress) }, ctx.handler(.image_loaded));
         },
         .image_progress => |progress| {
             const image = if (state.image) |*image| image else return;
@@ -159,10 +158,8 @@ pub fn update(state: *State, msg: Msg, ctx: *app.Update(App)) !void {
             const image = state.image orelse return;
             image.deinit(gpa);
             state.image = null;
-            try ctx.runKey("image", tasks.unloadImage, .{@constCast(ctx.use(tasks.Work))}, ctx.handler(.image_unloaded));
+            try ctx.runKey("image", tasks.unloadImage, .{ctx.use(*tasks.Work).*}, null);
         },
-
-        .image_unloaded => {},
 
         .open_drives => {
             if (state.flashing() or state.image == null) return;
@@ -263,7 +260,7 @@ pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
     switch (state.dialog) {
         .none => {},
         .drives => {
-            try ui.task(.{ "drives", state.drive_refresh }, tasks.listDrives, .{ui.use(tasks.Work).options.file_targets}, on.handler(.drives_listed));
+            try ui.task(.{ "drives", state.drive_refresh }, tasks.listDrives, .{ui.use(*tasks.Work).*.options.file_targets}, on.handler(.drives_listed));
             try ui.one(DriveSelector, .{
                 .drives = switch (state.drives) {
                     .listed => |list| list.items,
