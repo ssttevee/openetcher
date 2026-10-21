@@ -260,7 +260,7 @@ pub fn view(ui: *app.Ui, state: *const State, _: Props) !void {
     switch (state.dialog) {
         .none => {},
         .drives => {
-            try ui.task(.{ "drives", state.drive_refresh }, tasks.listDrives, .{ui.use(*tasks.Work).*.options.file_targets}, on.handler(.drives_listed));
+            try ui.task("drives", .{ .restart = state.drive_refresh }, tasks.listDrives, .{ui.use(*tasks.Work).*.options.file_targets}, on.handler(.drives_listed));
             try ui.one(DriveSelector, .{
                 .drives = switch (state.drives) {
                     .listed => |list| list.items,

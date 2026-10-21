@@ -98,7 +98,7 @@ fn chooseImage(h: *Harness, path: []const u8, size: u64) !void {
 /// Answers the latest drive listing with copies of `drives`.
 fn answerDrives(h: *Harness, drives: []const model.Drive) !void {
     // completeTask copies the fixture, and update clones what state keeps.
-    try h.completeTask(.{ "drives", h.state().drive_refresh }, App.tasks.listDrives, .{ .listed = .{ .items = drives } });
+    try h.completeTask("drives", App.tasks.listDrives, .{ .listed = .{ .items = drives } });
 }
 
 const sd_card: model.Drive = .{ .path = "/dev/disk4", .name = "SD Card Reader", .location = "/dev/disk4", .size = 31_914_983_424, .system = false, .removable = true };
@@ -117,7 +117,7 @@ test "choosing an image loads it and enables the target step" {
     try h.expectText("Select target");
     // nothing to write yet: the target and flash buttons are disabled
     try h.click("Select target");
-    try testing.expect(!h.taskStarted(.{ "drives", h.state().drive_refresh }));
+    try testing.expect(!h.taskStarted("drives"));
 
     try h.click("Flash from file");
     // the platform's chooser, offering image files
@@ -140,7 +140,7 @@ test "choosing an image loads it and enables the target step" {
     try h.expectText("2.70 GB \u{00b7} xz");
 
     try h.click("Select target");
-    try testing.expect(h.taskStarted(.{ "drives", h.state().drive_refresh }));
+    try testing.expect(h.taskStarted("drives"));
     try h.expectText("Looking for drives\u{2026}");
 }
 
@@ -213,7 +213,7 @@ test "the drive selector hides system drives and refuses ones too small" {
     // reopening starts from the current target, and Cancel keeps it
     try h.click("Change");
     try testing.expectEqual(2, h.state().drive_refresh);
-    try testing.expect(h.taskStarted(.{ "drives", h.state().drive_refresh }));
+    try testing.expect(h.taskStarted("drives"));
     try answerDrives(&h, &.{sd_card});
     try h.click("Cancel");
     try testing.expectEqualStrings("/dev/disk4", h.state().target.?.path);
@@ -316,7 +316,7 @@ test "canceling a flash asks the services once and shows how it ended" {
 
     try h.click("Flash another");
     try h.click("Select target");
-    try h.completeTask(.{ "drives", h.state().drive_refresh }, App.tasks.listDrives, .{ .failed = error.DiskListFailed });
+    try h.completeTask("drives", App.tasks.listDrives, .{ .failed = error.DiskListFailed });
     try h.expectText("Listing drives failed.");
 }
 
@@ -481,7 +481,7 @@ test "Remove waits for a loading task to return and releases its cached source" 
     try h.chooseFile(path);
     const core = &h.runtime.core;
     const original = core.tasks.records.items[0];
-    try core.tasks.start(core, original.owner, original.key, false, DeferredLoad.load, .{ &fake.work, &sync, h.state().image.?.id, path, h.root().handler(App, .image_progress) }, h.root().handler(App, .image_loaded));
+    try core.tasks.start(core, original.owner, original.key, false, 0, DeferredLoad.load, .{ &fake.work, &sync, h.state().image.?.id, path, h.root().handler(App, .image_progress) }, h.root().handler(App, .image_loaded));
     core.tasks.queued = false;
     try h.frame();
     try waitLoad(&sync.entered);
@@ -500,4 +500,27 @@ test "Remove waits for a loading task to return and releases its cached source" 
     try testing.expectEqual(null, fake.work.loaded);
     try testing.expectEqual(null, h.state().image);
     try h.expectNoText("image.img");
+}
+
+test "refresh restarts the drive listing under its stable key" {
+    var fake: FakeServices = .{};
+    defer fake.deinit();
+    var h = try fake.harness();
+    defer h.deinit();
+    try h.frame();
+    try chooseImage(&h, "/images/os.img", 1000);
+    try h.click("Select target");
+    try answerDrives(&h, &.{sd_card});
+    try h.expectText("SD Card Reader");
+    const refresh = h.state().drive_refresh;
+    try h.click("Refresh");
+    try testing.expectEqual(refresh + 1, h.state().drive_refresh);
+    try testing.expect(h.taskStarted("drives"));
+    try h.expectText("Looking for drives…");
+    try h.expectNoText("SD Card Reader");
+    try answerDrives(&h, &.{});
+    try h.expectText("Refresh");
+    try h.click("Refresh");
+    try answerDrives(&h, &.{sd_card});
+    try h.expectText("SD Card Reader");
 }
