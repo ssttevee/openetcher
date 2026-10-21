@@ -431,3 +431,73 @@ test "long names are cut to fit, and keep both ends" {
     try testing.expect(std.mem.endsWith(u8, shown, "?"));
     try testing.expect(std.mem.indexOf(u8, shown, layout.text.ellipsis) != null);
 }
+
+// Keep a real load in its return path after installing its image. Removal
+// must wait for the whole task to return before clearing the shared cache.
+const DeferredLoad = struct {
+    entered: std.Io.Event = .unset,
+    canceled: std.Io.Event = .unset,
+    release: std.Io.Event = .unset,
+    never: std.Io.Event = .unset,
+
+    fn load(task: *app.Task, work: *App.tasks.Work, sync: *DeferredLoad, id: u32, path: []const u8, handler: app.Handler(model.ImageProgress)) model.ImageLoad {
+        const result = App.tasks.loadImage(task, work, id, path, handler);
+        sync.entered.set(task.io);
+        sync.never.wait(task.io) catch {};
+        sync.canceled.set(task.io);
+        sync.release.waitUncancelable(task.io);
+        return result;
+    }
+};
+
+fn waitLoad(event: *std.Io.Event) !void {
+    try event.waitTimeout(testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+}
+
+test "Remove waits for a loading task to return and releases its cached source" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = try testing.allocator.alloc(u8, 4096 * 512);
+    defer testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    bytes[446 + 4] = 0x0c;
+    std.mem.writeInt(u32, bytes[446 + 8 ..][0..4], 2048, .little);
+    std.mem.writeInt(u32, bytes[446 + 12 ..][0..4], 1024, .little);
+    std.mem.writeInt(u16, bytes[510..512], 0xAA55, .little);
+    var file = try tmp.dir.createFile(testing.io, "image.img", .{});
+    defer file.close(testing.io);
+    try file.writeStreamingAll(testing.io, bytes);
+    const path = try tmp.dir.realPathFileAlloc(testing.io, "image.img", testing.allocator);
+    defer testing.allocator.free(path);
+
+    var fake: FakeServices = .{};
+    defer fake.deinit();
+    var h = try fake.harness();
+    defer h.deinit();
+    var sync: DeferredLoad = .{};
+    defer sync.release.set(testing.io);
+    try h.frame();
+    try h.click("Flash from file");
+    try h.chooseFile(path);
+    const core = &h.runtime.core;
+    const original = core.tasks.records.items[0];
+    try core.tasks.start(core, original.owner, original.key, false, DeferredLoad.load, .{ &fake.work, &sync, h.state().image.?.id, path, h.root().handler(App, .image_progress) }, h.root().handler(App, .image_loaded));
+    core.tasks.queued = false;
+    try h.frame();
+    try waitLoad(&sync.entered);
+    try testing.expect(fake.work.loaded != null);
+    const loading = core.tasks.records.items[0];
+    core.tasks.queued = true;
+    try h.click("Remove");
+    try waitLoad(&sync.canceled);
+    try testing.expectEqual(null, h.state().image);
+    try testing.expectError(error.TaskPending, h.completeTask("image", App.tasks.unloadImage, {}));
+    try h.runTasks();
+    try testing.expect(fake.work.loaded != null);
+    sync.release.set(testing.io);
+    try loading.reaper.await(testing.io);
+    try h.runTasks();
+    try testing.expectEqual(null, fake.work.loaded);
+    try testing.expectEqual(null, h.state().image);
+    try h.expectNoText("image.img");
+}
